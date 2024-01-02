@@ -1,18 +1,22 @@
 use blake3;
-use ed25519_dalek;
-use ed25519_dalek::{Keypair, PublicKey, Signer, Verifier};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    vec,
+};
 
 type Hash = [u8; blake3::OUT_LEN];
-type Identity = [u8; ed25519_dalek::PUBLIC_KEY_LENGTH];
-type Signature = [u8; ed25519_dalek::SIGNATURE_LENGTH];
+type Signature = [u8; 64];
+type PrivateKey = [u8; 64];
 type CertiticateID = Hash;
+
+#[derive(Clone, Hash, Ord, PartialOrd, Eq, PartialEq)]
+struct PublicKey([u8; 32]);
 
 #[derive(Clone)]
 pub struct Vote {
     view: u64,
     cert: CertiticateID,
-    identity: Identity,
+    identity: PublicKey,
     signature: Signature,
 }
 
@@ -21,54 +25,88 @@ impl Vote {
         let mut bytes = vec![];
         bytes.extend_from_slice(&self.view.to_be_bytes());
         bytes.extend_from_slice(&self.cert);
+        bytes.extend_from_slice(&self.identity.0);
+        bytes.extend_from_slice(&self.signature);
         bytes
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        let mut previous = [0; blake3::OUT_LEN];
-        previous.copy_from_slice(&bytes[8..8 + blake3::OUT_LEN]);
+    pub fn len() -> usize {
+        8 + 32 + 32 + 64
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let mut view = [0u8; 8];
+        view.copy_from_slice(&buf[0..8]);
+        let mut cert = [0u8; 32];
+        cert.copy_from_slice(&buf[8..40]);
+        let mut identity = [0u8; 32];
+        identity.copy_from_slice(&buf[40..72]);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&buf[72..136]);
         Self {
-            view: u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
-            cert: previous,
-            identity: [0; ed25519_dalek::PUBLIC_KEY_LENGTH],
-            signature: [0; ed25519_dalek::SIGNATURE_LENGTH],
+            view: u64::from_be_bytes(view),
+            cert,
+            identity: PublicKey(identity),
+            signature,
         }
     }
 }
 
 #[derive(Clone, Hash)]
-pub struct Certificate {
+pub struct Generic {
     view: u64,
+    // height of the executed block, derived from position in the hashchain.
     height: u64,
+    // block to execute.
     block: Hash,
-    prev: Hash,
-    prev_votes: Vec<(Identity, Signature)>,
+    // hash of the previous generic message.
+    previous: Hash,
+    // set of signatures for the `previous` hash in the hashchain.
+    votes: Vec<(PublicKey, Signature)>,
 }
 
-impl Default for Certificate {
-    fn default() -> Self {
-        Self {
-            view: 0,
-            height: 0,
-            block: [0; blake3::OUT_LEN],
-            prev: [0; blake3::OUT_LEN],
-            prev_votes: vec![],
-        }
-    }
-}
-
-impl Certificate {
+impl Generic {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec![];
         bytes.extend_from_slice(&self.view.to_be_bytes());
         bytes.extend_from_slice(&self.block);
-        bytes.extend_from_slice(&self.prev);
-        bytes.extend_from_slice(&self.prev_votes.len().to_be_bytes());
-        for (identity, signature) in &self.prev_votes {
-            bytes.extend_from_slice(identity);
+        bytes.extend_from_slice(&self.previous);
+        bytes.extend_from_slice(&self.votes.len().to_be_bytes());
+        for (identity, signature) in &self.votes {
+            bytes.extend_from_slice(&identity.0);
             bytes.extend_from_slice(signature);
         }
         bytes
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let mut view = [0u8; 8];
+        view.copy_from_slice(&buf[0..8]);
+        let mut block = [0u8; 32];
+        block.copy_from_slice(&buf[8..40]);
+        let mut previous = [0u8; 32];
+        previous.copy_from_slice(&buf[40..72]);
+        let mut votes_len = [0u8; 8];
+        votes_len.copy_from_slice(&buf[72..80]);
+        let votes_len = u64::from_be_bytes(votes_len);
+        let mut votes = vec![];
+        let mut offset = 80;
+        for _ in 0..votes_len {
+            let mut identity = [0u8; 32];
+            identity.copy_from_slice(&buf[offset..offset + 32]);
+            offset += 32;
+            let mut signature = [0u8; 64];
+            signature.copy_from_slice(&buf[offset..offset + 64]);
+            offset += 64;
+            votes.push((PublicKey(identity), signature));
+        }
+        Self {
+            view: u64::from_be_bytes(view),
+            height: 0,
+            block,
+            previous,
+            votes,
+        }
     }
 
     pub fn id(&self) -> Hash {
@@ -79,12 +117,12 @@ impl Certificate {
 }
 
 #[derive(Clone)]
-pub struct TimeoutCertificate {
+pub struct Timeout {
     view: u64,
-    votes: Vec<(Identity, Signature)>,
+    votes: Vec<(PublicKey, Signature)>,
 }
 
-impl Default for TimeoutCertificate {
+impl Default for Timeout {
     fn default() -> Self {
         Self {
             view: 0,
@@ -93,38 +131,79 @@ impl Default for TimeoutCertificate {
     }
 }
 
-impl TimeoutCertificate {
+impl Timeout {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec![];
         bytes.extend_from_slice(&self.view.to_be_bytes());
         bytes.extend_from_slice(&self.votes.len().to_be_bytes());
         for (identity, signature) in &self.votes {
-            bytes.extend_from_slice(identity);
+            bytes.extend_from_slice(&identity.0);
             bytes.extend_from_slice(signature);
         }
         bytes
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let mut view = [0u8; 8];
+        view.copy_from_slice(&buf[0..8]);
+        let mut votes_len = [0u8; 8];
+        votes_len.copy_from_slice(&buf[8..16]);
+        let votes_len = u64::from_be_bytes(votes_len);
+        let mut votes = vec![];
+        let mut offset = 16;
+        for _ in 0..votes_len {
+            let mut identity = [0u8; 32];
+            identity.copy_from_slice(&buf[offset..offset + 32]);
+            offset += 32;
+            let mut signature = [0u8; 64];
+            signature.copy_from_slice(&buf[offset..offset + 64]);
+            offset += 64;
+            votes.push((PublicKey(identity), signature));
+        }
+        Self {
+            view: u64::from_be_bytes(view),
+            votes,
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct Wish {
     view: u64,
+    identity: PublicKey,
+    signature: Signature,
 }
 
 impl Wish {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec![];
         bytes.extend_from_slice(&self.view.to_be_bytes());
+        bytes.extend_from_slice(&self.identity.0);
+        bytes.extend_from_slice(&self.signature);
         bytes
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        let mut view = [0u8; 8];
+        view.copy_from_slice(&buf[0..8]);
+        let mut identity = [0u8; 32];
+        identity.copy_from_slice(&buf[8..40]);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&buf[40..104]);
+        Self {
+            view: u64::from_be_bytes(view),
+            identity: PublicKey(identity),
+            signature,
+        }
     }
 }
 
 #[derive(Clone)]
 pub enum Message {
     Vote(Vote),
-    QC(Certificate),
+    QC(Generic),
     Wish(Wish),
-    TC(TimeoutCertificate),
+    TC(Timeout),
 }
 
 impl Message {
@@ -164,19 +243,19 @@ pub enum Action {
     // Wait for all participants to send its highest locked certificate.
     WaitDelay(),
     // Set timers for an epoch. Epoch is a t+1 consecutive views.
-    SetEpochTimers(u64),
+    ResetTimers((u64, u64)),
 }
 
 struct TCAggregator {
-    cert: TimeoutCertificate,
-    participants: BTreeSet<Identity>,
+    cert: Timeout,
+    participants: BTreeSet<PublicKey>,
     sent: bool,
 }
 
 impl Default for TCAggregator {
     fn default() -> Self {
         Self {
-            cert: TimeoutCertificate::default(),
+            cert: Timeout::default(),
             participants: BTreeSet::new(),
             sent: false,
         }
@@ -184,22 +263,19 @@ impl Default for TCAggregator {
 }
 
 struct QCAggregator {
-    votes: Vec<(Identity, Signature)>,
-    participants: BTreeSet<Identity>,
+    votes: Vec<(PublicKey, Signature)>,
+    participants: BTreeSet<PublicKey>,
     sent: bool,
 }
 
 struct HotStuff {
     view: u64,
     voted: u64,
-    t: u64,
-    chain: BTreeMap<u64, Certificate>,
-    executed: u64,
-    locked: u64,
+    chain: BTreeMap<u64, Generic>,
     highest: u64,
-    keys: BTreeSet<ed25519_dalek::Keypair>,
-    participants: BTreeSet<ed25519_dalek::PublicKey>,
-    proposed_block: Option<Hash>,
+    keys: HashMap<PublicKey, PrivateKey>,
+    participants: BTreeSet<PublicKey>,
+    propose: Option<Hash>,
     wishes: BTreeMap<u64, TCAggregator>,
     certs: BTreeMap<(u64, Hash), QCAggregator>,
     pub actions: Vec<Action>,
@@ -210,14 +286,11 @@ impl Default for HotStuff {
         Self {
             view: 0,
             voted: 0,
-            t: 0,
             chain: BTreeMap::new(),
-            executed: 0,
-            locked: 0,
             highest: 0,
-            keys: BTreeSet::new(),
+            keys: HashMap::new(),
             participants: BTreeSet::new(),
-            proposed_block: None,
+            propose: None,
             wishes: BTreeMap::new(),
             certs: BTreeMap::new(),
             actions: vec![],
@@ -230,19 +303,27 @@ impl HotStuff {
         if next <= self.view {
             return;
         }
-        if self.view % (self.t + 1) == 0 {
-            let message = Message::Wish(Wish { view: next });
-            let buf = message.to_bytes();
+        if self.view % (self.participants.len() as u64 / 3 + 1) == 0 {
+            let message = Message::Wish(Wish {
+                view: next,
+                identity: PublicKey([0u8; 32]),
+                signature: [0u8; 64],
+            });
             self.keys.iter().for_each(|key| {
                 self.actions.push(Action::Send(message.clone()));
             });
         } else {
-            self.advance_with_delay(next)
+            self.advance(next);
+            self.actions.push(Action::WaitDelay());
+            if let Some(prev) = self.chain.get(&self.highest) {
+                let qc = Message::QC(prev.clone());
+                self.actions.push(Action::Send(qc));
+            }
         }
     }
 
-    fn advance_with_delay(&mut self, next: u64) {
-        self.advance(next);
+    pub fn on_timeout_certificate(&mut self, cert: Timeout) {
+        self.advance(cert.view + 1);
         self.actions.push(Action::WaitDelay());
         if let Some(prev) = self.chain.get(&self.highest) {
             let qc = Message::QC(prev.clone());
@@ -251,27 +332,43 @@ impl HotStuff {
     }
 
     pub fn on_delay(&mut self) {
-        self.propose(self.view);
+        let cert = if let Some(highest) = self.chain.get(&self.highest) {
+            Generic {
+                view: self.view,
+                height: self.highest,
+                block: highest.block,
+                previous: highest.previous,
+                votes: highest.votes.clone(),
+            }
+        } else if let Some(propose) = self.propose {
+            Generic {
+                view: self.view,
+                height: 1,
+                block: propose,
+                previous: [0; 32],
+                votes: vec![],
+            }
+        } else {
+            return;
+        };
+        self.actions.push(Action::Send(Message::QC(cert)));
     }
 
-    pub fn on_message(msg: Message) {}
-
-    fn on_certificate(&mut self, cert: Certificate) {
+    pub fn on_certificate(&mut self, cert: Generic) {
         if let Some(prev) = self.chain.get(&(cert.height - 1)) {
-            if prev.id() != cert.prev || cert.prev_votes.len() <= self.participants.len() * 2 / 3 {
+            // check that certificate votes are for block that is ranked no lower than currently locked certificate.
+            if prev.id() != cert.previous || cert.votes.len() <= self.participants.len() * 2 / 3 {
                 return;
             }
             let height = cert.height;
             self.advance(prev.view + 1);
             if self.view == cert.view && self.voted < cert.view {
                 self.highest = height;
-                self.locked = height - 1;
-                self.executed = height - 2;
                 self.voted = cert.view;
                 self.actions.push(Action::Send(Message::Vote(Vote {
                     view: self.view,
                     cert: cert.id(),
-                    identity: [0; 32],
+                    identity: PublicKey([0; 32]),
                     signature: [0; 64],
                 })));
                 self.chain.insert(height, cert);
@@ -279,11 +376,7 @@ impl HotStuff {
         }
     }
 
-    fn on_timeout_certificate(&mut self, cert: TimeoutCertificate) {
-        self.advance_with_delay(cert.view + 1);
-    }
-
-    fn on_vote(&mut self, vote: Vote) {
+    pub fn on_vote(&mut self, vote: Vote) {
         let cert = self
             .certs
             .entry((vote.view, vote.cert))
@@ -292,21 +385,45 @@ impl HotStuff {
                 participants: BTreeSet::new(),
                 sent: false,
             });
-        if cert.participants.insert(vote.identity.clone()) {
-            cert.votes.push((vote.identity, vote.signature));
-            if cert.votes.len() > self.participants.len() * 2 / 3 && !cert.sent {
-                cert.sent = true;
-                self.propose(self.view + 1);
-            }
+        if !cert.participants.insert(vote.identity.clone()) {
+            return;
+        };
+        cert.votes.push((vote.identity, vote.signature));
+        if cert.votes.len() <= self.participants.len() * 2 / 3 {
+            return;
+        };
+        if cert.sent {
+            return;
         }
+        cert.sent = true;
+        let signer = leader(self.view, &self.participants);
+        if signer.is_none() {
+            return;
+        }
+        let key = self.keys.get(&signer.unwrap());
+        if key.is_none() {
+            return;
+        }
+        let proposal = self.propose.take();
+        if proposal.is_none() {
+            return;
+        }
+        let cert = Generic {
+            height: self.highest + 1,
+            view: vote.view + 1,
+            previous: vote.cert,
+            block: proposal.unwrap(),
+            votes: cert.votes.clone(),
+        };
+        self.actions.push(Action::Send(Message::QC(cert)));
     }
 
-    fn on_wish(&mut self, identity: Identity, sig: Signature, wish: Wish) {
+    pub fn on_wish(&mut self, identity: PublicKey, sig: Signature, wish: Wish) {
         let agg = self
             .wishes
             .entry(wish.view)
             .or_insert_with(|| TCAggregator {
-                cert: TimeoutCertificate {
+                cert: Timeout {
                     view: wish.view,
                     votes: vec![],
                 },
@@ -324,39 +441,26 @@ impl HotStuff {
     }
 
     pub fn schedule_block(&mut self, id: Hash) {
-        self.proposed_block = Some(id);
-    }
-
-    fn propose(&mut self, view: u64) {
-        if let Some(id) = self.proposed_block {
-            if let Some(prev) = self.chain.get(&self.highest) {
-                let cert = Certificate {
-                    view: view,
-                    height: prev.height + 1,
-                    block: id,
-                    prev: prev.id(),
-                    ..Default::default()
-                };
-                let message = Message::QC(cert);
-                let buf = message.to_bytes();
-                self.keys.iter().for_each(|key| {
-                    self.actions.push(Action::Send(message.clone()));
-                });
-            }
-        }
+        self.propose = Some(id);
     }
 
     fn advance(&mut self, next: u64) {
         if next > self.view {
-            if self.view % self.t + 1 == 0 {
-                self.actions.push(Action::SetEpochTimers(self.view));
+            if self.view % self.participants.len() as u64 / 3 + 1 == 0 {
+                self.actions.push(Action::ResetTimers((
+                    self.view,
+                    self.participants.len() as u64 / 3 + 1,
+                )));
             }
             self.view = next;
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    fn test_view_synchronization() {}
+fn leader(view: u64, participants: &BTreeSet<PublicKey>) -> Option<&PublicKey> {
+    let i = view as usize % participants.len();
+    participants.iter().nth(i)
 }
+
+#[cfg(test)]
+mod tests {}

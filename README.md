@@ -4,3 +4,5 @@
   original 3-round hotstuff and pipelined protocol specification.
 - [cogsworth](https://cryptoeconomicsystems.pubpub.org/pub/naor-cogsworth-synchronization/release/5)
   view synchronization protocol referenced in hotstuff2.
+- [bls12-381 signature library](https://github.com/supranational/blst)
+- [bls12-381 overview](https://hackmd.io/@benjaminion/bls12-381) 
