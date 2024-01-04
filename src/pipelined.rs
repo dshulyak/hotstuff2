@@ -268,7 +268,7 @@ struct QCAggregator {
     sent: bool,
 }
 
-struct HotStuff {
+pub struct Consensus {
     view: u64,
     voted: u64,
     chain: BTreeMap<u64, Generic>,
@@ -281,7 +281,7 @@ struct HotStuff {
     pub actions: Vec<Action>,
 }
 
-impl Default for HotStuff {
+impl Default for Consensus {
     fn default() -> Self {
         Self {
             view: 0,
@@ -298,7 +298,7 @@ impl Default for HotStuff {
     }
 }
 
-impl HotStuff {
+impl Consensus {
     pub fn on_view_timer(&mut self, next: u64) {
         if next <= self.view {
             return;
