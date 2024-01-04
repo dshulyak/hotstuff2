@@ -1,6 +1,6 @@
 use crate::codec::ToBytes;
-use crate::errors::Error;
 
+use anyhow::{Error, Result};
 use blst::min_pk as blst;
 use std::hash;
 
@@ -42,28 +42,23 @@ impl AggregateSignature {
     pub fn verify<'a>(
         &self,
         message: &[u8],
-        public_keys: impl IntoIterator<Item = &'a PublicKey>,
-    ) -> Option<Error> {
+        public_keys: impl IntoIterator<Item = Result<&'a PublicKey>>,
+    ) -> Result<()> {
         let public = blst::AggregatePublicKey::aggregate(
-            &public_keys.into_iter().map(|pk| &pk.0).collect::<Vec<_>>(),
+            &public_keys
+                .into_iter()
+                .map(|key| key.map(|key| &key.0))
+                .collect::<Result<Vec<_>, _>>()?,
             true,
-        );
-
-        match public {
-            Ok(public) => {
-                match self.0.to_signature().verify(
-                    true,
-                    message,
-                    &[],
-                    &[],
-                    &public.to_public_key(),
-                    true,
-                ) {
-                    ::blst::BLST_ERROR::BLST_SUCCESS => None,
-                    _ => Some(Error::Invalid),
-                }
-            }
-            Err(e) => Some(Error::Invalid),
+        )
+        .expect("failed to aggregate public key");
+        match self
+            .0
+            .to_signature()
+            .verify(true, message, &[], &[], &public.to_public_key(), true)
+        {
+            ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
+            _ => Err(Error::msg("invalid aggregate signature")),
         }
     }
 }
@@ -97,10 +92,10 @@ impl ToBytes for Signature {
 }
 
 impl Signature {
-    pub(crate) fn verify(&self, message: &[u8], public_key: &PublicKey) -> Option<Error> {
+    pub(crate) fn verify(&self, message: &[u8], public_key: &PublicKey) -> Result<()> {
         match self.0.verify(true, message, &[], &[], &public_key.0, true) {
-            ::blst::BLST_ERROR::BLST_SUCCESS => None,
-            _ => Some(Error::Invalid),
+            ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
+            _ => Err(Error::msg("invalid signature")),
         }
     }
 }

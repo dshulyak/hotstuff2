@@ -1,11 +1,11 @@
 use crate::bls::{AggregateSignature, PrivateKey, PublicKey};
 use crate::codec::ToBytes;
-use crate::errors::Error;
 use crate::types::{
     Block, Certificate, Message, Prepare, Propose, Signed, Signer, Sync, Timeout, View, Vote, Wish,
     ID,
 };
 
+use anyhow::{anyhow, ensure, Result};
 use bit_vec::BitVec;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Index;
@@ -125,13 +125,12 @@ impl Consensus {
         }
     }
 
-    fn on_wish(&mut self, wish: Signed<Wish>) -> Option<Error> {
-        if wish.message.view <= self.view {
-            return Some(Error::Invalid);
-        }
-        if wish.signer >= self.participants.len() as u16 {
-            return Some(Error::Invalid);
-        }
+    fn on_wish(&mut self, wish: Signed<Wish>) -> Result<()> {
+        ensure!(wish.message.view > self.view, "old view");
+        ensure!(
+            wish.signer < self.participants.len() as u16,
+            "invalid signer"
+        );
         wish.signature
             .verify(&wish.message.to_bytes(), &self.participants[wish.signer])?;
 
@@ -156,29 +155,28 @@ impl Consensus {
                 },
             })));
         }
-        None
+        Ok(())
     }
 
-    pub fn on_message(&mut self, message: Message) -> Option<Error> {
+    pub fn on_message(&mut self, message: Message) -> Result<()> {
         match message {
-            Message::Sync(sync) => None,
+            Message::Sync(sync) => Ok(()),
             Message::Prepare(prepare) => self.on_prepare(prepare),
-            Message::Vote(vote) => None,
+            Message::Vote(vote) => Ok(()),
             Message::Propose(propose) => self.on_propose(propose),
-            Message::Vote2(vote2) => None,
+            Message::Vote2(vote2) => Ok(()),
             Message::Wish(wish) => self.on_wish(wish),
             Message::Timeout(timeout) => self.on_timeout(timeout),
         }
     }
 
-    fn on_timeout(&mut self, timeout: Timeout) -> Option<Error> {
-        if timeout.certificate.message <= self.view {
-            return Some(Error::Invalid);
-        }
+    fn on_timeout(&mut self, timeout: Timeout) -> Result<()> {
+        ensure!(timeout.certificate.message > self.view, "old view");
+
         self.view = timeout.certificate.message;
         self.enter_view(timeout.certificate.message);
         self.wait_delay();
-        None
+        Ok(())
     }
 
     pub fn on_delay(&mut self) {
@@ -220,39 +218,38 @@ impl Consensus {
         }
     }
 
-    fn on_propose(&mut self, propose: Signed<Propose>) -> Option<Error> {
-        // verification is rougly in the order of computational complexity
-        if propose.message.view < self.view || self.voted >= self.view {
-            return Some(Error::Invalid);
-        }
-        if propose.signer >= self.participants.len() as u16 {
-            return Some(Error::Invalid);
-        }
-        // if locked is ranked no lower than current locked
-        if propose.message.locked.message.view <= self.lock.message.view {
-            return Some(Error::Invalid);
-        }
-        // locked either extends double or equal to double if it was finalized in the same view
-        if propose.message.locked.message.block.prev != propose.message.double.message.block.id
-            && propose.message.locked.message.block.id != propose.message.double.message.block.id
-        {
-            return Some(Error::Invalid);
-        }
-        // double always extends known double. it is also true when node downloads state.
-        if propose.message.double.message.block.prev != self.commit.message.block.id {
-            return Some(Error::Invalid);
-        }
-
-        if propose.message.locked.signers.iter().filter(|b| *b).count()
-            < self.participants.len() * 2 / 3 + 1
-        {
-            return Some(Error::Invalid);
-        }
-        if propose.message.double.signers.iter().filter(|b| *b).count()
-            < self.participants.len() * 2 / 3 + 1
-        {
-            return Some(Error::Invalid);
-        }
+    fn on_propose(&mut self, propose: Signed<Propose>) -> Result<()> {
+        // verification is roughly in the order of computational complexity
+        ensure!(propose.message.view >= self.view, "old view");
+        ensure!(self.voted > self.view, "already votedin this view");
+        ensure!(
+            propose.signer < self.participants.len() as u16,
+            "signer identifier is out of bounds"
+        );
+        ensure!(
+            propose.message.locked.message.view >= self.lock.message.view,
+            "locked ranked lower than current locked"
+        );
+        ensure!(
+            propose.message.locked.message.block.prev == propose.message.double.message.block.id
+                || propose.message.locked.message.block.id
+                    == propose.message.double.message.block.id,
+            "locked either extends double or equal to double if it was finalized in the same view"
+        );
+        ensure!(
+            propose.message.double.message.block.prev == self.commit.message.block.id,
+            "double always extends known double block"
+        );
+        ensure!(
+            propose.message.locked.signers.iter().filter(|b| *b).count()
+                > self.participants.len() * 2 / 3,
+            "locked signed by more than 2/3 participants"
+        );
+        ensure!(
+            propose.message.double.signers.iter().filter(|b| *b).count()
+                > self.participants.len() * 2 / 3,
+            "double signed by more than 2/3 participants"
+        );
 
         propose.signature.verify(
             &propose.message.to_bytes(),
@@ -280,7 +277,7 @@ impl Consensus {
             self.enter_view(self.commit.message.view + 1);
         }
         if self.view != propose.message.view {
-            return None;
+            return Ok(());
         }
 
         for (public, private) in self.keys.iter() {
@@ -297,32 +294,37 @@ impl Consensus {
                 })));
             }
         }
-        None
+        Ok(())
     }
 
-    fn on_prepare(&mut self, prepare: Signed<Prepare>) -> Option<Error> {
-        if prepare.message.certificate.message.view != self.view {
-            return Some(Error::Invalid);
-        }
-        if prepare.signer >= self.participants.len() as u16 {
-            return Some(Error::Invalid);
-        }
-        if prepare.message.certificate.message.view <= self.lock.message.view
-            || prepare.message.certificate.message.block.prev != self.lock.message.block.id
-        {
-            return Some(Error::Invalid);
-        }
-        if prepare
-            .message
-            .certificate
-            .signers
-            .iter()
-            .filter(|b| *b)
-            .count()
-            < self.participants.len() * 2 / 3 + 1
-        {
-            return Some(Error::Invalid);
-        }
+    fn on_prepare(&mut self, prepare: Signed<Prepare>) -> Result<()> {
+        ensure!(
+            prepare.message.certificate.message.view == self.view,
+            "invalid view"
+        );
+        ensure!(
+            prepare.signer < self.participants.len() as u16,
+            "invalid signer"
+        );
+        ensure!(
+            prepare.message.certificate.message.view > self.lock.message.view,
+            "double for old view"
+        );
+        ensure!(
+            prepare.message.certificate.message.block.prev == self.lock.message.block.id,
+            "double should extend locked"
+        );
+        ensure!(
+            prepare
+                .message
+                .certificate
+                .signers
+                .iter()
+                .filter(|b| *b)
+                .count()
+                > self.participants.len() * 2 / 3,
+            "must be signed by honest majority"
+        );
 
         prepare.signature.verify(
             &prepare.message.to_bytes(),
@@ -350,18 +352,21 @@ impl Consensus {
                 })));
             }
         }
-        None
+        Ok(())
     }
 }
 
 struct Signers(Vec<PublicKey>);
 
 impl Signers {
-    fn decode<'a>(&'a self, bits: &'a BitVec) -> impl IntoIterator<Item = &'a PublicKey> {
-        bits.iter()
-            .enumerate()
-            .filter(|(_, b)| *b)
-            .map(|(i, _)| &self.0[i])
+    fn decode<'a>(&'a self, bits: &'a BitVec) -> impl IntoIterator<Item = Result<&'a PublicKey>> {
+        bits.iter().enumerate().filter(|(_, b)| *b).map(|(i, _)| {
+            if i < self.0.len() {
+                Ok(&self.0[i])
+            } else {
+                Err(anyhow!("invalid signer"))
+            }
+        })
     }
 
     fn len(&self) -> usize {
