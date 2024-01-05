@@ -110,48 +110,60 @@ impl Consensus {
     }
 
     pub fn on_delay(&mut self) {
-        let leader = self.view.0 % self.participants.len() as u64;
-        let key = self.keys.get(&self.participants[leader]);
-        if key.is_none() {
+        if self
+            .keys
+            .get(self.participants.leader(self.view).1)
+            .is_none()
+        {
             return;
         }
         // unlike the paper, i want to obtain double certificate on every block.
         // therefore i extend locked if it is equal to double, otherwise i retry locked block.
-        let propose = if self.locked.inner != self.double.inner {
-            Some(Propose {
+        if self.locked.inner != self.double.inner {
+            self.proposal = Some(Propose {
                 view: self.view,
                 block: self.locked.inner.block.clone(),
                 locked: self.locked.clone(),
                 double: self.double.clone(),
-            })
-        } else if let Some(proposal) = self.proposal.take() {
+            });
+            self.propose(None).expect("failed to propose block");
+        } else {
             self.proposal = Some(Propose {
                 view: self.view,
-                block: Block::default(),
+                block: Block {
+                    height: self.double.inner.block.height + 1,
+                    id: ID::default(),
+                },
                 locked: self.locked.clone(),
                 double: self.double.clone(),
             });
-            None
-        } else {
-            None
+            self.actions.push(Action::Propose());
         };
-        if let Some(proposal) = propose {
-            let signature = key.unwrap().sign(&proposal.to_bytes());
-            self.actions.push(Action::Send(Message::Propose(Signed {
-                inner: proposal,
-                signer: leader as u16,
-                signature,
-            })));
-        }
     }
 
-    pub fn propose(&mut self, id: ID) -> Result<()> {
-        bail!("not implemented");
+    pub fn propose(&mut self, id: Option<ID>) -> Result<()> {
+        let mut proposal = self.proposal.take().ok_or(anyhow!("no proposal"))?;
+        ensure!(proposal.view >= self.view, "proposal wasn't built in time");
+        if let Some(id) = id {
+            proposal.block.id = id;
+        }
+        let leader = self.participants.leader(proposal.view);
+        let key = self
+            .keys
+            .get(leader.1)
+            .ok_or(anyhow!("no key for a view leader"))?;
+        let signature = key.sign(&proposal.to_bytes());
+        self.actions.push(Action::Send(Message::Propose(Signed {
+            inner: proposal,
+            signer: leader.0,
+            signature,
+        })));
+        Ok(())
     }
 
     pub fn on_message(&mut self, message: Message) -> Result<()> {
         match message {
-            Message::Sync(sync) => Ok(()),
+            Message::Sync(sync) => self.on_sync(sync),
             Message::Prepare(prepare) => self.on_prepare(prepare),
             Message::Vote(vote) => self.on_vote(vote),
             Message::Propose(propose) => self.on_propose(propose),
@@ -159,6 +171,10 @@ impl Consensus {
             Message::Wish(wish) => self.on_wish(wish),
             Message::Timeout(timeout) => self.on_timeout(timeout),
         }
+    }
+
+    fn on_sync(&mut self, sync: Sync) -> Result<()> {
+        Ok(())
     }
 
     fn on_wish(&mut self, wish: Signed<Wish>) -> Result<()> {
@@ -217,15 +233,6 @@ impl Consensus {
         ensure!(
             propose.inner.locked.inner.view >= self.locked.inner.view,
             "locked ranked lower than current locked"
-        );
-        ensure!(
-            propose.inner.locked.inner.block.prev == propose.inner.double.inner.block.id
-                || propose.inner.locked.inner.block.id == propose.inner.double.inner.block.id,
-            "locked either extends double or equal to double if it was finalized in the same view"
-        );
-        ensure!(
-            propose.inner.double.inner.block.prev == self.double.inner.block.id,
-            "double always extends known double block"
         );
         ensure!(
             propose.inner.locked.signers.iter().filter(|b| *b).count()
@@ -296,10 +303,6 @@ impl Consensus {
         ensure!(
             prepare.inner.certificate.inner.view > self.locked.inner.view,
             "double for old view"
-        );
-        ensure!(
-            prepare.inner.certificate.inner.block.prev == self.locked.inner.block.id,
-            "double should extend locked"
         );
         ensure!(
             prepare
@@ -387,61 +390,68 @@ impl Consensus {
     }
 
     fn on_vote2(&mut self, vote: Signed<Certificate<Vote>>) -> Result<()> {
-        let (leader, public) = self.participants.leader(self.view + 1);
-        if let Some(key) = self.keys.get(public) {
-            ensure!(vote.inner.view == self.view, "invalid view");
-            ensure!(
-                vote.signer < self.participants.len() as u16,
-                "invalid signer"
-            );
-            vote.signature
-                .verify(&vote.block.to_bytes(), &self.participants[vote.signer])?;
+        ensure!(
+            self.keys
+                .get(self.participants.leader(self.view + 1).1)
+                .is_some(),
+            "not a leader in view {:?}",
+            self.view + 1
+        );
+        ensure!(
+            vote.inner.view == self.view,
+            "vote view {:?} not equal to local view {:?}",
+            vote.inner.view,
+            self.view
+        );
+        ensure!(
+            vote.signer < self.participants.len() as u16,
+            "invalid signer index {:?}",
+            vote.signer
+        );
+        vote.signature
+            .verify(&vote.block.to_bytes(), &self.participants[vote.signer])?;
 
-            let votes = self
-                .votes2
-                .entry((vote.inner.view, vote.inner.block.clone()))
-                .or_insert_with(Votes::new);
+        let votes = self
+            .votes2
+            .entry((vote.inner.view, vote.inner.block.clone()))
+            .or_insert_with(Votes::new);
+        ensure!(
+            !votes.sent,
+            "already sent a double certificate for this view"
+        );
+        if votes.count() == 0 {
             ensure!(
-                !votes.sent,
-                "already sent a double certificate for this view"
+                vote.inner.signers.iter().filter(|b| *b).count()
+                    >= self.participants.honest_majority(),
+                "must be signed by honest majority"
             );
-            if votes.count() == 0 {
-                ensure!(
-                    vote.inner.signers.iter().filter(|b| *b).count()
-                        >= self.participants.honest_majority(),
-                    "must be signed by honest majority"
-                );
-                vote.inner.signature.verify(
-                    &vote.inner.to_bytes(),
-                    self.participants.decode(&vote.inner.signers),
-                )?;
-            }
-            votes.add(vote)?;
-
-            if votes.count() >= self.participants.honest_majority() {
-                votes.sent = true;
-                let cert = Certificate {
-                    inner: votes.message().inner.clone(),
-                    signature: AggregateSignature::aggregate(votes.signatures())
-                        .expect("failed to aggregate signatures"),
-                    signers: votes.signers(),
-                };
-                let signature = key.sign(&cert.to_bytes());
-                self.actions.push(Action::Send(Message::Propose(Signed {
-                    inner: Propose {
-                        view: self.view + 1,
-                        block: Block::default(),
-                        locked: votes.message().clone(),
-                        double: cert,
-                    },
-                    signer: leader,
-                    signature,
-                })))
-            }
-            Ok(())
-        } else {
-            bail!("not a leader in view {:?}", self.view + 1);
+            vote.inner.signature.verify(
+                &vote.inner.to_bytes(),
+                self.participants.decode(&vote.inner.signers),
+            )?;
         }
+        votes.add(vote)?;
+
+        if votes.count() >= self.participants.honest_majority() {
+            votes.sent = true;
+            let cert = Certificate {
+                inner: votes.message().inner.clone(),
+                signature: AggregateSignature::aggregate(votes.signatures())
+                    .expect("failed to aggregate signatures"),
+                signers: votes.signers(),
+            };
+            self.proposal = Some(Propose {
+                view: cert.view + 1,
+                block: Block {
+                    height: cert.height + 1,
+                    id: ID::default(),
+                },
+                locked: votes.message().clone(),
+                double: cert,
+            });
+            self.actions.push(Action::Propose());
+        }
+        Ok(())
     }
 
     fn is_epoch_boundary(&self) -> bool {

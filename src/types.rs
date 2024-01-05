@@ -16,6 +16,12 @@ impl ID {
     }
 }
 
+impl Default for ID {
+    fn default() -> Self {
+        ID([0; blake3::OUT_LEN].into())
+    }
+}
+
 impl PartialOrd<ID> for ID {
     fn partial_cmp(&self, other: &ID) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -32,7 +38,6 @@ impl Ord for ID {
 pub struct Block {
     pub height: u64,
     pub id: ID,
-    pub prev: ID,
 }
 
 impl Default for Block {
@@ -40,7 +45,6 @@ impl Default for Block {
         Block {
             height: 0,
             id: ID([0; blake3::OUT_LEN].into()),
-            prev: ID([0; blake3::OUT_LEN].into()),
         }
     }
 }
@@ -50,7 +54,6 @@ impl ToBytes for Block {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.height.to_le_bytes());
         bytes.extend_from_slice(self.id.as_bytes());
-        bytes.extend_from_slice(self.prev.as_bytes());
         bytes
     }
 }
