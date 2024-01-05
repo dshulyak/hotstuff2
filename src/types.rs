@@ -3,16 +3,46 @@ use crate::codec::ToBytes;
 
 use bit_vec::BitVec;
 use blake3;
-use std::ops::{Add, AddAssign, Rem};
+use std::ops::{Add, AddAssign, Deref, Rem};
 
 pub type Signer = u16;
-pub type ID = blake3::Hash;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct ID(blake3::Hash);
+
+impl ID {
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl PartialOrd<ID> for ID {
+    fn partial_cmp(&self, other: &ID) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ID {
+    fn cmp(&self, other: &ID) -> std::cmp::Ordering {
+        self.0.as_bytes().cmp(other.0.as_bytes())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Block {
     pub height: u64,
     pub id: ID,
     pub prev: ID,
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        Block {
+            height: 0,
+            id: ID([0; blake3::OUT_LEN].into()),
+            prev: ID([0; blake3::OUT_LEN].into()),
+        }
+    }
 }
 
 impl ToBytes for Block {
@@ -57,25 +87,41 @@ impl ToBytes for Prepare {
 
 #[derive(Clone)]
 pub struct Certificate<T: ToBytes> {
-    pub message: T,
+    pub inner: T,
     pub signature: AggregateSignature,
     pub signers: BitVec,
+}
+
+impl<T: ToBytes> Deref for Certificate<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl<T: ToBytes> ToBytes for Certificate<T> {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&self.message.to_bytes());
+        bytes.extend_from_slice(&self.inner.to_bytes());
         bytes.extend_from_slice(&self.signature.to_bytes());
         bytes.extend_from_slice(&self.signers.to_bytes());
         bytes
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Vote {
     pub view: View,
     pub block: Block,
+}
+
+impl Deref for Vote {
+    type Target = Block;
+
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
 }
 
 impl ToBytes for Vote {
@@ -98,7 +144,7 @@ impl ToBytes for Wish {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct View(pub u64);
 
 impl ToBytes for View {
@@ -133,10 +179,19 @@ pub struct Timeout {
     pub certificate: Certificate<View>,
 }
 
+#[derive(Clone)]
 pub struct Signed<T: ToBytes> {
-    pub message: T,
+    pub inner: T,
     pub signer: Signer,
     pub signature: Signature,
+}
+
+impl<T: ToBytes> Deref for Signed<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 pub struct Sync {
@@ -165,7 +220,7 @@ pub enum Message {
     Propose(Signed<Propose>),
     Prepare(Signed<Prepare>),
     Vote(Signed<Vote>),
-    Vote2(Signed<Vote>),
+    Vote2(Signed<Certificate<Vote>>),
     Wish(Signed<Wish>),
     Timeout(Timeout),
     Sync(Sync),

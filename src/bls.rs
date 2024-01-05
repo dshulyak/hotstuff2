@@ -83,6 +83,7 @@ impl PrivateKey {
     }
 }
 
+#[derive(Clone)]
 pub struct Signature(blst::Signature);
 
 impl ToBytes for Signature {
@@ -100,7 +101,8 @@ impl Signature {
     }
 }
 
-enum Domain {
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Domain {
     Propose = 0,
     Prepare = 1,
     Vote = 2,
