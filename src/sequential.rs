@@ -1,9 +1,4 @@
-use crate::bls::{AggregateSignature, Domain, PrivateKey, PublicKey, Signature};
-use crate::codec::ToBytes;
-use crate::types::{
-    Block, Certificate, Message, Prepare, Propose, Signed, Signer, Sync, Timeout, View, Vote, Wish,
-    ID,
-};
+use crate::types::*;
 
 use anyhow::{anyhow, bail, ensure, Result};
 use bit_vec::BitVec;
@@ -30,6 +25,8 @@ pub enum Action {
     ResetTicks(),
 
     // node is a leader and ready to propose
+    // when this action received call Consensus::propose()
+    // TODO consider notifying a node that it is a leader in the next view after it voted
     Propose(),
 }
 
