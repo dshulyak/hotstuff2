@@ -174,6 +174,26 @@ impl Consensus {
     }
 
     fn on_sync(&mut self, sync: Sync) -> Result<()> {
+        if let Some(double) = sync.double {
+            if double.block.height == self.double.inner.block.height + 1 {
+                double.signature.verify(
+                    &double.inner.block.to_bytes(),
+                    self.participants.decode(&double.signers),
+                )?;
+                self.double = double;
+                self.actions.push(Action::Commit(self.double.clone()));
+            }
+        }
+        if let Some(locked) = sync.locked {
+            if locked.view > self.locked.view {
+                locked.signature.verify(
+                    &locked.inner.block.to_bytes(),
+                    self.participants.decode(&locked.signers),
+                )?;
+                self.locked = locked;
+                self.actions.push(Action::Lock(self.locked.clone()));
+            }
+        }
         Ok(())
     }
 
