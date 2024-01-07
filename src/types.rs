@@ -1,7 +1,9 @@
-use anyhow::{Error, Result};
+use anyhow::{anyhow, Result};
 use bit_vec::BitVec;
 use blake3;
-use blst::min_pk as blst;
+use blst::min_sig as blst;
+use rand::thread_rng;
+use rand::{rngs::OsRng, Rng};
 
 use std::hash;
 use std::ops::{Add, AddAssign, Deref, Rem};
@@ -16,8 +18,14 @@ pub trait FromBytes {
 
 pub type Signer = u16;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ID(blake3::Hash);
+
+impl ID {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        ID(bytes.into())
+    }
+}
 
 impl ID {
     pub fn as_bytes(&self) -> &[u8] {
@@ -43,10 +51,16 @@ impl Ord for ID {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Block {
     pub height: u64,
     pub id: ID,
+}
+
+impl Block {
+    pub fn new(height: u64, id: ID) -> Self {
+        Block { height, id }
+    }
 }
 
 impl Default for Block {
@@ -67,6 +81,7 @@ impl ToBytes for Block {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Propose {
     pub view: View,
     pub block: Block,
@@ -85,6 +100,7 @@ impl ToBytes for Propose {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepare {
     pub certificate: Certificate<Vote>,
 }
@@ -97,7 +113,7 @@ impl ToBytes for Prepare {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Certificate<T: ToBytes> {
     pub inner: T,
     pub signature: AggregateSignature,
@@ -122,7 +138,7 @@ impl<T: ToBytes> ToBytes for Certificate<T> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Vote {
     pub view: View,
     pub block: Block,
@@ -145,7 +161,7 @@ impl ToBytes for Vote {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wish {
     pub view: View,
 }
@@ -162,6 +178,24 @@ pub struct View(pub u64);
 impl ToBytes for View {
     fn to_bytes(&self) -> Vec<u8> {
         self.0.to_le_bytes().to_vec()
+    }
+}
+
+impl From<u64> for View {
+    fn from(v: u64) -> Self {
+        View(v)
+    }
+}
+
+impl From<usize> for View {
+    fn from(v: usize) -> Self {
+        View(v as u64)
+    }
+}
+
+impl From<i32> for View {
+    fn from(v: i32) -> Self {
+        View(v as u64)
     }
 }
 
@@ -187,11 +221,12 @@ impl Rem<u64> for View {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Timeout {
     pub certificate: Certificate<View>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Signed<T: ToBytes> {
     pub inner: T,
     pub signer: Signer,
@@ -206,6 +241,7 @@ impl<T: ToBytes> Deref for Signed<T> {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Sync {
     pub locked: Option<Certificate<Vote>>,
     pub double: Option<Certificate<Vote>>,
@@ -228,6 +264,7 @@ impl ToBytes for Sync {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Message {
     Propose(Signed<Propose>),
     Prepare(Signed<Prepare>),
@@ -238,7 +275,49 @@ pub enum Message {
     Sync(Sync),
 }
 
-#[derive(Clone, PartialEq, Eq)]
+impl From<Signed<Propose>> for Message {
+    fn from(signed: Signed<Propose>) -> Self {
+        Message::Propose(signed)
+    }
+}
+
+impl From<Signed<Prepare>> for Message {
+    fn from(signed: Signed<Prepare>) -> Self {
+        Message::Prepare(signed)
+    }
+}
+
+impl From<Signed<Vote>> for Message {
+    fn from(signed: Signed<Vote>) -> Self {
+        Message::Vote(signed)
+    }
+}
+
+impl From<Signed<Certificate<Vote>>> for Message {
+    fn from(signed: Signed<Certificate<Vote>>) -> Self {
+        Message::Vote2(signed)
+    }
+}
+
+impl From<Signed<Wish>> for Message {
+    fn from(signed: Signed<Wish>) -> Self {
+        Message::Wish(signed)
+    }
+}
+
+impl From<Timeout> for Message {
+    fn from(timeout: Timeout) -> Self {
+        Message::Timeout(timeout)
+    }
+}
+
+impl From<Sync> for Message {
+    fn from(sync: Sync) -> Self {
+        Message::Sync(sync)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicKey(blst::PublicKey);
 
 impl hash::Hash for PublicKey {
@@ -259,7 +338,7 @@ impl Ord for PublicKey {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AggregateSignature(blst::AggregateSignature);
 
 impl AggregateSignature {
@@ -292,8 +371,22 @@ impl AggregateSignature {
             .verify(true, message, &[], &[], &public.to_public_key(), true)
         {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
-            _ => Err(Error::msg("invalid aggregate signature")),
+            err => Err(anyhow!("failed to verify signature: {:?}", err)),
         }
+    }
+}
+
+impl PartialEq for AggregateSignature {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_signature() == other.0.to_signature()
+    }
+}
+
+impl Eq for AggregateSignature {}
+
+impl Default for AggregateSignature {
+    fn default() -> Self {
+        Signature::from_bytes(&[0; 96]).into()
     }
 }
 
@@ -309,16 +402,37 @@ impl ToBytes for AggregateSignature {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct PrivateKey(blst::SecretKey);
 
 impl PrivateKey {
     pub(crate) fn sign(&self, message: &[u8]) -> Signature {
         Signature(self.0.sign(message, &[], &[]))
     }
+
+    pub(crate) fn os_random() -> Self {
+        let seed = OsRng.gen::<[u8; 32]>();
+        PrivateKey(blst::SecretKey::key_gen(&seed, &[]).expect("failed to generate private key"))
+    }
+
+    pub(crate) fn random() -> Self {
+        let seed = thread_rng().gen::<[u8; 32]>();
+        PrivateKey(blst::SecretKey::key_gen(&seed, &[]).expect("failed to generate private key"))
+    }
+
+    pub(crate) fn public(&self) -> PublicKey {
+        PublicKey(self.0.sk_to_pk())
+    }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Signature(blst::Signature);
+
+impl Into<AggregateSignature> for Signature {
+    fn into(self) -> AggregateSignature {
+        AggregateSignature(blst::AggregateSignature::from_signature(&self.0))
+    }
+}
 
 impl ToBytes for Signature {
     fn to_bytes(&self) -> Vec<u8> {
@@ -326,11 +440,25 @@ impl ToBytes for Signature {
     }
 }
 
+impl FromBytes for Signature {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Signature(blst::Signature::from_bytes(bytes).expect("fixme"))
+    }
+}
+
+impl PartialEq for Signature {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Signature {}
+
 impl Signature {
     pub(crate) fn verify(&self, message: &[u8], public_key: &PublicKey) -> Result<()> {
         match self.0.verify(true, message, &[], &[], &public_key.0, true) {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
-            _ => Err(Error::msg("invalid signature")),
+            err => Err(anyhow!("invalid signature: {:?}", err)),
         }
     }
 }
@@ -342,4 +470,5 @@ pub(crate) enum Domain {
     Vote = 2,
     Vote2 = 3,
     Wish = 4,
+    Extra = 1000,
 }

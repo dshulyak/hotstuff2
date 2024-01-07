@@ -1,10 +1,11 @@
 use crate::types::*;
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use bit_vec::BitVec;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Index;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     // persist the following data before sending messages
     // committed certificate can be executed.
@@ -30,13 +31,48 @@ pub enum Action {
     Propose(),
 }
 
+impl Action {
+    pub fn commit(certificate: Certificate<Vote>) -> Self {
+        Action::Commit(certificate)
+    }
+
+    pub fn lock(certificate: Certificate<Vote>) -> Self {
+        Action::Lock(certificate)
+    }
+
+    pub fn voted(view: View) -> Self {
+        Action::Voted(view)
+    }
+
+    pub fn send(message: Message) -> Self {
+        Action::Send(message)
+    }
+
+    pub fn send_to(message: Message, to: PublicKey) -> Self {
+        Action::SendTo(message, to)
+    }
+
+    pub fn wait_delay() -> Self {
+        Action::WaitDelay()
+    }
+
+    pub fn reset_ticks() -> Self {
+        Action::ResetTicks()
+    }
+
+    pub fn propose() -> Self {
+        Action::Propose()
+    }
+}
+
 pub struct Consensus {
     // current view
     view: View,
     next_tick: View,
     // last voted view
     voted: View,
-    // participants are sorted lexicographically. used to decode public keys from bitvec in certificates
+    // participants must be sorted lexicographically across all participating nodes.
+    // used to decode public keys by reference.
     participants: Signers,
     // single certificate from 2/3*f+1 Vote. initialized to genesis
     locked: Certificate<Vote>,
@@ -62,8 +98,9 @@ impl Consensus {
         lock: Certificate<Vote>,
         commit: Certificate<Vote>,
         voted: View,
-        keys: HashMap<PublicKey, PrivateKey>,
+        keys: &[PrivateKey],
     ) -> Self {
+        debug_assert!(participants.len() >= 4);
         Self {
             view,
             next_tick: View(0),
@@ -72,7 +109,7 @@ impl Consensus {
             double: commit,
             actions: Vec::new(),
             voted,
-            keys,
+            keys: keys.iter().map(|key| (key.public(), key.clone())).collect(),
             proposal: None,
             votes: BTreeMap::new(),
             votes2: BTreeMap::new(),
@@ -90,7 +127,9 @@ impl Consensus {
             // execute view synchronization protocol
             for (id, pk) in self.keys.iter() {
                 if let Some(i) = self.participants.0.iter().position(|p| p == id) {
-                    let wish = Wish { view: self.view };
+                    let wish = Wish {
+                        view: self.view + 1,
+                    };
                     let signature = pk.sign(&wish.to_bytes());
                     self.actions.push(Action::Send(Message::Wish(Signed {
                         inner: wish,
@@ -206,7 +245,7 @@ impl Consensus {
         let wishes = self
             .timeouts
             .entry(wish.inner.view)
-            .or_insert_with(Votes::new);
+            .or_insert_with(|| Votes::new(self.participants.len()));
         wishes.add(wish)?;
 
         if wishes.count() >= self.participants.honest_majority() {
@@ -240,69 +279,81 @@ impl Consensus {
     }
 
     fn on_propose(&mut self, propose: Signed<Propose>) -> Result<()> {
-        // verification is roughly in the order of computational complexity
         ensure!(propose.inner.view >= self.view, "old view");
-        ensure!(self.voted > self.view, "already votedin this view");
+        ensure!(
+            self.voted < propose.inner.view,
+            "already voted in this view"
+        );
         ensure!(
             propose.signer < self.participants.len() as u16,
             "signer identifier is out of bounds"
         );
         ensure!(
-            propose.inner.locked.inner.view >= self.locked.inner.view,
+            (self.locked.inner.view == View(0) && propose.inner.locked.inner.view == View(0))
+                || propose.inner.locked.inner.view >= self.locked.inner.view,
             "locked ranked lower than current locked"
         );
         ensure!(
-            propose.inner.locked.signers.iter().filter(|b| *b).count()
-                >= self.participants.honest_majority(),
+            (self.locked.inner.view == View(0) && propose.inner.locked.inner.view == View(0))
+                || propose.inner.locked.signers.iter().filter(|b| *b).count()
+                    >= self.participants.honest_majority(),
             "locked signed by more than 2/3 participants"
         );
         ensure!(
-            propose.inner.double.signers.iter().filter(|b| *b).count()
-                >= self.participants.honest_majority(),
+            (self.double.inner.view == View(0) && propose.inner.double.inner.view == View(0))
+                || propose.inner.double.signers.iter().filter(|b| *b).count()
+                    >= self.participants.honest_majority(),
             "double signed by more than 2/3 participants"
+        );
+        ensure!(
+            propose.inner.block.height > self.double.inner.block.height,
+            "proposed block must have higher height"
         );
 
         propose.signature.verify(
             &propose.inner.to_bytes(),
             &self.participants[propose.signer],
         )?;
-        propose.inner.locked.signature.verify(
-            &propose.inner.locked.inner.to_bytes(),
-            self.participants.decode(&propose.inner.locked.signers),
-        )?;
-        propose.inner.double.signature.verify(
-            &propose.inner.double.inner.to_bytes(),
-            self.participants.decode(&propose.inner.double.signers),
-        )?;
+        if propose.inner.locked.view > View(0) {
+            propose.inner.locked.signature.verify(
+                &propose.inner.locked.inner.to_bytes(),
+                self.participants.decode(&propose.inner.locked.signers),
+            )?;
+        }
+        if propose.inner.double.view > View(0) {
+            propose.inner.double.signature.verify(
+                &propose.inner.double.inner.to_bytes(),
+                self.participants.decode(&propose.inner.double.signers),
+            )?;
+        }
 
-        self.voted = propose.inner.view;
-        self.locked = propose.inner.locked.clone();
-        self.double = propose.inner.double.clone();
-
-        // persist updates
-        self.actions.push(Action::Voted(self.voted));
-        self.actions.push(Action::Lock(self.locked.clone()));
-        self.actions.push(Action::Commit(self.double.clone()));
-
-        if self.double.inner.view > self.view {
+        if propose.inner.locked.view > View(0) {
+            self.locked = propose.inner.locked.clone();
+            self.actions.push(Action::Lock(self.locked.clone()));
+        }
+        if propose.inner.double.view > View(0) {
+            self.double = propose.inner.double.clone();
+            self.actions.push(Action::Commit(self.double.clone()));
+        }
+        if self.double.inner.view >= self.view {
             self.enter_view(self.double.inner.view + 1);
         }
-        if self.view != propose.inner.view {
-            return Ok(());
-        }
-
-        for (public, private) in self.keys.iter() {
-            if let Some(i) = self.participants.0.iter().position(|p| p == public) {
-                let vote = Vote {
-                    view: propose.inner.view.clone(),
-                    block: propose.inner.block.clone(),
-                };
-                let signature = private.sign(&vote.to_bytes());
-                self.actions.push(Action::Send(Message::Vote(Signed {
-                    inner: vote,
-                    signer: i as Signer,
-                    signature,
-                })));
+        if self.view == propose.inner.view {
+            self.voted = propose.inner.view;
+            self.actions.push(Action::Voted(self.voted));
+            for (public, private) in self.keys.iter() {
+                if let Ok(i) = self.participants.binary_search(public) {
+                    let vote = Vote {
+                        view: propose.inner.view.clone(),
+                        block: propose.inner.block.clone(),
+                    };
+                    let signature = private.sign(&vote.to_bytes());
+                    self.actions.push(Action::Send(Message::Vote(Signed {
+                        inner: vote,
+                        signer: i as Signer,
+                        signature,
+                    })));
+                }
             }
         }
         Ok(())
@@ -311,15 +362,18 @@ impl Consensus {
     fn on_prepare(&mut self, prepare: Signed<Prepare>) -> Result<()> {
         ensure!(
             prepare.inner.certificate.inner.view == self.view,
-            "invalid view"
+            "accepting prepare only for view {:?}",
+            self.view,
         );
         ensure!(
             prepare.signer < self.participants.len() as u16,
-            "invalid signer"
+            "invalid signer {:?}",
+            prepare.signer,
         );
         ensure!(
             prepare.inner.certificate.inner.view > self.locked.inner.view,
-            "double for old view"
+            "certificatate for old view {:?}",
+            prepare.inner.certificate.inner.view,
         );
         ensure!(
             prepare
@@ -351,8 +405,8 @@ impl Consensus {
                     block: prepare.inner.certificate.inner.block.clone(),
                 };
                 let signature = private.sign(&vote.to_bytes());
-                self.actions.push(Action::Send(Message::Vote(Signed {
-                    inner: vote,
+                self.actions.push(Action::Send(Message::Vote2(Signed {
+                    inner: self.locked.clone(),
                     signer: i as Signer,
                     signature,
                 })));
@@ -363,47 +417,47 @@ impl Consensus {
 
     fn on_vote(&mut self, vote: Signed<Vote>) -> Result<()> {
         let (leader, public) = self.participants.leader(self.view);
-        if let Some(key) = self.keys.get(public) {
-            ensure!(vote.inner.view == self.view, "invalid view");
-            ensure!(
-                vote.signer < self.participants.len() as u16,
-                "invalid signer"
-            );
-            vote.signature
-                .verify(&vote.to_bytes(), &self.participants[vote.signer])?;
+        let key = self
+            .keys
+            .get(public)
+            .ok_or_else(|| anyhow!("not a leader in view {:?}", self.view))?;
+        ensure!(vote.inner.view == self.view, "invalid view");
+        ensure!(
+            vote.signer < self.participants.len() as u16,
+            "invalid signer"
+        );
+        vote.signature
+            .verify(&vote.to_bytes(), &self.participants[vote.signer])?;
 
-            let votes = self
-                .votes
-                .entry((vote.inner.view, vote.inner.block.clone()))
-                .or_insert_with(Votes::new);
-            ensure!(
-                !votes.sent,
-                "already sent a prepare certificate for this view"
-            );
-            votes.add(vote)?;
+        let votes = self
+            .votes
+            .entry((vote.inner.view, vote.inner.block.clone()))
+            .or_insert_with(|| Votes::new(self.participants.len()));
+        ensure!(
+            !votes.sent,
+            "already sent a prepare certificate for this view"
+        );
+        votes.add(vote)?;
 
-            if votes.count() >= self.participants.honest_majority() {
-                votes.sent = true;
-                let signature = AggregateSignature::aggregate(votes.signatures())
-                    .expect("failed to aggregate signatures");
-                let cert = Prepare {
-                    certificate: Certificate {
-                        inner: votes.message(),
-                        signature: signature.clone(),
-                        signers: votes.signers(),
-                    },
-                };
-                let signature = key.sign(&cert.to_bytes());
-                self.actions.push(Action::Send(Message::Prepare(Signed {
-                    inner: cert,
-                    signer: leader,
-                    signature,
-                })));
-            }
-            Ok(())
-        } else {
-            bail!("not a leader in in view {:?}", vote.inner.view);
+        if votes.count() >= self.participants.honest_majority() {
+            votes.sent = true;
+            let signature = AggregateSignature::aggregate(votes.signatures())
+                .expect("failed to aggregate signatures");
+            let cert = Prepare {
+                certificate: Certificate {
+                    inner: votes.message(),
+                    signature: signature.clone(),
+                    signers: votes.signers(),
+                },
+            };
+            let signature = key.sign(&cert.to_bytes());
+            self.actions.push(Action::Send(Message::Prepare(Signed {
+                inner: cert,
+                signer: leader,
+                signature,
+            })));
         }
+        Ok(())
     }
 
     fn on_vote2(&mut self, vote: Signed<Certificate<Vote>>) -> Result<()> {
@@ -426,12 +480,12 @@ impl Consensus {
             vote.signer
         );
         vote.signature
-            .verify(&vote.block.to_bytes(), &self.participants[vote.signer])?;
+            .verify(&vote.inner.to_bytes(), &self.participants[vote.signer])?;
 
         let votes = self
             .votes2
             .entry((vote.inner.view, vote.inner.block.clone()))
-            .or_insert_with(Votes::new);
+            .or_insert_with(|| Votes::new(self.participants.len()));
         ensure!(
             !votes.sent,
             "already sent a double certificate for this view"
@@ -551,9 +605,9 @@ struct Votes<T: ToBytes + Clone> {
 }
 
 impl<T: ToBytes + Clone> Votes<T> {
-    fn new() -> Self {
+    fn new(n: usize) -> Self {
         Self {
-            signers: BitVec::new(),
+            signers: BitVec::from_elem(n, false),
             votes: Vec::new(),
             sent: false,
         }

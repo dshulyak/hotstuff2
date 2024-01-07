@@ -7,3 +7,12 @@
 - [bls12-381 signature library](https://github.com/supranational/blst)
 - [bls12-381 overview](https://hackmd.io/@benjaminion/bls12-381)
 
+
+TODO:
+- [ ] coverage
+- [ ] proptests
+- [ ] synchronization
+  move signature verification, signing and aggregations to one layer above message processing code.
+  participants array should remain immutable by contract, any changes to array should result in different instance.
+  message processing will be guarded by single mutex.
+- [ ] loom
