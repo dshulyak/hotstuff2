@@ -1,6 +1,7 @@
 use bit_vec::BitVec;
 
 use crate::sequential as seq;
+use crate::sequential::Action as action;
 use crate::types::*;
 
 struct Tester {
@@ -170,33 +171,13 @@ impl Tester {
         view: View,
         height: u64,
         id: &str,
-        locked: (View, u64, &str, Vec<Signer>),
-        double: (View, u64, &str, Vec<Signer>),
+        locked: Certificate<Vote>,
+        double: Certificate<Vote>,
     ) -> Message {
         let block = {
             let mut _id = [0; 32];
             _id[..id.len()].copy_from_slice(id.as_bytes());
             Block::new(height, ID::new(_id))
-        };
-        let locked = {
-            let (view, height, id, signers) = locked;
-            let block = {
-                let mut _id = [0; 32];
-                _id[..id.len()].copy_from_slice(id.as_bytes());
-                Block::new(height, ID::new(_id))
-            };
-            let vote = Vote { view, block };
-            self.certify(Domain::Vote, signers, &vote)
-        };
-        let double = {
-            let (view, height, id, signers) = double;
-            let block = {
-                let mut _id = [0; 32];
-                _id[..id.len()].copy_from_slice(id.as_bytes());
-                Block::new(height, ID::new(_id))
-            };
-            let vote = Vote { view, block };
-            self.certify(Domain::Vote, signers, &vote)
         };
         let propose = Propose {
             view,
@@ -306,8 +287,12 @@ struct Instance {
 }
 
 impl Instance {
+    fn is_leader(&self, view: View) -> bool {
+        self.consensus.is_leader(view)
+    }
+
     fn on_message(&mut self, message: Message) {
-        assert!(self.consensus.on_message(message).is_ok());
+        self.consensus.on_message(message).expect("message:");
     }
 
     fn on_tick(&mut self) {
@@ -318,8 +303,14 @@ impl Instance {
         self.consensus.on_delay();
     }
 
-    fn on_propose(&mut self, id: Option<ID>) {
-        assert!(self.consensus.propose(id).is_ok());
+    fn on_propose(&mut self, id: &str) {
+        let mut _id = [0; 32];
+        _id[..id.len()].copy_from_slice(id.as_bytes());
+        self.consensus.propose(Some(ID::new(_id))).expect("ERROR");
+    }
+
+    fn send(&mut self, message: Message) {
+        self.action(seq::Action::Send(message));
     }
 
     fn action(&mut self, action: seq::Action) {
@@ -341,6 +332,66 @@ impl Instance {
     }
 }
 
+struct Instances(Vec<Instance>);
+
+impl Instances {
+    fn leader(&mut self, view: View) -> &mut Instance {
+        self.0
+            .iter_mut()
+            .filter(|instance| instance.is_leader(view))
+            .next()
+            .unwrap()
+    }
+
+    fn on_message(&mut self, message: Message) {
+        self.0
+            .iter_mut()
+            .for_each(|instance| instance.on_message(message.clone()));
+    }
+
+    fn on_tick(&mut self) {
+        self.0.iter_mut().for_each(|instance| instance.on_tick());
+    }
+
+    fn on_delay(&mut self) {
+        self.0.iter_mut().for_each(|instance| instance.on_delay());
+    }
+
+    fn action(&mut self, action: seq::Action) {
+        self.0
+            .iter_mut()
+            .for_each(|instance| instance.action(action.clone()));
+    }
+
+    fn send(&mut self, message: Message) {
+        self.action(seq::Action::Send(message));
+    }
+
+    fn actions(&mut self, actions: Vec<seq::Action>) {
+        self.0
+            .iter_mut()
+            .for_each(|instance| instance.actions(actions.clone()));
+    }
+
+    fn no_actions(&mut self) {
+        self.0.iter_mut().for_each(|instance| instance.no_actions());
+    }
+
+    fn drain_actions(&mut self) {
+        self.0
+            .iter_mut()
+            .for_each(|instance| instance.drain_actions());
+    }
+
+    fn for_each(&mut self, f: impl FnMut(&mut Instance)) {
+        self.0.iter_mut().for_each(f);
+    }
+
+    fn map(&mut self, f: impl FnMut(&mut Instance) -> Message) -> Vec<Message> {
+        self.0.iter_mut().map(f).collect()
+    }
+}
+
 fn test_nonvoting(f: impl FnOnce(&Tester, &mut Instance)) {
     let cluster = Tester::new(4);
     let mut instance = Instance {
@@ -359,61 +410,41 @@ fn test_voting(i: usize, f: impl FnOnce(&Tester, &mut Instance)) {
     f(&cluster, &mut instance)
 }
 
-fn test_multi(n: usize, f: impl FnOnce(&Tester, &mut Vec<Instance>)) {
+fn test_multi(n: usize, f: impl FnOnce(&Tester, &mut Instances)) {
     let cluster = Tester::new(n);
-    let mut instances = (0..n)
+    let instances = (0..n)
         .map(|i| Instance {
             consensus: cluster.active(i),
             signer: Some(i as u16),
         })
-        .collect();
-    f(&cluster, &mut instances)
+        .collect::<Vec<_>>();
+    f(&cluster, &mut Instances(instances))
 }
 
 #[test]
-fn test_nonvoting_sanity() {
-    test_nonvoting(|tester, inst: &mut Instance| {
-        inst.on_message(tester.timeout(1.into(), vec![0, 1, 2]));
-        inst.action(seq::Action::reset_ticks());
-        inst.action(seq::Action::wait_delay());
-        inst.action(seq::Action::send(tester.sync_genesis()));
-        inst.on_message(tester.propose_first(1.into(), "a"));
-        inst.action(seq::Action::voted(1.into()));
-        inst.on_message(tester.prepare(1.into(), 1, "a", vec![0, 1, 2]));
-        inst.action(seq::Action::lock(tester.certify_vote(
-            1.into(),
-            1,
-            "a",
-            vec![0, 1, 2],
-        )));
-        inst.no_actions();
-    });
-}
-
-#[test]
-fn test_voting_sanity() {
+fn test_sanity() {
     test_voting(0, |tester, inst: &mut Instance| {
         inst.on_message(tester.timeout(1.into(), vec![0, 1, 2]));
-        inst.action(seq::Action::reset_ticks());
-        inst.action(seq::Action::wait_delay());
-        inst.action(seq::Action::send(tester.sync_genesis()));
+        inst.action(action::reset_ticks());
+        inst.action(action::wait_delay());
+        inst.action(action::send(tester.sync_genesis()));
         inst.on_message(tester.propose_first(1.into(), "a"));
-        inst.action(seq::Action::voted(1.into()));
+        inst.action(action::voted(1.into()));
 
-        inst.action(seq::Action::send(tester.vote(
+        inst.action(action::send(tester.vote(
             1.into(),
             1,
             "a",
             inst.signer.unwrap(),
         )));
         inst.on_message(tester.prepare(1.into(), 1, "a", vec![0, 1, 2]));
-        inst.action(seq::Action::lock(tester.certify_vote(
+        inst.action(action::lock(tester.certify_vote(
             1.into(),
             1,
             "a",
             vec![0, 1, 2],
         )));
-        inst.action(seq::Action::send(tester.vote2(
+        inst.action(action::send(tester.vote2(
             1.into(),
             1,
             "a",
@@ -424,11 +455,71 @@ fn test_voting_sanity() {
 }
 
 #[test]
-fn test_multi_progress() {
-    test_multi(4, |tester, instances| {
-        instances.iter_mut().for_each(|i| i.on_tick());
+fn test_multi_bootstrap() {
+    test_multi(4, |tester, instances: &mut Instances| {
+        instances.on_tick();
+        instances.for_each(|i| i.action(action::send(tester.wish(1.into(), i.signer.unwrap()))));
+        instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
+        instances.action(action::reset_ticks());
+        instances.action(action::wait_delay());
+        instances.action(action::send(tester.sync_genesis()));
+        instances.on_delay();
+        instances.leader(1.into()).action(action::propose());
+
+        instances.no_actions();
+
+        instances.leader(1.into()).on_propose("a");
         instances
+            .leader(1.into())
+            .action(action::send(tester.propose_first(1.into(), "a")));
+        instances.on_message(tester.propose_first(1.into(), "a"));
+        instances.action(action::voted(1.into()));
+
+        let votes = instances
+            .0
             .iter_mut()
-            .for_each(|i| i.action(seq::Action::send(tester.wish(1.into(), i.signer.unwrap()))));
+            .map(|i| {
+                let vote = tester.vote(1.into(), 1, "a", i.signer.unwrap());
+                i.action(action::send(vote.clone()));
+                vote
+            })
+            .collect::<Vec<_>>();
+
+        instances.no_actions();
+
+        votes.into_iter().for_each(|v| {
+            instances.leader(1.into()).on_message(v);
+        });
+        instances
+            .leader(1.into())
+            .send(tester.prepare(1.into(), 1, "a", vec![0, 1, 2]));
+        instances.on_message(tester.prepare(1.into(), 1, "a", vec![0, 1, 2]));
+        instances.action(action::lock(tester.certify_vote(
+            1.into(),
+            1,
+            "a",
+            vec![0, 1, 2],
+        )));
+        instances
+            .map(|i| {
+                let vote = tester.vote2(1.into(), 1, "a", i.signer.unwrap(), vec![0, 1, 2]);
+                i.action(action::send(vote.clone()));
+                vote
+            })
+            .into_iter()
+            .for_each(|v| instances.leader(2.into()).on_message(v));
+
+        let leader2 = instances.leader(2.into());
+        leader2.action(action::propose());
+        leader2.on_propose("b");
+        leader2.action(action::send(tester.propose(
+            2.into(),
+            2,
+            "b",
+            tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]),
+            tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
+        )));
+
+        instances.no_actions();
     })
 }

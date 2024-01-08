@@ -10,7 +10,12 @@
 
 TODO:
 - [ ] coverage
+  single and multi instances unit tests that ensure that consensus makes progress
+  exactly as i expect it too.
 - [ ] proptests
+  completely random messages.
+  different order for good messages.
+  1/3 of the network is voting differently.
 - [ ] synchronization
   move signature verification, signing and aggregations to one layer above message processing code.
   participants array should remain immutable by contract, any changes to array should result in different instance.

@@ -3,6 +3,7 @@ use crate::types::*;
 use anyhow::{anyhow, ensure, Result};
 use bit_vec::BitVec;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Debug;
 use std::ops::Index;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +120,11 @@ impl Consensus {
 }
 
 impl Consensus {
+    pub fn is_leader(&self, view: View) -> bool {
+        let leader = self.participants.leader(view);
+        self.keys.get(leader.1).is_some()
+    }
+
     pub fn on_tick(&mut self) {
         if self.next_tick <= self.view && self.view != View(0) {
             return;
@@ -265,8 +271,9 @@ impl Consensus {
         ensure!(timeout.certificate.inner > self.view, "old view");
         ensure!(
             timeout.certificate.signers.iter().filter(|b| *b).count()
-                >= self.participants.honest_majority(),
-            "must be signed by honest majority"
+                == self.participants.honest_majority(),
+            "must be signed exactly by an honest majority: {:?}",
+            self.participants.honest_majority(),
         );
         timeout.certificate.signature.verify(
             &timeout.certificate.inner.to_bytes(),
@@ -400,10 +407,7 @@ impl Consensus {
         self.actions.push(Action::Lock(self.locked.clone()));
         for (public, private) in self.keys.iter() {
             if let Ok(i) = self.participants.binary_search(public) {
-                let vote = Vote {
-                    view: prepare.inner.certificate.inner.view.clone(),
-                    block: prepare.inner.certificate.inner.block.clone(),
-                };
+                let vote = self.locked.inner.clone();
                 let signature = private.sign(&vote.to_bytes());
                 self.actions.push(Action::Send(Message::Vote2(Signed {
                     inner: self.locked.clone(),
@@ -433,13 +437,10 @@ impl Consensus {
             .votes
             .entry((vote.inner.view, vote.inner.block.clone()))
             .or_insert_with(|| Votes::new(self.participants.len()));
-        ensure!(
-            !votes.sent,
-            "already sent a prepare certificate for this view"
-        );
-        votes.add(vote)?;
-
-        if votes.count() >= self.participants.honest_majority() {
+        if !votes.sent {
+            votes.add(vote)?;
+        }
+        if !votes.sent && votes.count() == self.participants.honest_majority() {
             votes.sent = true;
             let signature = AggregateSignature::aggregate(votes.signatures())
                 .expect("failed to aggregate signatures");
@@ -479,31 +480,29 @@ impl Consensus {
             "invalid signer index {:?}",
             vote.signer
         );
+        let signed = &vote.inner.inner;
         vote.signature
-            .verify(&vote.inner.to_bytes(), &self.participants[vote.signer])?;
+            .verify(&signed.to_bytes(), &self.participants[vote.signer])?;
 
         let votes = self
             .votes2
             .entry((vote.inner.view, vote.inner.block.clone()))
             .or_insert_with(|| Votes::new(self.participants.len()));
-        ensure!(
-            !votes.sent,
-            "already sent a double certificate for this view"
-        );
         if votes.count() == 0 {
             ensure!(
                 vote.inner.signers.iter().filter(|b| *b).count()
-                    >= self.participants.honest_majority(),
+                    == self.participants.honest_majority(),
                 "must be signed by honest majority"
             );
             vote.inner.signature.verify(
-                &vote.inner.to_bytes(),
+                &signed.to_bytes(),
                 self.participants.decode(&vote.inner.signers),
             )?;
         }
-        votes.add(vote)?;
-
-        if votes.count() >= self.participants.honest_majority() {
+        if !votes.sent {
+            votes.add(vote)?;
+        }
+        if !votes.sent && votes.count() == self.participants.honest_majority() {
             votes.sent = true;
             let cert = Certificate {
                 inner: votes.message().inner.clone(),
@@ -598,13 +597,13 @@ impl Index<u64> for Signers {
     }
 }
 
-struct Votes<T: ToBytes + Clone> {
+struct Votes<T: ToBytes + Clone + Debug> {
     signers: BitVec,
     votes: Vec<Signed<T>>,
     pub sent: bool,
 }
 
-impl<T: ToBytes + Clone> Votes<T> {
+impl<T: ToBytes + Clone + Debug> Votes<T> {
     fn new(n: usize) -> Self {
         Self {
             signers: BitVec::from_elem(n, false),
@@ -615,8 +614,14 @@ impl<T: ToBytes + Clone> Votes<T> {
 
     fn add(&mut self, vote: Signed<T>) -> Result<()> {
         ensure!(
-            self.signers.get(vote.signer as usize).is_none(),
-            "vote already registered"
+            self.signers.get(vote.signer as usize).is_some(),
+            "bit vector length is too small for signer {:?}",
+            vote.signer,
+        );
+        ensure!(
+            self.signers.get(vote.signer as usize).map_or(false, |b| !b),
+            "vote already registered {:?}",
+            vote,
         );
         self.signers.set(vote.signer as usize, true);
         self.votes.push(vote);
