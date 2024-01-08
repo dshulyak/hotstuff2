@@ -52,7 +52,7 @@ impl Tester {
         key.sign(domain, &message.to_bytes())
     }
 
-    fn publics(&self) -> Vec<PublicKey> {
+    fn publics(&self) -> Box<[PublicKey]> {
         self.keys.iter().map(|key| key.public()).collect()
     }
 

@@ -71,14 +71,15 @@ impl Action {
 }
 
 pub struct Consensus {
+    // participants must be sorted lexicographically across all participating nodes.
+    // used to decode public keys by reference.
+    participants: Signers,
+
     // current view
     view: View,
     next_tick: View,
     // last voted view
     voted: View,
-    // participants must be sorted lexicographically across all participating nodes.
-    // used to decode public keys by reference.
-    participants: Signers,
     // single certificate from 2/3*f+1 Vote. initialized to genesis
     locked: Certificate<Vote>,
     // double certificate from 2/3*f+1 Vote2. initialized to genesis
@@ -99,7 +100,7 @@ pub struct Consensus {
 impl Consensus {
     pub fn new(
         view: View,
-        participants: Vec<PublicKey>,
+        participants: Box<[PublicKey]>,
         lock: Certificate<Vote>,
         commit: Certificate<Vote>,
         voted: View,
@@ -119,9 +120,9 @@ impl Consensus {
             })
             .collect();
         Self {
+            participants: Signers(participants),
             view,
             next_tick: View(0),
-            participants: Signers(participants),
             locked: lock,
             double: commit,
             actions: Vec::new(),
@@ -571,7 +572,7 @@ impl Consensus {
     }
 }
 
-struct Signers(Vec<PublicKey>);
+struct Signers(Box<[PublicKey]>);
 
 impl Signers {
     fn decode<'a>(&'a self, bits: &'a BitVec) -> impl IntoIterator<Item = Result<&'a PublicKey>> {
