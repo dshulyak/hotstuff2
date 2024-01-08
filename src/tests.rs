@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use bit_vec::BitVec;
 
 use crate::sequential as seq;
@@ -19,7 +21,7 @@ impl Tester {
                 view: View(0),
                 block: Block::new(0, ID::new([0; 32])),
             },
-            signature: PrivateKey::random().sign(&[0; 32]).into(),
+            signature: PrivateKey::random().sign(Domain::Vote, &[0; 32]).into(),
             signers: BitVec::new(),
         };
         Self { keys, genesis }
@@ -27,17 +29,6 @@ impl Tester {
 
     fn genesis(&self) -> Certificate<Vote> {
         self.genesis.clone()
-    }
-
-    fn passive(&self) -> seq::Consensus {
-        seq::Consensus::new(
-            View(0),
-            self.publics(),
-            self.genesis(),
-            self.genesis(),
-            View(0),
-            &[],
-        )
     }
 
     fn active(&self, i: usize) -> seq::Consensus {
@@ -56,9 +47,9 @@ impl Tester {
         index as Signer
     }
 
-    fn sign<T: ToBytes>(&self, _domain: Domain, signer: Signer, message: &T) -> Signature {
+    fn sign<T: ToBytes>(&self, domain: Domain, signer: Signer, message: &T) -> Signature {
         let key = &self.keys[signer as usize];
-        key.sign(&message.to_bytes())
+        key.sign(domain, &message.to_bytes())
     }
 
     fn publics(&self) -> Vec<PublicKey> {
@@ -248,51 +239,50 @@ impl Tester {
     }
 
     fn sync_genesis(&self) -> Message {
-        Message::Sync(Sync {
-            locked: Some(self.genesis()),
-            double: Some(self.genesis()),
-        })
+        self.sync(Some(self.genesis()), Some(self.genesis()))
     }
 
     fn sync(
         &self,
-        locked: Option<(View, u64, &str, Vec<Signer>)>,
-        double: Option<(View, u64, &str, Vec<Signer>)>,
+        locked: Option<Certificate<Vote>>,
+        double: Option<Certificate<Vote>>,
     ) -> Message {
-        let locked = locked.map(|(view, height, id, signers)| {
-            let block = {
-                let mut _id = [0; 32];
-                _id[..id.len()].copy_from_slice(id.as_bytes());
-                Block::new(height, ID::new(_id))
-            };
-            let vote = Vote { view, block };
-            self.certify(Domain::Vote, signers, &vote)
-        });
-        let double = double.map(|(view, height, id, signers)| {
-            let block = {
-                let mut _id = [0; 32];
-                _id[..id.len()].copy_from_slice(id.as_bytes());
-                Block::new(height, ID::new(_id))
-            };
-            let vote = Vote { view, block };
-            self.certify(Domain::Vote, signers, &vote)
-        });
         Message::Sync(Sync { locked, double })
     }
 }
 
 struct Instance {
     consensus: seq::Consensus,
-    signer: Option<Signer>,
+    signer: Signer,
 }
 
 impl Instance {
+    fn bootstrap(&mut self, tester: &Tester, view: View, id: &str) {
+        self.on_message(tester.timeout(view, vec![0, 1, 2]));
+        self.reset_ticks();
+        self.wait_delay();
+        self.send(tester.sync_genesis());
+        self.on_message(tester.propose_first(view, id));
+        self.action(action::voted(view));
+        self.send(tester.vote(view, 1, id, self.signer));
+        self.on_message(tester.prepare(view, 1, id, vec![0, 1, 2]));
+        self.lock(tester.certify_vote(view, 1, id, vec![0, 1, 2]));
+        self.send(tester.vote2(view, 1, id, self.signer, vec![0, 1, 2]));
+        self.no_actions();
+    }
+
     fn is_leader(&self, view: View) -> bool {
         self.consensus.is_leader(view)
     }
 
     fn on_message(&mut self, message: Message) {
         self.consensus.on_message(message).expect("message:");
+    }
+
+    fn on_message_err(&mut self, message: Message) {
+        self.consensus
+            .on_message(message)
+            .expect_err("expected to fail");
     }
 
     fn on_tick(&mut self) {
@@ -311,6 +301,26 @@ impl Instance {
 
     fn send(&mut self, message: Message) {
         self.action(seq::Action::Send(message));
+    }
+
+    fn lock(&mut self, lock: Certificate<Vote>) {
+        self.action(seq::Action::Lock(lock));
+    }
+
+    fn commit(&mut self, commit: Certificate<Vote>) {
+        self.action(seq::Action::Commit(commit));
+    }
+
+    fn voted(&mut self, view: View) {
+        self.action(action::voted(view));
+    }
+
+    fn reset_ticks(&mut self) {
+        self.action(seq::Action::reset_ticks());
+    }
+
+    fn wait_delay(&mut self) {
+        self.action(seq::Action::wait_delay());
     }
 
     fn action(&mut self, action: seq::Action) {
@@ -392,20 +402,11 @@ impl Instances {
     }
 }
 
-fn test_nonvoting(f: impl FnOnce(&Tester, &mut Instance)) {
-    let cluster = Tester::new(4);
-    let mut instance = Instance {
-        consensus: cluster.passive(),
-        signer: None,
-    };
-    f(&cluster, &mut instance)
-}
-
-fn test_voting(i: usize, f: impl FnOnce(&Tester, &mut Instance)) {
+fn test_one(i: usize, f: impl FnOnce(&Tester, &mut Instance)) {
     let cluster = Tester::new(4);
     let mut instance = Instance {
         consensus: cluster.active(i),
-        signer: Some(i as u16),
+        signer: i as u16,
     };
     f(&cluster, &mut instance)
 }
@@ -415,42 +416,54 @@ fn test_multi(n: usize, f: impl FnOnce(&Tester, &mut Instances)) {
     let instances = (0..n)
         .map(|i| Instance {
             consensus: cluster.active(i),
-            signer: Some(i as u16),
+            signer: i as u16,
         })
         .collect::<Vec<_>>();
     f(&cluster, &mut Instances(instances))
 }
 
 #[test]
-fn test_sanity() {
-    test_voting(0, |tester, inst: &mut Instance| {
-        inst.on_message(tester.timeout(1.into(), vec![0, 1, 2]));
-        inst.action(action::reset_ticks());
-        inst.action(action::wait_delay());
-        inst.action(action::send(tester.sync_genesis()));
-        inst.on_message(tester.propose_first(1.into(), "a"));
-        inst.action(action::voted(1.into()));
+fn test_bootstrap() {
+    test_one(0, |tester, inst: &mut Instance| {
+        inst.bootstrap(tester, 1.into(), "a")
+    });
+}
 
-        inst.action(action::send(tester.vote(
-            1.into(),
-            1,
-            "a",
-            inst.signer.unwrap(),
-        )));
-        inst.on_message(tester.prepare(1.into(), 1, "a", vec![0, 1, 2]));
-        inst.action(action::lock(tester.certify_vote(
-            1.into(),
-            1,
-            "a",
-            vec![0, 1, 2],
-        )));
-        inst.action(action::send(tester.vote2(
-            1.into(),
-            1,
-            "a",
-            inst.signer.unwrap(),
-            vec![0, 1, 2],
-        )));
+#[test]
+fn test_commit_one() {
+    test_one(0, |tester, inst: &mut Instance| {
+        inst.bootstrap(tester, 1.into(), "a");
+        inst.on_message(tester.propose(
+            2.into(),
+            2,
+            "b",
+            tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]),
+            tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
+        ));
+        inst.commit(tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]));
+        inst.voted(2.into());
+        inst.send(tester.vote(2.into(), 2, "b", inst.signer));
+    });
+}
+
+#[test]
+fn test_domain_misuse() {
+    test_one(0, |tester, inst: &mut Instance| {
+        inst.bootstrap(tester, 1.into(), "a");
+        inst.on_message_err(tester.propose(
+            2.into(),
+            2,
+            "b",
+            tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]),
+            tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]),
+        ));
+        inst.on_message_err(tester.propose(
+            2.into(),
+            2,
+            "b",
+            tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
+            tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
+        ));
     });
 }
 
@@ -458,7 +471,7 @@ fn test_sanity() {
 fn test_multi_bootstrap() {
     test_multi(4, |tester, instances: &mut Instances| {
         instances.on_tick();
-        instances.for_each(|i| i.action(action::send(tester.wish(1.into(), i.signer.unwrap()))));
+        instances.for_each(|i| i.action(action::send(tester.wish(1.into(), i.signer))));
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
         instances.action(action::reset_ticks());
         instances.action(action::wait_delay());
@@ -479,7 +492,7 @@ fn test_multi_bootstrap() {
             .0
             .iter_mut()
             .map(|i| {
-                let vote = tester.vote(1.into(), 1, "a", i.signer.unwrap());
+                let vote = tester.vote(1.into(), 1, "a", i.signer);
                 i.action(action::send(vote.clone()));
                 vote
             })
@@ -502,7 +515,7 @@ fn test_multi_bootstrap() {
         )));
         instances
             .map(|i| {
-                let vote = tester.vote2(1.into(), 1, "a", i.signer.unwrap(), vec![0, 1, 2]);
+                let vote = tester.vote2(1.into(), 1, "a", i.signer, vec![0, 1, 2]);
                 i.action(action::send(vote.clone()));
                 vote
             })

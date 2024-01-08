@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{anyhow, Result};
 use bit_vec::BitVec;
 use blake3;
@@ -354,6 +356,7 @@ impl AggregateSignature {
 
     pub fn verify<'a>(
         &self,
+        domain: Domain,
         message: &[u8],
         public_keys: impl IntoIterator<Item = Result<&'a PublicKey>>,
     ) -> Result<()> {
@@ -365,11 +368,14 @@ impl AggregateSignature {
             true,
         )
         .expect("failed to aggregate public key");
-        match self
-            .0
-            .to_signature()
-            .verify(true, message, &[], &[], &public.to_public_key(), true)
-        {
+        match self.0.to_signature().verify(
+            true,
+            message,
+            domain.into(),
+            &[],
+            &public.to_public_key(),
+            true,
+        ) {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
             err => Err(anyhow!("failed to verify signature: {:?}", err)),
         }
@@ -406,8 +412,8 @@ impl ToBytes for AggregateSignature {
 pub struct PrivateKey(blst::SecretKey);
 
 impl PrivateKey {
-    pub(crate) fn sign(&self, message: &[u8]) -> Signature {
-        Signature(self.0.sign(message, &[], &[]))
+    pub(crate) fn sign(&self, dst: Domain, message: &[u8]) -> Signature {
+        Signature(self.0.sign(message, dst.into(), &[]))
     }
 
     pub(crate) fn os_random() -> Self {
@@ -455,20 +461,41 @@ impl PartialEq for Signature {
 impl Eq for Signature {}
 
 impl Signature {
-    pub(crate) fn verify(&self, message: &[u8], public_key: &PublicKey) -> Result<()> {
-        match self.0.verify(true, message, &[], &[], &public_key.0, true) {
+    pub(crate) fn verify(
+        &self,
+        domain: Domain,
+        message: &[u8],
+        public_key: &PublicKey,
+    ) -> Result<()> {
+        match self
+            .0
+            .verify(true, message, domain.into(), &[], &public_key.0, true)
+        {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
             err => Err(anyhow!("invalid signature: {:?}", err)),
         }
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Domain {
-    Propose = 0,
-    Prepare = 1,
-    Vote = 2,
-    Vote2 = 3,
-    Wish = 4,
-    Extra = 1000,
+#[derive(Debug, Clone)]
+pub enum Domain {
+    Propose,
+    Prepare,
+    Vote,
+    Vote2,
+    Wish,
+    Possesion,
+}
+
+impl Into<&'static [u8]> for Domain {
+    fn into(self) -> &'static [u8] {
+        match self {
+            Domain::Propose => b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_PRO_",
+            Domain::Prepare => b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_PRE_",
+            Domain::Vote => b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_V_",
+            Domain::Vote2 => b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_V2_",
+            Domain::Wish => b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_W_",
+            Domain::Possesion => b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_",
+        }
+    }
 }
