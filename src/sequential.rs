@@ -8,22 +8,26 @@ use std::ops::Index;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    // persist the following data before sending messages
+    // persist the following data before sending messages.
     // committed certificate can be executed.
     Commit(Certificate<Vote>),
-    // latest locked certificate has to be durable for safety.
+    // node should not vote below highest known locked certificate. persisted for safety.
     Lock(Certificate<Vote>),
     // node should not vote more than once in the view. persisted for safety.
     Voted(View),
 
     // send message to all participants
     Send(Message),
-    // send message to a specific participant
+    // send message to a specific participant. some messages may be delievered directly for aggregation purposes.
     SendTo(Message, PublicKey),
 
-    // wait single network delay
+    // wait single network delay. see below what is expected.
     WaitDelay(),
-    // reset ticks
+    // reset ticks. single tick should be sufficient to finish consensus round.
+    // - wait delay for leader to receive sync messages. during this delay leader needs to delive timeout certificate
+    //   and obtain sync messages from all honest participants. should be equal to two maximal network delays.
+    // - wait for 4 normal rounds, each one atleast one maximal network delay.
+    // single tick atleast 6 maximal network delays.
     ResetTicks(),
 
     // node is a leader and ready to propose
