@@ -459,9 +459,7 @@ fn test_tick_on_epoch_boundary() {
         inst.lock(tester.certify_vote(2.into(), 2, "b", vec![1, 2, 3]));
         inst.drain_actions();
 
-        for _ in 0..3 {
-            inst.on_tick();
-        }
+        (0..2).for_each(|_| inst.on_tick());
         inst.send(tester.wish(3.into(), inst.signer));
         inst.on_message(tester.timeout(3.into(), vec![0, 1, 2]));
         inst.reset_ticks();
@@ -482,12 +480,42 @@ fn test_propose_after_delay() {
     gentest(4, |tester, instances| {
         let inst = &mut instances.0[2];
         inst.bootstrap(tester, 1.into(), "a");
-        (0..2).for_each(|_| inst.on_tick());
+        inst.on_tick();
+        inst.wait_delay();
+        let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
+        inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
+
+        inst.no_actions();
+        inst.on_delay();
+        inst.send(tester.propose(2.into(), 1, "a", locked_a.clone(), tester.genesis()));
+    })
+}
+
+#[test]
+fn test_nonleader_on_delay() {
+    gentest(4, |tester, instances| {
+        // leaders are assigned in round-robin
+        // therefore leader for view 2 will be at index 2.
+        let inst = &mut instances.0[1];
+        inst.bootstrap(tester, 1.into(), "a");
+        inst.on_tick();
         inst.wait_delay();
         let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
         inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
         inst.on_delay();
-        inst.send(tester.propose(2.into(), 1, "a", locked_a.clone(), tester.genesis()));
+        inst.no_actions();
+    })
+}
+
+#[test]
+fn test_on_sync() {
+    gentest(4, |tester, instances| {
+        let inst = &mut instances.0[0];
+        inst.bootstrap(tester, 1.into(), "a");
+        inst.on_message(tester.sync(
+            Some(tester.certify_vote(2.into(), 1, "a", vec![0, 1, 2])),
+            Some(tester.certify_vote2(2.into(), 1, "a", vec![0, 1, 2])),
+        ));
     })
 }
 
@@ -512,6 +540,17 @@ fn test_domain_misuse() {
             tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
         ));
     });
+}
+
+#[test]
+fn test_aggregate_timeout() {
+    gentest(4, |tester, instances| {
+        let inst = &mut instances.0[1];
+        (0..4)
+            .map(|i| tester.wish(1.into(), i as Signer))
+            .for_each(|w| inst.on_message(w));
+        inst.send(tester.timeout(1.into(), vec![0, 1, 2]))
+    })
 }
 
 #[test]

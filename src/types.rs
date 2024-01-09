@@ -65,15 +65,6 @@ impl Block {
     }
 }
 
-impl Default for Block {
-    fn default() -> Self {
-        Block {
-            height: 0,
-            id: ID([0; blake3::OUT_LEN].into()),
-        }
-    }
-}
-
 impl ToBytes for Block {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -183,18 +174,6 @@ impl ToBytes for View {
     }
 }
 
-impl From<u64> for View {
-    fn from(v: u64) -> Self {
-        View(v)
-    }
-}
-
-impl From<usize> for View {
-    fn from(v: usize) -> Self {
-        View(v as u64)
-    }
-}
-
 impl From<i32> for View {
     fn from(v: i32) -> Self {
         View(v as u64)
@@ -277,56 +256,8 @@ pub enum Message {
     Sync(Sync),
 }
 
-impl From<Signed<Propose>> for Message {
-    fn from(signed: Signed<Propose>) -> Self {
-        Message::Propose(signed)
-    }
-}
-
-impl From<Signed<Prepare>> for Message {
-    fn from(signed: Signed<Prepare>) -> Self {
-        Message::Prepare(signed)
-    }
-}
-
-impl From<Signed<Vote>> for Message {
-    fn from(signed: Signed<Vote>) -> Self {
-        Message::Vote(signed)
-    }
-}
-
-impl From<Signed<Certificate<Vote>>> for Message {
-    fn from(signed: Signed<Certificate<Vote>>) -> Self {
-        Message::Vote2(signed)
-    }
-}
-
-impl From<Signed<Wish>> for Message {
-    fn from(signed: Signed<Wish>) -> Self {
-        Message::Wish(signed)
-    }
-}
-
-impl From<Timeout> for Message {
-    fn from(timeout: Timeout) -> Self {
-        Message::Timeout(timeout)
-    }
-}
-
-impl From<Sync> for Message {
-    fn from(sync: Sync) -> Self {
-        Message::Sync(sync)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicKey(blst::PublicKey);
-
-impl hash::Hash for PublicKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write(&self.0.to_bytes());
-    }
-}
 
 impl PartialOrd for PublicKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -389,18 +320,6 @@ impl PartialEq for AggregateSignature {
 }
 
 impl Eq for AggregateSignature {}
-
-impl Default for AggregateSignature {
-    fn default() -> Self {
-        Signature::from_bytes(&[0; 96]).into()
-    }
-}
-
-impl Into<Signature> for AggregateSignature {
-    fn into(self) -> Signature {
-        Signature(self.0.to_signature())
-    }
-}
 
 impl ToBytes for AggregateSignature {
     fn to_bytes(&self) -> Vec<u8> {

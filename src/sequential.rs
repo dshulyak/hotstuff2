@@ -142,9 +142,10 @@ impl Consensus {
 
     pub fn on_tick(&mut self) {
         if self.next_tick <= self.view && self.view != View(0) {
+            // view was advanced with double certificate, nothing else to do
             self.next_tick += 1;
         } else if self.is_epoch_boundary() {
-            // execute view synchronization protocol
+            // view will be advanced once leader aggregates timeout certificate from wishes.
             for (signer, pk) in self.keys.iter() {
                 let wish = Wish {
                     view: self.view + 1,
@@ -231,28 +232,28 @@ impl Consensus {
         if let Some(double) = &sync.double {
             double.signature.verify(
                 Domain::Vote2,
-                &double.inner.block.to_bytes(),
+                &double.inner.to_bytes(),
                 self.participants.decode(&double.signers),
             )?;
         }
         if let Some(locked) = &sync.locked {
             locked.signature.verify(
                 Domain::Vote,
-                &locked.inner.block.to_bytes(),
+                &locked.inner.to_bytes(),
                 self.participants.decode(&locked.signers),
             )?;
-        }
-
-        if let Some(double) = sync.double {
-            if double.block.height == self.double.inner.block.height + 1 {
-                self.double = double;
-                self.actions.push(Action::Commit(self.double.clone()));
-            }
         }
         if let Some(locked) = sync.locked {
             if locked.view > self.locked.view {
                 self.locked = locked;
                 self.actions.push(Action::Lock(self.locked.clone()));
+            }
+        }
+        if let Some(double) = sync.double {
+            if double.block.height == self.double.inner.block.height + 1 {
+                self.double = double;
+                self.actions.push(Action::Commit(self.double.clone()));
+                self.enter_view(self.double.inner.view + 1);
             }
         }
         Ok(())
@@ -305,6 +306,8 @@ impl Consensus {
 
         ensure!(timeout.certificate.inner > self.view, "old view");
         self.enter_view(timeout.certificate.inner);
+        self.next_tick = self.view + 1;
+        self.actions.push(Action::ResetTicks());
         self.wait_delay();
         Ok(())
     }
@@ -494,10 +497,9 @@ impl Consensus {
             "invalid signer index {:?}",
             vote.signer
         );
-        let signed = &vote.inner.inner;
         vote.signature.verify(
             Domain::Vote2,
-            &signed.to_bytes(),
+            &vote.inner.inner.to_bytes(),
             &self.participants[vote.signer],
         )?;
         ensure!(
@@ -506,7 +508,7 @@ impl Consensus {
         );
         vote.inner.signature.verify(
             Domain::Vote,
-            &signed.to_bytes(),
+            &vote.inner.inner.to_bytes(),
             self.participants.decode(&vote.inner.signers),
         )?;
 
@@ -558,10 +560,6 @@ impl Consensus {
     }
 
     fn enter_view(&mut self, view: View) {
-        if self.view % self.participants.atleast_one_honest() as u64 == 0 {
-            self.next_tick = self.view + 1;
-            self.actions.push(Action::ResetTicks());
-        }
         self.view = view;
         self.timeouts.retain(|view, _| view >= &self.view);
         self.votes.retain(|(view, _), _| view >= &self.view);
@@ -569,6 +567,8 @@ impl Consensus {
     }
 
     fn wait_delay(&mut self) {
+        // it will be more optimal to output it only if this node
+        // is not a leader in the next view
         self.actions.push(Action::WaitDelay());
         self.actions.push(Action::Send(Message::Sync(Sync {
             locked: Some(self.locked.clone()),
@@ -611,13 +611,6 @@ impl Signers {
 impl Index<u16> for Signers {
     type Output = PublicKey;
     fn index(&self, index: u16) -> &Self::Output {
-        &self.0[index as usize]
-    }
-}
-
-impl Index<u64> for Signers {
-    type Output = PublicKey;
-    fn index(&self, index: u64) -> &Self::Output {
         &self.0[index as usize]
     }
 }
