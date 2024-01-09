@@ -12,3 +12,4 @@ bit-vec = "0.6.3"
 bitvec = { version = "1.0.1", default-features = false, features = ["alloc", "atomic", "serde"] }
 anyhow = "1.0"
 rand = "0.8.0"
+parking_lot = "0.12.1"
