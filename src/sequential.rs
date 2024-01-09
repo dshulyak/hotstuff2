@@ -74,6 +74,7 @@ pub struct Consensus {
     // participants must be sorted lexicographically across all participating nodes.
     // used to decode public keys by reference.
     participants: Signers,
+    keys: HashMap<Signer, PrivateKey>,
 
     // current view
     view: View,
@@ -84,14 +85,14 @@ pub struct Consensus {
     locked: Certificate<Vote>,
     // double certificate from 2/3*f+1 Vote2. initialized to genesis
     double: Certificate<Vote>,
-    keys: HashMap<PublicKey, (Signer, PrivateKey)>,
     // to aggregate propose and prepare votes
     // key is view, type of the vote, signer
     // TODO this structs do not allow to easily spot equivocation
     votes: BTreeMap<(View, Block), Votes<Vote>>,
     votes2: BTreeMap<(View, Block), Votes<Certificate<Vote>>>,
     timeouts: BTreeMap<View, Votes<Wish>>,
-
+    // after leader is ready to send a proposal it emulates asynchronous upcall
+    // and waits for a identifier of the payload
     proposal: Option<Propose>,
 
     pub actions: Vec<Action>,
@@ -111,23 +112,20 @@ impl Consensus {
             .iter()
             .map(|key| {
                 (
-                    key.public(),
-                    (
-                        participants.binary_search(&key.public()).unwrap() as Signer,
-                        key.clone(),
-                    ),
+                    participants.binary_search(&key.public()).unwrap() as Signer,
+                    key.clone(),
                 )
             })
             .collect();
         Self {
             participants: Signers(participants),
+            keys: keys,
             view,
             next_tick: View(0),
             locked: lock,
             double: commit,
             actions: Vec::new(),
             voted,
-            keys: keys,
             proposal: None,
             votes: BTreeMap::new(),
             votes2: BTreeMap::new(),
@@ -139,23 +137,22 @@ impl Consensus {
 impl Consensus {
     pub fn is_leader(&self, view: View) -> bool {
         let leader = self.participants.leader(view);
-        self.keys.get(leader.1).is_some()
+        self.keys.get(&leader.0).is_some()
     }
 
     pub fn on_tick(&mut self) {
         if self.next_tick <= self.view && self.view != View(0) {
-            return;
-        }
-        if self.is_epoch_boundary() {
+            self.next_tick += 1;
+        } else if self.is_epoch_boundary() {
             // execute view synchronization protocol
-            for (_, pk) in self.keys.iter() {
+            for (signer, pk) in self.keys.iter() {
                 let wish = Wish {
                     view: self.view + 1,
                 };
-                let signature = pk.1.sign(Domain::Wish, &wish.to_bytes());
+                let signature = pk.sign(Domain::Wish, &wish.to_bytes());
                 self.actions.push(Action::Send(Message::Wish(Signed {
                     inner: wish,
-                    signer: pk.0,
+                    signer: *signer,
                     signature,
                 })));
             }
@@ -169,12 +166,12 @@ impl Consensus {
     pub fn on_delay(&mut self) {
         if self
             .keys
-            .get(self.participants.leader(self.view).1)
+            .get(&self.participants.leader(self.view).0)
             .is_none()
         {
             return;
         }
-        // unlike the paper, i want to obtain double certificate on every block.
+        // unlike in the paper, i want to obtain double certificate on every block.
         // therefore i extend locked if it is equal to double, otherwise i retry locked block.
         if self.locked.inner != self.double.inner {
             self.proposal = Some(Propose {
@@ -204,14 +201,15 @@ impl Consensus {
         if let Some(id) = id {
             proposal.block.id = id;
         }
+        let signer = self.participants.leader(proposal.view).0;
         let pk = self
             .keys
-            .get(self.participants.leader(proposal.view).1)
+            .get(&signer)
             .ok_or(anyhow!("no key for a view leader"))?;
-        let signature = pk.1.sign(Domain::Propose, &proposal.to_bytes());
+        let signature = pk.sign(Domain::Propose, &proposal.to_bytes());
         self.actions.push(Action::Send(Message::Propose(Signed {
             inner: proposal,
-            signer: pk.0,
+            signer: signer,
             signature,
         })));
         Ok(())
@@ -375,7 +373,7 @@ impl Consensus {
 
         self.voted = propose.inner.view;
         self.actions.push(Action::Voted(self.voted));
-        self.keys.iter().for_each(|(_, (signer, pk))| {
+        self.keys.iter().for_each(|(signer, pk)| {
             let vote = Vote {
                 view: propose.inner.view.clone(),
                 block: propose.inner.block.clone(),
@@ -432,7 +430,7 @@ impl Consensus {
         self.actions.push(Action::Lock(self.locked.clone()));
 
         let locked: Certificate<Vote> = prepare.inner.certificate;
-        self.keys.iter().for_each(|(_, (signer, pk))| {
+        self.keys.iter().for_each(|(signer, pk)| {
             let vote = locked.inner.to_bytes();
             let signature = pk.sign(Domain::Vote2, &vote);
             self.actions.push(Action::Send(Message::Vote2(Signed {
@@ -456,9 +454,10 @@ impl Consensus {
         )?;
 
         ensure!(vote.inner.view == self.view, "invalid view");
-        let (signer, pk) = self
+        let signer = self.participants.leader(self.view).0;
+        let pk = self
             .keys
-            .get(self.participants.leader(self.view).1)
+            .get(&signer)
             .ok_or_else(|| anyhow!("not a leader in view {:?}", self.view))?;
 
         let votes = self
@@ -482,7 +481,7 @@ impl Consensus {
             let signature = pk.sign(Domain::Prepare, &cert.to_bytes());
             self.actions.push(Action::Send(Message::Prepare(Signed {
                 inner: cert,
-                signer: *signer,
+                signer: signer,
                 signature,
             })));
         }
@@ -513,7 +512,7 @@ impl Consensus {
 
         ensure!(
             self.keys
-                .get(self.participants.leader(self.view + 1).1)
+                .get(&self.participants.leader(self.view + 1).0)
                 .is_some(),
             "not a leader in view {:?}",
             self.view + 1

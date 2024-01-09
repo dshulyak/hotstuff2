@@ -10,7 +10,7 @@
 
 TODO:
 - [ ] coverage
-  single and multi instances unit tests that ensure that consensus makes progress
+  single and multi instances unit tests so that consensus makes progress
   exactly as i expect it too.
 - [ ] proptests
   completely random messages.
@@ -21,3 +21,14 @@ TODO:
   participants array should remain immutable by contract, any changes to array should result in different instance.
   message processing will be guarded by single mutex.
 - [ ] loom
+
+## Tests
+
+1. `cargo install cargo-nextest --locked`
+2. `cargo nextest run`
+
+## Coverage
+
+1. `cargo install cargo-llvm-cov`
+2. Open web page with coverage report `cargo llvm-cov nextest --open`
+

@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
-use bit_vec::BitVec;
-
 use crate::sequential as seq;
 use crate::sequential::Action as action;
 use crate::types::*;
+
+use bit_vec::BitVec;
 
 struct Tester {
     keys: Vec<PrivateKey>,
@@ -15,7 +15,6 @@ impl Tester {
     fn new(n: usize) -> Self {
         let mut keys: Vec<_> = (0..n).map(|_| PrivateKey::random()).collect();
         keys.sort_by(|a, b| a.public().cmp(&b.public()));
-
         let genesis = Certificate {
             inner: Vote {
                 view: View(0),
@@ -323,6 +322,10 @@ impl Instance {
         self.action(seq::Action::wait_delay());
     }
 
+    fn propose(&mut self) {
+        self.action(seq::Action::propose());
+    }
+
     fn action(&mut self, action: seq::Action) {
         assert_eq!(self.consensus.actions.drain(0..1).next(), Some(action));
     }
@@ -402,16 +405,7 @@ impl Instances {
     }
 }
 
-fn test_one(i: usize, f: impl FnOnce(&Tester, &mut Instance)) {
-    let cluster = Tester::new(4);
-    let mut instance = Instance {
-        consensus: cluster.active(i),
-        signer: i as u16,
-    };
-    f(&cluster, &mut instance)
-}
-
-fn test_multi(n: usize, f: impl FnOnce(&Tester, &mut Instances)) {
+fn gentest(n: usize, f: impl FnOnce(&Tester, &mut Instances)) {
     let cluster = Tester::new(n);
     let instances = (0..n)
         .map(|i| Instance {
@@ -424,14 +418,15 @@ fn test_multi(n: usize, f: impl FnOnce(&Tester, &mut Instances)) {
 
 #[test]
 fn test_bootstrap() {
-    test_one(0, |tester, inst: &mut Instance| {
-        inst.bootstrap(tester, 1.into(), "a")
+    gentest(4, |tester, inst: &mut Instances| {
+        inst.0[0].bootstrap(tester, 1.into(), "a")
     });
 }
 
 #[test]
 fn test_commit_one() {
-    test_one(0, |tester, inst: &mut Instance| {
+    gentest(4, |tester, inst: &mut Instances| {
+        let inst = &mut inst.0[0];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_message(tester.propose(
             2.into(),
@@ -447,8 +442,46 @@ fn test_commit_one() {
 }
 
 #[test]
+fn test_retry_locked() {
+    gentest(4, |tester, inst: &mut Instances| {
+        let inst = &mut inst.0[3];
+        inst.bootstrap(tester, 1.into(), "a");
+        inst.on_message(tester.propose(
+            2.into(),
+            2,
+            "b",
+            tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]),
+            tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
+        ));
+        inst.commit(tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]));
+        inst.drain_actions();
+        inst.on_message(tester.prepare(2.into(), 2, "b", vec![1, 2, 3]));
+        inst.lock(tester.certify_vote(2.into(), 2, "b", vec![1, 2, 3]));
+        inst.drain_actions();
+
+        for _ in 0..3 {
+            inst.on_tick();
+        }
+        inst.send(tester.wish(3.into(), inst.signer));
+        inst.on_message(tester.timeout(3.into(), vec![0, 1, 2]));
+        inst.reset_ticks();
+        inst.wait_delay();
+        let locked_b = tester.certify_vote(2.into(), 2, "b", vec![1, 2, 3]);
+        let double_a = tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]);
+        inst.send(tester.sync(Some(locked_b.clone()), Some(double_a.clone())));
+        inst.on_delay();
+        inst.send(tester.propose(3.into(), 2, "b", locked_b.clone(), double_a.clone()));
+        inst.on_message(tester.propose(3.into(), 2, "b", locked_b.clone(), double_a.clone()));
+        inst.voted(3.into());
+        inst.send(tester.vote(3.into(), 2, "b", inst.signer));
+    });
+}
+
+#[test]
 fn test_domain_misuse() {
-    test_one(0, |tester, inst: &mut Instance| {
+    gentest(4, |tester, inst: &mut Instances| {
+        let inst = &mut inst.0[0];
+
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_message_err(tester.propose(
             2.into(),
@@ -469,7 +502,7 @@ fn test_domain_misuse() {
 
 #[test]
 fn test_multi_bootstrap() {
-    test_multi(4, |tester, instances: &mut Instances| {
+    gentest(4, |tester, instances: &mut Instances| {
         instances.on_tick();
         instances.for_each(|i| i.action(action::send(tester.wish(1.into(), i.signer))));
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
