@@ -230,24 +230,29 @@ impl Consensus {
     }
 
     fn on_sync(&mut self, sync: Sync) -> Result<()> {
+        if let Some(double) = &sync.double {
+            double.signature.verify(
+                Domain::Vote2,
+                &double.inner.block.to_bytes(),
+                self.participants.decode(&double.signers),
+            )?;
+        }
+        if let Some(locked) = &sync.locked {
+            locked.signature.verify(
+                Domain::Vote,
+                &locked.inner.block.to_bytes(),
+                self.participants.decode(&locked.signers),
+            )?;
+        }
+
         if let Some(double) = sync.double {
             if double.block.height == self.double.inner.block.height + 1 {
-                double.signature.verify(
-                    Domain::Vote2,
-                    &double.inner.block.to_bytes(),
-                    self.participants.decode(&double.signers),
-                )?;
                 self.double = double;
                 self.actions.push(Action::Commit(self.double.clone()));
             }
         }
         if let Some(locked) = sync.locked {
             if locked.view > self.locked.view {
-                locked.signature.verify(
-                    Domain::Vote,
-                    &locked.inner.block.to_bytes(),
-                    self.participants.decode(&locked.signers),
-                )?;
                 self.locked = locked;
                 self.actions.push(Action::Lock(self.locked.clone()));
             }
@@ -256,7 +261,6 @@ impl Consensus {
     }
 
     fn on_wish(&mut self, wish: Signed<Wish>) -> Result<()> {
-        ensure!(wish.inner.view > self.view, "old view");
         ensure!(
             wish.signer < self.participants.len() as u16,
             "invalid signer"
@@ -267,13 +271,15 @@ impl Consensus {
             &self.participants[wish.signer],
         )?;
 
+        ensure!(wish.inner.view > self.view, "old view");
+
         let wishes = self
             .timeouts
             .entry(wish.inner.view)
             .or_insert_with(|| Votes::new(self.participants.len()));
         wishes.add(wish)?;
-
-        if wishes.count() >= self.participants.honest_majority() {
+        if !wishes.sent && wishes.count() == self.participants.honest_majority() {
+            wishes.sent = true;
             self.actions.push(Action::Send(Message::Timeout(Timeout {
                 certificate: Certificate {
                     inner: wishes.message().view,
@@ -287,7 +293,6 @@ impl Consensus {
     }
 
     fn on_timeout(&mut self, timeout: Timeout) -> Result<()> {
-        ensure!(timeout.certificate.inner > self.view, "old view");
         ensure!(
             timeout.certificate.signers.iter().filter(|b| *b).count()
                 == self.participants.honest_majority(),
@@ -300,6 +305,7 @@ impl Consensus {
             self.participants.decode(&timeout.certificate.signers),
         )?;
 
+        ensure!(timeout.certificate.inner > self.view, "old view");
         self.enter_view(timeout.certificate.inner);
         self.wait_delay();
         Ok(())
@@ -369,19 +375,18 @@ impl Consensus {
 
         self.voted = propose.inner.view;
         self.actions.push(Action::Voted(self.voted));
-        for (_, pk) in self.keys.iter() {
+        self.keys.iter().for_each(|(_, (signer, pk))| {
             let vote = Vote {
                 view: propose.inner.view.clone(),
                 block: propose.inner.block.clone(),
             };
-            let signature = pk.1.sign(Domain::Vote, &vote.to_bytes());
+            let signature = pk.sign(Domain::Vote, &vote.to_bytes());
             self.actions.push(Action::Send(Message::Vote(Signed {
                 inner: vote,
-                signer: pk.0,
+                signer: *signer,
                 signature,
             })));
-        }
-
+        });
         Ok(())
     }
 
@@ -426,15 +431,16 @@ impl Consensus {
         self.locked = prepare.inner.certificate.clone();
         self.actions.push(Action::Lock(self.locked.clone()));
 
-        for (_, pk) in self.keys.iter() {
-            let vote = self.locked.inner.clone();
-            let signature = pk.1.sign(Domain::Vote2, &vote.to_bytes());
+        let locked: Certificate<Vote> = prepare.inner.certificate;
+        self.keys.iter().for_each(|(_, (signer, pk))| {
+            let vote = locked.inner.to_bytes();
+            let signature = pk.sign(Domain::Vote2, &vote);
             self.actions.push(Action::Send(Message::Vote2(Signed {
-                inner: self.locked.clone(),
-                signer: pk.0,
+                inner: locked.clone(),
+                signer: *signer,
                 signature,
             })));
-        }
+        });
         Ok(())
     }
 
@@ -450,7 +456,7 @@ impl Consensus {
         )?;
 
         ensure!(vote.inner.view == self.view, "invalid view");
-        let pk = self
+        let (signer, pk) = self
             .keys
             .get(self.participants.leader(self.view).1)
             .ok_or_else(|| anyhow!("not a leader in view {:?}", self.view))?;
@@ -473,10 +479,10 @@ impl Consensus {
                     signers: votes.signers(),
                 },
             };
-            let signature = pk.1.sign(Domain::Prepare, &cert.to_bytes());
+            let signature = pk.sign(Domain::Prepare, &cert.to_bytes());
             self.actions.push(Action::Send(Message::Prepare(Signed {
                 inner: cert,
-                signer: pk.0,
+                signer: *signer,
                 signature,
             })));
         }
