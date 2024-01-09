@@ -442,8 +442,8 @@ fn test_commit_one() {
 }
 
 #[test]
-fn test_retry_locked() {
-    gentest(4, |tester, inst: &mut Instances| {
+fn test_tick_on_epoch_boundary() {
+    gentest(4, |tester, inst| {
         let inst = &mut inst.0[3];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_message(tester.propose(
@@ -475,6 +475,20 @@ fn test_retry_locked() {
         inst.voted(3.into());
         inst.send(tester.vote(3.into(), 2, "b", inst.signer));
     });
+}
+
+#[test]
+fn test_propose_after_delay() {
+    gentest(4, |tester, instances| {
+        let inst = &mut instances.0[2];
+        inst.bootstrap(tester, 1.into(), "a");
+        (0..2).for_each(|_| inst.on_tick());
+        inst.wait_delay();
+        let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
+        inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
+        inst.on_delay();
+        inst.send(tester.propose(2.into(), 1, "a", locked_a.clone(), tester.genesis()));
+    })
 }
 
 #[test]
