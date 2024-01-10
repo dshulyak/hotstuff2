@@ -2,7 +2,8 @@ use crate::types::*;
 
 use anyhow::{anyhow, ensure, Result};
 use bit_vec::BitVec;
-use std::collections::{BTreeMap, HashMap};
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::ops::Index;
 
@@ -94,8 +95,7 @@ pub struct Consensus {
     // after leader is ready to send a proposal it emulates asynchronous upcall
     // and waits for a identifier of the payload
     proposal: Option<Propose>,
-
-    pub actions: Vec<Action>,
+    actions: VecDeque<Action>,
 }
 
 impl Consensus {
@@ -123,7 +123,7 @@ impl Consensus {
             next_tick: View(0),
             locked: lock,
             double: commit,
-            actions: Vec::new(),
+            actions: VecDeque::new(),
             voted,
             proposal: None,
             votes: BTreeMap::new(),
@@ -131,9 +131,13 @@ impl Consensus {
             timeouts: BTreeMap::new(),
         }
     }
-}
 
-impl Consensus {
+    pub fn consume_actions(&mut self, mut f: impl FnMut(Action)) {
+        while let Some(action) = self.actions.pop_front() {
+            f(action);
+        }
+    }
+
     pub fn is_leader(&self, view: View) -> bool {
         let leader = self.participants.leader(view);
         self.keys.get(&leader).is_some()
@@ -150,7 +154,7 @@ impl Consensus {
                     view: self.view + 1,
                 };
                 let signature = pk.sign(Domain::Wish, &wish.to_bytes());
-                self.actions.push(Action::Send(Message::Wish(Signed {
+                self.actions.push_back(Action::Send(Message::Wish(Signed {
                     inner: wish,
                     signer: *signer,
                     signature,
@@ -191,7 +195,7 @@ impl Consensus {
                 locked: self.locked.clone(),
                 double: self.double.clone(),
             });
-            self.actions.push(Action::Propose());
+            self.actions.push_back(Action::Propose());
         };
     }
 
@@ -207,11 +211,12 @@ impl Consensus {
             .get(&signer)
             .ok_or(anyhow!("no key for a view leader"))?;
         let signature = pk.sign(Domain::Propose, &proposal.to_bytes());
-        self.actions.push(Action::Send(Message::Propose(Signed {
-            inner: proposal,
-            signer: signer,
-            signature,
-        })));
+        self.actions
+            .push_back(Action::Send(Message::Propose(Signed {
+                inner: proposal,
+                signer: signer,
+                signature,
+            })));
         Ok(())
     }
 
@@ -247,13 +252,13 @@ impl Consensus {
         if let Some(locked) = sync.locked {
             if locked.view > self.locked.view {
                 self.locked = locked;
-                self.actions.push(Action::Lock(self.locked.clone()));
+                self.actions.push_back(Action::Lock(self.locked.clone()));
             }
         }
         if let Some(double) = sync.double {
             if double.block.height == self.double.inner.block.height + 1 {
                 self.double = double;
-                self.actions.push(Action::Commit(self.double.clone()));
+                self.actions.push_back(Action::Commit(self.double.clone()));
                 self.enter_view(self.double.inner.view + 1);
             }
         }
@@ -285,14 +290,15 @@ impl Consensus {
         );
         wishes.add(wish);
         if wishes.count() == self.participants.honest_majority() {
-            self.actions.push(Action::Send(Message::Timeout(Timeout {
-                certificate: Certificate {
-                    inner: wishes.message().view,
-                    signature: AggregateSignature::aggregate(wishes.signatures())
-                        .expect("failed to aggregate signatures"),
-                    signers: wishes.signers(),
-                },
-            })));
+            self.actions
+                .push_back(Action::Send(Message::Timeout(Timeout {
+                    certificate: Certificate {
+                        inner: wishes.message().view,
+                        signature: AggregateSignature::aggregate(wishes.signatures())
+                            .expect("failed to aggregate signatures"),
+                        signers: wishes.signers(),
+                    },
+                })));
         }
         Ok(())
     }
@@ -314,7 +320,7 @@ impl Consensus {
         ensure!(timeout.certificate.inner > self.view, "old view");
         self.enter_view(timeout.certificate.inner);
         self.next_tick = self.view + 1;
-        self.actions.push(Action::ResetTicks());
+        self.actions.push_back(Action::ResetTicks());
         self.wait_delay();
         Ok(())
     }
@@ -359,11 +365,11 @@ impl Consensus {
 
         if propose.inner.locked.view > self.locked.view {
             self.locked = propose.inner.locked.clone();
-            self.actions.push(Action::Lock(self.locked.clone()));
+            self.actions.push_back(Action::Lock(self.locked.clone()));
         }
         if propose.inner.double.view > self.double.view {
             self.double = propose.inner.double.clone();
-            self.actions.push(Action::Commit(self.double.clone()));
+            self.actions.push_back(Action::Commit(self.double.clone()));
             self.enter_view(self.double.inner.view + 1);
         }
 
@@ -382,14 +388,14 @@ impl Consensus {
         );
 
         self.voted = propose.inner.view;
-        self.actions.push(Action::Voted(self.voted));
+        self.actions.push_back(Action::Voted(self.voted));
         self.keys.iter().for_each(|(signer, pk)| {
             let vote = Vote {
                 view: propose.inner.view.clone(),
                 block: propose.inner.block.clone(),
             };
             let signature = pk.sign(Domain::Vote, &vote.to_bytes());
-            self.actions.push(Action::Send(Message::Vote(Signed {
+            self.actions.push_back(Action::Send(Message::Vote(Signed {
                 inner: vote,
                 signer: *signer,
                 signature,
@@ -439,13 +445,13 @@ impl Consensus {
             prepare.inner.certificate.inner.view,
         );
         self.locked = prepare.inner.certificate.clone();
-        self.actions.push(Action::Lock(self.locked.clone()));
+        self.actions.push_back(Action::Lock(self.locked.clone()));
 
         let locked: Certificate<Vote> = prepare.inner.certificate;
         self.keys.iter().for_each(|(signer, pk)| {
             let vote = locked.inner.to_bytes();
             let signature = pk.sign(Domain::Vote2, &vote);
-            self.actions.push(Action::Send(Message::Vote2(Signed {
+            self.actions.push_back(Action::Send(Message::Vote2(Signed {
                 inner: locked.clone(),
                 signer: *signer,
                 signature,
@@ -493,11 +499,12 @@ impl Consensus {
                 },
             };
             let signature = pk.sign(Domain::Prepare, &cert.to_bytes());
-            self.actions.push(Action::Send(Message::Prepare(Signed {
-                inner: cert,
-                signer: signer,
-                signature,
-            })));
+            self.actions
+                .push_back(Action::Send(Message::Prepare(Signed {
+                    inner: cert,
+                    signer: signer,
+                    signature,
+                })));
         }
         Ok(())
     }
@@ -563,7 +570,7 @@ impl Consensus {
                 locked: votes.message().clone(),
                 double: cert,
             });
-            self.actions.push(Action::Propose());
+            self.actions.push_back(Action::Propose());
         }
         Ok(())
     }
@@ -582,8 +589,8 @@ impl Consensus {
     fn wait_delay(&mut self) {
         // it will be more optimal to output it only if this node
         // is not a leader in the next view
-        self.actions.push(Action::WaitDelay());
-        self.actions.push(Action::Send(Message::Sync(Sync {
+        self.actions.push_back(Action::WaitDelay());
+        self.actions.push_back(Action::Send(Message::Sync(Sync {
             locked: Some(self.locked.clone()),
             double: Some(self.double.clone()),
         })));

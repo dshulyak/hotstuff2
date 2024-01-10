@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{anyhow, Result};
 use bit_vec::BitVec;
 use blst::min_pk as blst;
@@ -333,9 +331,9 @@ impl PrivateKey {
         Signature(self.0.sign(message, dst.into(), &[]))
     }
 
-    pub(crate) fn os_random() -> Self {
+    pub fn os_random() -> Self {
         let seed = OsRng.gen::<[u8; 32]>();
-        PrivateKey(blst::SecretKey::key_gen(&seed, &[]).expect("failed to generate private key"))
+        Self::from_seed(&seed)
     }
 
     pub(crate) fn from_seed(seed: &[u8; 32]) -> Self {
@@ -344,7 +342,7 @@ impl PrivateKey {
 
     pub fn random() -> Self {
         let seed = thread_rng().gen::<[u8; 32]>();
-        PrivateKey(blst::SecretKey::key_gen(&seed, &[]).expect("failed to generate private key"))
+        Self::from_seed(&seed)
     }
 
     pub(crate) fn public(&self) -> PublicKey {

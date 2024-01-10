@@ -254,6 +254,7 @@ impl Tester {
 struct Instance {
     consensus: seq::Consensus,
     signer: Signer,
+    actions: Vec<seq::Action>,
 }
 
 impl Instance {
@@ -327,8 +328,13 @@ impl Instance {
         self.action(seq::Action::propose());
     }
 
+    fn consume_actions(&mut self) {
+        self.consensus.consume_actions(|a| self.actions.push(a));
+    }
+
     fn action(&mut self, action: seq::Action) {
-        assert_eq!(self.consensus.actions.drain(0..1).next(), Some(action));
+        self.consume_actions();
+        assert_eq!(self.actions.drain(0..1).next(), Some(action));
     }
 
     fn actions(&mut self, actions: Vec<seq::Action>) {
@@ -338,11 +344,13 @@ impl Instance {
     }
 
     fn no_actions(&mut self) {
-        assert_eq!(self.consensus.actions, vec![]);
+        self.consume_actions();
+        assert_eq!(self.actions, vec![]);
     }
 
     fn drain_actions(&mut self) {
-        let _ = self.consensus.actions.drain(0..);
+        self.consume_actions();
+        let _ = self.actions.drain(0..);
     }
 }
 
@@ -412,6 +420,7 @@ fn gentest(n: usize, f: impl FnOnce(&Tester, &mut Instances)) {
         .map(|i| Instance {
             consensus: cluster.active(i),
             signer: i as u16,
+            actions: vec![],
         })
         .collect::<Vec<_>>();
     f(&cluster, &mut Instances(instances))
