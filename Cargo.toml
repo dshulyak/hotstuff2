@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 blst = "0.3.11"
 bit-vec = "0.6.3"
-bitvec = { version = "1.0.1", default-features = false, features = ["alloc", "atomic", "serde"] }
 anyhow = "1.0"
 rand = "0.8.0"
 parking_lot = "0.12.1"
+proptest = "1.4.0"

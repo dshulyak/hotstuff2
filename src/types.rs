@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use bit_vec::BitVec;
-use blst::min_sig as blst;
+use blst::min_pk as blst;
 use rand::thread_rng;
 use rand::{rngs::OsRng, Rng};
 
@@ -287,14 +287,14 @@ impl AggregateSignature {
         &self,
         domain: Domain,
         message: &[u8],
-        public_keys: impl IntoIterator<Item = Result<&'a PublicKey>>,
+        public_keys: impl IntoIterator<Item = &'a PublicKey>,
     ) -> Result<()> {
         let public = blst::AggregatePublicKey::aggregate(
             &public_keys
                 .into_iter()
-                .map(|key| key.map(|key| &key.0))
-                .collect::<Result<Vec<_>, _>>()?,
-            true,
+                .map(|key| &key.0)
+                .collect::<Vec<_>>(),
+            false,
         )
         .expect("failed to aggregate public key");
         match self.0.to_signature().verify(
@@ -303,7 +303,7 @@ impl AggregateSignature {
             domain.into(),
             &[],
             &public.to_public_key(),
-            true,
+            false,
         ) {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
             err => Err(anyhow!("failed to verify signature: {:?}", err)),
@@ -338,7 +338,11 @@ impl PrivateKey {
         PrivateKey(blst::SecretKey::key_gen(&seed, &[]).expect("failed to generate private key"))
     }
 
-    pub(crate) fn random() -> Self {
+    pub(crate) fn from_seed(seed: &[u8; 32]) -> Self {
+        PrivateKey(blst::SecretKey::key_gen(seed, &[]).expect("failed to generate private key"))
+    }
+
+    pub fn random() -> Self {
         let seed = thread_rng().gen::<[u8; 32]>();
         PrivateKey(blst::SecretKey::key_gen(&seed, &[]).expect("failed to generate private key"))
     }
@@ -386,7 +390,7 @@ impl Signature {
     ) -> Result<()> {
         match self
             .0
-            .verify(true, message, domain.into(), &[], &public_key.0, true)
+            .verify(true, message, domain.into(), &[], &public_key.0, false)
         {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
             err => Err(anyhow!("invalid signature: {:?}", err)),
