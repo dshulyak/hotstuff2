@@ -2,12 +2,10 @@
 
 use anyhow::{anyhow, Result};
 use bit_vec::BitVec;
-use blake3;
 use blst::min_sig as blst;
 use rand::thread_rng;
 use rand::{rngs::OsRng, Rng};
 
-use std::hash;
 use std::ops::{Add, AddAssign, Deref, Rem};
 
 pub trait ToBytes {
@@ -21,7 +19,7 @@ pub trait FromBytes {
 pub type Signer = u16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ID(blake3::Hash);
+pub struct ID([u8; 32]);
 
 impl ID {
     pub fn new(bytes: [u8; 32]) -> Self {
@@ -31,13 +29,13 @@ impl ID {
 
 impl ID {
     pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
+        &self.0
     }
 }
 
 impl Default for ID {
     fn default() -> Self {
-        ID([0; blake3::OUT_LEN].into())
+        ID([0; 32].into())
     }
 }
 
@@ -49,7 +47,7 @@ impl PartialOrd<ID> for ID {
 
 impl Ord for ID {
     fn cmp(&self, other: &ID) -> std::cmp::Ordering {
-        self.0.as_bytes().cmp(other.0.as_bytes())
+        self.0.cmp(&other.0)
     }
 }
 
