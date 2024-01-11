@@ -23,18 +23,18 @@ pub enum Action {
     SendTo(Message, PublicKey),
 
     // wait single network delay. see below what is expected.
-    WaitDelay(),
+    WaitDelay,
     // reset ticks. single tick should be sufficient to finish consensus round.
     // - wait delay for leader to receive sync messages. during this delay leader needs to delive timeout certificate
     //   and obtain sync messages from all honest participants. should be equal to two maximal network delays.
     // - wait for 4 normal rounds, each one atleast one maximal network delay.
     // single tick atleast 6 maximal network delays.
-    ResetTicks(),
+    ResetTicks,
 
     // node is a leader and ready to propose
     // when this action received call Consensus::propose()
     // TODO consider notifying a node that it is a leader in the next view after it voted
-    Propose(),
+    Propose,
 }
 
 impl Action {
@@ -59,15 +59,15 @@ impl Action {
     }
 
     pub fn wait_delay() -> Self {
-        Action::WaitDelay()
+        Action::WaitDelay
     }
 
     pub fn reset_ticks() -> Self {
-        Action::ResetTicks()
+        Action::ResetTicks
     }
 
     pub fn propose() -> Self {
-        Action::Propose()
+        Action::Propose
     }
 }
 
@@ -195,7 +195,7 @@ impl Consensus {
                 locked: self.locked.clone(),
                 double: self.double.clone(),
             });
-            self.actions.push_back(Action::Propose());
+            self.actions.push_back(Action::Propose);
         };
     }
 
@@ -235,19 +235,23 @@ impl Consensus {
     fn on_sync(&mut self, sync: Sync) -> Result<()> {
         if let Some(double) = &sync.double {
             ensure!(double.signers.len() <= self.participants.len());
-            double.signature.verify(
-                Domain::Vote2,
-                &double.inner.to_bytes(),
-                self.participants.decode(&double.signers),
-            )?;
+            if double.view > View(0) {
+                double.signature.verify(
+                    Domain::Vote2,
+                    &double.inner.to_bytes(),
+                    self.participants.decode(&double.signers),
+                )?;
+            }
         }
         if let Some(locked) = &sync.locked {
             ensure!(locked.signers.len() <= self.participants.len());
-            locked.signature.verify(
-                Domain::Vote,
-                &locked.inner.to_bytes(),
-                self.participants.decode(&locked.signers),
-            )?;
+            if locked.view > View(0) {
+                locked.signature.verify(
+                    Domain::Vote,
+                    &locked.inner.to_bytes(),
+                    self.participants.decode(&locked.signers),
+                )?;
+            }
         }
         if let Some(locked) = sync.locked {
             if locked.view > self.locked.view {
@@ -320,7 +324,7 @@ impl Consensus {
         ensure!(timeout.certificate.inner > self.view, "old view");
         self.enter_view(timeout.certificate.inner);
         self.next_tick = self.view + 1;
-        self.actions.push_back(Action::ResetTicks());
+        self.actions.push_back(Action::ResetTicks);
         self.wait_delay();
         Ok(())
     }
@@ -570,7 +574,7 @@ impl Consensus {
                 locked: votes.message().clone(),
                 double: cert,
             });
-            self.actions.push_back(Action::Propose());
+            self.actions.push_back(Action::Propose);
         }
         Ok(())
     }
@@ -589,7 +593,7 @@ impl Consensus {
     fn wait_delay(&mut self) {
         // it will be more optimal to output it only if this node
         // is not a leader in the next view
-        self.actions.push_back(Action::WaitDelay());
+        self.actions.push_back(Action::WaitDelay);
         self.actions.push_back(Action::Send(Message::Sync(Sync {
             locked: Some(self.locked.clone()),
             double: Some(self.double.clone()),

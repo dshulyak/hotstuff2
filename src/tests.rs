@@ -6,6 +6,7 @@ use crate::types::*;
 
 use bit_vec::BitVec;
 use proptest::prelude::*;
+use rand::thread_rng;
 
 struct Tester {
     keys: Vec<PrivateKey>,
@@ -631,6 +632,61 @@ fn test_multi_bootstrap() {
 
         instances.no_actions();
     })
+}
+
+#[test]
+fn test_multi_simulation() {
+    gentest(4, |_, instances| {
+        let mut inputs: Vec<Vec<Message>> = vec![vec![]; instances.0.len()];
+        let mut wait_delay = vec![false; instances.0.len()];
+        let mut propose: Vec<Option<[u8; 32]>> = vec![None; instances.0.len()];
+        let mut commits = vec![None; instances.0.len()];
+        for _r in 0..22 {
+            let mut no_actions = true;
+            for (i, inst) in instances.0.iter_mut().enumerate() {
+                {
+                    let msgs = &mut inputs[i];
+                    msgs.iter().for_each(|m| {
+                        _ = inst.consensus.on_message(m.clone());
+                    });
+                    msgs.clear();
+                }
+                if wait_delay[i] {
+                    inst.on_delay();
+                    wait_delay[i] = false;
+                }
+                if let Some(p) = propose[i].take() {
+                    inst.consensus.propose(Some(ID::new(p))).expect("no error");
+                }
+                inst.consensus.consume_actions(|a| {
+                    no_actions = false;
+                    match a {
+                        seq::Action::Send(m) => {
+                            inputs.iter_mut().for_each(|input| input.push(m.clone()))
+                        }
+                        seq::Action::WaitDelay => wait_delay[i] = true,
+                        seq::Action::Propose => {
+                            propose[i] = Some(thread_rng().gen::<[u8; 32]>());
+                        }
+                        seq::Action::Commit(commit) => {
+                            commits[i] = Some(commit);
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            if no_actions {
+                for inst in instances.0.iter_mut() {
+                    inst.on_tick();
+                }
+            }
+        }
+        let commit = commits[0].as_ref().expect("certificate exists");
+        assert_eq!(commit.height, 5);
+        for other in commits.iter() {
+            assert_eq!(other.as_ref().unwrap(), commit);
+        }
+    });
 }
 
 fn domain_strat() -> impl Strategy<Value = Domain> {
