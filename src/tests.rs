@@ -6,6 +6,7 @@ use crate::types::*;
 
 use bit_vec::BitVec;
 use proptest::prelude::*;
+use proptest::test_runner::TestRunner;
 use rand::thread_rng;
 
 struct Tester {
@@ -252,6 +253,7 @@ impl Tester {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Instance {
     consensus: seq::Consensus,
     signer: Signer,
@@ -703,7 +705,6 @@ fn domain_strat() -> impl Strategy<Value = Domain> {
 fn signature_strat() -> impl Strategy<Value = Signature> {
     (domain_strat(), any::<[u8; 32]>(), any::<[u8; 32]>())
         .prop_map(|(domain, seed, msg)| PrivateKey::from_seed(&seed).sign(domain, &msg))
-        .boxed()
 }
 
 fn wish_strat() -> impl Strategy<Value = Message> {
@@ -736,14 +737,15 @@ fn vote_strat() -> impl Strategy<Value = Message> {
         })
 }
 
-proptest! {
-    #[test]
-    fn test_random(msg in prop_oneof![
-        wish_strat(),
-        vote_strat(),
-    ]) {
-        gentest(1, |_tester, inst: &mut Instances| {
-            inst.0[0].on_message_err(msg)
-        });
-    }
+#[test]
+fn test_random_messages() {
+    let mut runner = TestRunner::default();
+    gentest(4, |_tester, inst: &mut Instances| {
+        runner
+            .run(&(prop_oneof![vote_strat(), wish_strat()]), |msg| {
+                inst.0[0].clone().on_message_err(msg);
+                Ok(())
+            })
+            .unwrap();
+    })
 }

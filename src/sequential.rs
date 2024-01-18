@@ -71,6 +71,7 @@ impl Action {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Consensus {
     // participants must be sorted lexicographically across all participating nodes.
     // used to decode public keys by reference.
@@ -601,6 +602,7 @@ impl Consensus {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Signers(Box<[PublicKey]>);
 
 impl Signers {
@@ -636,6 +638,7 @@ impl Index<u16> for Signers {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Votes<T: ToBytes + Clone + Debug> {
     signers: BitVec,
     votes: Vec<Signed<T>>,
