@@ -1,12 +1,17 @@
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::cmp::max;
+use std::fmt::Debug;
+
 use crate::sequential as seq;
 use crate::sequential::Action as action;
 use crate::types::*;
 
 use bit_vec::BitVec;
 use proptest::prelude::*;
-use proptest::test_runner::TestRunner;
+use proptest::sample::{subsequence, Subsequence};
+use proptest::test_runner::{Config, TestRunner};
 use rand::thread_rng;
 
 struct Tester {
@@ -16,17 +21,29 @@ struct Tester {
 
 impl Tester {
     fn new(n: usize) -> Self {
-        let mut keys: Vec<_> = (0..n).map(|_| PrivateKey::random()).collect();
+        let mut keys: Vec<_> = (0..n)
+            .map(|_| {
+                let seed = thread_rng().gen::<[u8; 32]>();
+                PrivateKey::from_seed(&seed)
+            })
+            .collect();
         keys.sort_by(|a, b| a.public().cmp(&b.public()));
+        let empty_seed = [0; 32];
         let genesis = Certificate {
             inner: Vote {
                 view: View(0),
                 block: Block::new(0, ID::new([0; 32])),
             },
-            signature: PrivateKey::random().sign(Domain::Vote, &[0; 32]).into(),
+            signature: PrivateKey::from_seed(&empty_seed)
+                .sign(Domain::Vote, &[0; 32])
+                .into(),
             signers: BitVec::new(),
         };
         Self { keys, genesis }
+    }
+
+    fn keys(&self) -> Vec<PrivateKey> {
+        self.keys.clone()
     }
 
     fn genesis(&self) -> Certificate<Vote> {
@@ -261,9 +278,10 @@ struct Instance {
 }
 
 impl Instance {
+    // bootstrap enter specified view and generates lock verificate in that view for block with id
     fn bootstrap(&mut self, tester: &Tester, view: View, id: &str) {
         self.on_message(tester.timeout(view, vec![0, 1, 2]));
-        self.reset_ticks();
+        self.entered_view(view);
         self.wait_delay();
         self.send(tester.sync_genesis());
         self.on_message(tester.propose_first(view, id));
@@ -308,19 +326,19 @@ impl Instance {
     }
 
     fn lock(&mut self, lock: Certificate<Vote>) {
-        self.action(seq::Action::Lock(lock));
+        self.action(seq::Action::lock(lock));
     }
 
     fn commit(&mut self, commit: Certificate<Vote>) {
-        self.action(seq::Action::Commit(commit));
+        self.action(seq::Action::commit(commit));
     }
 
     fn voted(&mut self, view: View) {
         self.action(action::voted(view));
     }
 
-    fn reset_ticks(&mut self) {
-        self.action(seq::Action::reset_ticks());
+    fn entered_view(&mut self, view: View) {
+        self.action(seq::Action::entered_view(view));
     }
 
     fn wait_delay(&mut self) {
@@ -332,7 +350,9 @@ impl Instance {
     }
 
     fn consume_actions(&mut self) {
-        self.consensus.consume_actions(|a| self.actions.push(a));
+        for action in self.consensus.drain_actions() {
+            self.actions.push(action);
+        }
     }
 
     fn action(&mut self, action: seq::Action) {
@@ -426,6 +446,7 @@ fn gentest(n: usize, f: impl FnOnce(&Tester, &mut Instances)) {
             actions: vec![],
         })
         .collect::<Vec<_>>();
+    // TODO refactor it without closure, can't recall what i was thinking
     f(&cluster, &mut Instances(instances))
 }
 
@@ -449,6 +470,7 @@ fn test_commit_one() {
             tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
         ));
         inst.commit(tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]));
+        inst.entered_view(2.into());
         inst.voted(2.into());
         inst.send(tester.vote(2.into(), 2, "b", inst.signer));
     });
@@ -467,15 +489,17 @@ fn test_tick_on_epoch_boundary() {
             tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
         ));
         inst.commit(tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]));
+        inst.entered_view(2.into());
         inst.drain_actions();
         inst.on_message(tester.prepare(2.into(), 2, "b", vec![1, 2, 3]));
         inst.lock(tester.certify_vote(2.into(), 2, "b", vec![1, 2, 3]));
         inst.drain_actions();
 
-        (0..2).for_each(|_| inst.on_tick());
+        inst.on_tick();
+        inst.consume_actions();
         inst.send(tester.wish(3.into(), inst.signer));
         inst.on_message(tester.timeout(3.into(), vec![0, 1, 2]));
-        inst.reset_ticks();
+        inst.entered_view(3.into());
         inst.wait_delay();
         let locked_b = tester.certify_vote(2.into(), 2, "b", vec![1, 2, 3]);
         let double_a = tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]);
@@ -494,6 +518,7 @@ fn test_propose_after_delay() {
         let inst = &mut instances.0[2];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
+        inst.entered_view(2.into());
         inst.wait_delay();
         let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
         inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
@@ -512,6 +537,7 @@ fn test_nonleader_on_delay() {
         let inst = &mut instances.0[1];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
+        inst.entered_view(2.into());
         inst.wait_delay();
         let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
         inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
@@ -567,12 +593,25 @@ fn test_aggregate_timeout() {
 }
 
 #[test]
+fn test_repetetive_messages() {
+    gentest(4, |tester, instances| {
+        let inst = &mut instances.0[2];
+        inst.bootstrap(tester, 1.into(), "a");
+        let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
+        let double_a = tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]);
+        inst.on_message(tester.propose(2.into(), 2, "b", locked_a.clone(), double_a.clone()));
+        inst.on_message(tester.vote(2.into(), 2, "b", 1));
+        inst.on_message_err(tester.vote(2.into(), 2, "b", 1));
+    })
+}
+
+#[test]
 fn test_multi_bootstrap() {
     gentest(4, |tester, instances: &mut Instances| {
         instances.on_tick();
         instances.for_each(|i| i.action(action::send(tester.wish(1.into(), i.signer))));
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
-        instances.action(action::reset_ticks());
+        instances.action(action::entered_view(1.into()));
         instances.action(action::wait_delay());
         instances.action(action::send(tester.sync_genesis()));
         instances.on_delay();
@@ -636,46 +675,199 @@ fn test_multi_bootstrap() {
     })
 }
 
+struct SimState {
+    inputs: Vec<Vec<Message>>,
+    wait_delay: Vec<bool>,
+    propose: Vec<Option<[u8; 32]>>,
+    commits: Vec<Option<Certificate<Vote>>>,
+    max_view: View,
+}
+
+impl SimState {
+    fn new(n: usize) -> Self {
+        SimState {
+            inputs: vec![vec![]; n],
+            wait_delay: vec![false; n],
+            propose: vec![None; n],
+            commits: vec![None; n],
+            max_view: View(0),
+        }
+    }
+
+    // node will follow the protocol, except it will randomize messages that it sends out.
+    // in a such way that they will appear valid, but violate more subtle rules of the protocol.
+    fn randomize_messages(
+        &mut self,
+        tester: &Tester,
+        i: usize,
+        inst: &mut Instance,
+        runner: &mut TestRunner,
+    ) -> bool {
+        self.follow_protocol(i, inst);
+        let mut acted = true;
+        for a in inst.consensus.drain_actions() {
+            acted = false;
+            match a {
+                seq::Action::Send(m) => {
+                    send_random_messages(m, tester, i as Signer, &mut self.inputs, runner)
+                }
+                seq::Action::WaitDelay => self.wait_delay[i] = true,
+                seq::Action::Propose => {
+                    self.propose[i] = Some(thread_rng().gen::<[u8; 32]>());
+                }
+                seq::Action::Commit(commit) => {
+                    self.commits[i] = Some(commit);
+                }
+                seq::Action::EnteredView(view) => {
+                    self.max_view = max(self.max_view, view);
+                }
+                _ => {}
+            }
+        }
+        acted
+    }
+
+    fn honest_actions(&mut self, i: usize, inst: &mut Instance) -> bool {
+        self.follow_protocol(i, inst);
+        let mut acted = true;
+        inst.consensus.consume_actions(|a| {
+            acted = false;
+            match a {
+                seq::Action::Send(m) => self
+                    .inputs
+                    .iter_mut()
+                    .for_each(|input| input.push(m.clone())),
+                seq::Action::WaitDelay => self.wait_delay[i] = true,
+                seq::Action::Propose => {
+                    self.propose[i] = Some(thread_rng().gen::<[u8; 32]>());
+                }
+                seq::Action::Commit(commit) => {
+                    self.commits[i] = Some(commit);
+                }
+                seq::Action::EnteredView(view) => {
+                    self.max_view = max(self.max_view, view);
+                }
+                _ => {}
+            }
+        });
+        acted
+    }
+
+    fn follow_protocol(&mut self, i: usize, inst: &mut Instance) {
+        {
+            let msgs = &mut self.inputs[i];
+            msgs.iter().for_each(|m| {
+                _ = inst.consensus.on_message(m.clone());
+            });
+            msgs.clear();
+        }
+        if self.wait_delay[i] {
+            inst.on_delay();
+            self.wait_delay[i] = false;
+        }
+        if let Some(p) = self.propose[i].take() {
+            inst.consensus.propose(Some(ID::new(p))).expect("no error");
+        }
+    }
+}
+
+fn send_random_messages(
+    original: Message,
+    tester: &Tester,
+    signer: Signer,
+    inputs: &mut Vec<Vec<Message>>,
+    runner: &mut TestRunner,
+) {
+    let inputs = RefCell::new(inputs);
+    match original {
+        Message::Wish(w) => {
+            let _ = runner.run(
+                &(prop_oneof![Just(w.inner.view), Just(w.inner.view + 1)]),
+                |view| {
+                    let wish = Wish { view };
+                    let signature = tester.sign(Domain::Wish, signer, &wish);
+                    let msg = Message::Wish(Signed {
+                        inner: wish,
+                        signer: signer,
+                        signature,
+                    });
+                    inputs.borrow_mut().iter_mut().for_each(|input| {
+                        input.push(msg.clone());
+                    });
+                    Ok(())
+                },
+            );
+        }
+        Message::Vote(v) => {
+            let _ = runner.run(
+                &(
+                    Just(v.inner.view),
+                    Just(v.inner.block.height),
+                    prop_oneof![
+                        Just(v.inner.block.id),
+                        any::<[u8; 32]>().prop_map(|id| ID::new(id)),
+                    ],
+                ),
+                |(view, height, id)| {
+                    let vote = Vote {
+                        view,
+                        block: Block { height, id },
+                    };
+                    let signature = tester.sign(Domain::Vote, signer, &vote);
+                    let msg = Message::Vote(Signed {
+                        inner: vote,
+                        signer: signer,
+                        signature,
+                    });
+                    inputs.borrow_mut().iter_mut().for_each(|input| {
+                        input.push(msg.clone());
+                    });
+                    Ok(())
+                },
+            );
+        }
+        Message::Vote2(v) => {
+            let _ = runner.run(
+                &(prop_oneof![
+                    cert_strat(
+                        Just(v.inner.inner.clone()),
+                        Just(Domain::Vote),
+                        keys_strat(tester.keys().clone(), 2),
+                    ),
+                    Just(v.inner.clone()),
+                ]),
+                |cert| {
+                    let signature = tester.sign(Domain::Vote2, signer, &cert.inner);
+                    let msg = Message::Vote2(Signed {
+                        inner: cert,
+                        signer,
+                        signature,
+                    });
+                    inputs.borrow_mut().iter_mut().for_each(|input| {
+                        input.push(msg.clone());
+                    });
+                    Ok(())
+                },
+            );
+        }
+        _ => {
+            inputs.borrow_mut().iter_mut().for_each(|input| {
+                input.push(original.clone());
+            });
+        }
+    }
+}
+
 #[test]
-fn test_multi_simulation() {
+fn test_simulation() {
     gentest(4, |_, instances| {
-        let mut inputs: Vec<Vec<Message>> = vec![vec![]; instances.0.len()];
-        let mut wait_delay = vec![false; instances.0.len()];
-        let mut propose: Vec<Option<[u8; 32]>> = vec![None; instances.0.len()];
-        let mut commits = vec![None; instances.0.len()];
+        let mut sim = SimState::new(instances.0.len());
         for _r in 0..22 {
             let mut no_actions = true;
             for (i, inst) in instances.0.iter_mut().enumerate() {
-                {
-                    let msgs = &mut inputs[i];
-                    msgs.iter().for_each(|m| {
-                        _ = inst.consensus.on_message(m.clone());
-                    });
-                    msgs.clear();
-                }
-                if wait_delay[i] {
-                    inst.on_delay();
-                    wait_delay[i] = false;
-                }
-                if let Some(p) = propose[i].take() {
-                    inst.consensus.propose(Some(ID::new(p))).expect("no error");
-                }
-                inst.consensus.consume_actions(|a| {
+                if !sim.honest_actions(i, inst) {
                     no_actions = false;
-                    match a {
-                        seq::Action::Send(m) => {
-                            inputs.iter_mut().for_each(|input| input.push(m.clone()))
-                        }
-                        seq::Action::WaitDelay => wait_delay[i] = true,
-                        seq::Action::Propose => {
-                            propose[i] = Some(thread_rng().gen::<[u8; 32]>());
-                        }
-                        seq::Action::Commit(commit) => {
-                            commits[i] = Some(commit);
-                        }
-                        _ => {}
-                    }
-                });
+                }
             }
             if no_actions {
                 for inst in instances.0.iter_mut() {
@@ -683,12 +875,87 @@ fn test_multi_simulation() {
                 }
             }
         }
-        let commit = commits[0].as_ref().expect("certificate exists");
+        let commit = sim.commits[0].as_ref().expect("certificate exists");
         assert_eq!(commit.height, 5);
-        for other in commits.iter() {
+        for other in sim.commits.iter() {
             assert_eq!(other.as_ref().unwrap(), commit);
         }
     });
+}
+
+#[test]
+fn test_simulation_with_unavailable() {
+    // in this test one of the nodes (4th, last node) will not be voting or performing aggregation when it is a leader.
+    // nodes are expected to time out on the turn of this node.
+    gentest(4, |_, instances| {
+        let steps = 40;
+        let expected_height = 3;
+
+        // disconnecting node is a realized by taking a slice of all instances,
+        // while every node is a aware of full set of instances.
+        let working = &mut instances.0[..3];
+        let mut sim = SimState::new(working.len());
+        for _r in 0..steps {
+            let mut no_actions = true;
+            for (i, inst) in working.iter_mut().enumerate() {
+                if !sim.honest_actions(i, inst) {
+                    no_actions = false;
+                }
+            }
+            if no_actions {
+                for inst in working.iter_mut() {
+                    inst.on_tick();
+                }
+            }
+        }
+        let commit = sim.commits[0].as_ref().expect("certificate exists");
+        assert_eq!(commit.height, expected_height);
+        for other in sim.commits.iter() {
+            assert_eq!(other.as_ref().unwrap(), commit);
+        }
+    });
+}
+
+#[test]
+fn test_simulation_with_adversary() {
+    gentest(4, |tester, instances| {
+        let adversary = 3;
+        let mut sim = SimState::new(instances.0.len());
+        for _r in 0..30 {
+            let mut no_actions = true;
+            let mut runner = TestRunner::new(Config {
+                cases: 10, // 10 random actions per single adversary action
+                ..Config::default()
+            });
+            for (i, inst) in instances.0.iter_mut().enumerate() {
+                if i == adversary {
+                    if !sim.randomize_messages(tester, i, inst, &mut runner) {
+                        no_actions = false;
+                    }
+                } else {
+                    if !sim.honest_actions(i, inst) {
+                        no_actions = false;
+                    }
+                }
+            }
+            if no_actions {
+                for inst in instances.0.iter_mut() {
+                    inst.on_tick();
+                }
+            }
+        }
+        let commit = sim.commits[0].as_ref().expect("certificate exists");
+        assert_eq!(commit.height, 7);
+        for other in sim.commits.iter() {
+            assert_eq!(other.as_ref().unwrap(), commit);
+        }
+    });
+}
+
+#[test]
+fn test_simulation_with_partition() {
+    // in this test some messages are not delivered or delivered only to the part of the cluster.
+    // todo!("like the test above but where honest nodes don't receive messages, but can sync");
 }
 
 fn domain_strat() -> impl Strategy<Value = Domain> {
@@ -702,50 +969,124 @@ fn domain_strat() -> impl Strategy<Value = Domain> {
     ]
 }
 
-fn signature_strat() -> impl Strategy<Value = Signature> {
-    (domain_strat(), any::<[u8; 32]>(), any::<[u8; 32]>())
-        .prop_map(|(domain, seed, msg)| PrivateKey::from_seed(&seed).sign(domain, &msg))
-}
-
-fn wish_strat() -> impl Strategy<Value = Message> {
-    (any::<u64>(), 0..10u16, signature_strat()).prop_map(|(view, signer, signature)| {
+fn wish_strat(
+    views: impl Strategy<Value = u64>,
+    domains: impl Strategy<Value = Domain>,
+    keys: Vec<PrivateKey>,
+) -> impl Strategy<Value = Message> {
+    (views, domains, 0..keys.len()).prop_map(move |(view, domain, signer)| {
+        let msg = Wish { view: View(view) };
+        let signature = keys[signer].sign(domain, &msg.to_bytes());
         Message::Wish(Signed {
-            inner: Wish { view: View(view) },
-            signer,
+            inner: msg,
+            signer: signer as Signer,
             signature,
         })
     })
 }
 
-fn vote_strat() -> impl Strategy<Value = Message> {
-    (
-        any::<u64>(),
-        0..10u16,
-        any::<u64>(),
-        any::<[u8; 32]>(),
-        signature_strat(),
-    )
-        .prop_map(|(view, signer, height, id, signature)| {
+fn vote_strat(
+    views: impl Strategy<Value = u64>,
+    keys: Vec<PrivateKey>,
+) -> impl Strategy<Value = Message> {
+    (views, 0..keys.len(), any::<u64>(), any::<[u8; 32]>()).prop_map(
+        move |(view, signer, height, id)| {
+            let msg = Vote {
+                view: View(view),
+                block: Block::new(height, ID::new(id)),
+            };
+            let signature = keys[signer].sign(Domain::Vote, &msg.to_bytes());
             Message::Vote(Signed {
-                inner: Vote {
-                    view: View(view),
-                    block: Block::new(height, ID::new(id)),
-                },
-                signer,
+                inner: msg,
+                signer: signer as Signer,
                 signature,
             })
-        })
+        },
+    )
+}
+
+fn cert_strat<T: ToBytes + Debug>(
+    msgs: impl Strategy<Value = T>,
+    domains: impl Strategy<Value = Domain>,
+    keys: Subsequence<(u16, PrivateKey)>,
+) -> impl Strategy<Value = Certificate<T>> {
+    (msgs, domains, keys).prop_map(|(msg, domain, signers)| {
+        let max = signers.iter().map(|(s, _)| *s).max().unwrap_or(0) + 1;
+        let mut bits = BitVec::from_elem(max.into(), false);
+        signers.iter().for_each(|(s, _)| {
+            bits.set((*s).into(), true);
+        });
+        let signatures: Vec<_> = signers
+            .into_iter()
+            .map(|(_, key)| key.sign(domain.clone(), &msg.to_bytes()))
+            .collect();
+        let aggregated = AggregateSignature::aggregate(&signatures).expect("failed to aggregate");
+        Certificate {
+            inner: msg,
+            signers: bits,
+            signature: aggregated,
+        }
+    })
+}
+
+fn keys_strat(keys: Vec<PrivateKey>, bound: usize) -> Subsequence<(u16, PrivateKey)> {
+    let signers = keys
+        .into_iter()
+        .enumerate()
+        .map(|(signer, pk)| (signer as Signer, pk))
+        .collect::<Vec<_>>();
+    subsequence(signers.clone(), bound)
 }
 
 #[test]
 fn test_random_messages() {
     let mut runner = TestRunner::default();
-    gentest(4, |_tester, inst: &mut Instances| {
+    let keys = (10..20)
+        .map(|i: i32| {
+            let mut seed = [0; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            PrivateKey::from_seed(&seed)
+        })
+        .collect::<Vec<_>>();
+
+    gentest(4, |tester, inst: &mut Instances| {
+        inst.0[0].bootstrap(tester, View(1), "a");
         runner
-            .run(&(prop_oneof![vote_strat(), wish_strat()]), |msg| {
-                inst.0[0].clone().on_message_err(msg);
-                Ok(())
-            })
+            .run(
+                &(prop_oneof![
+                    vote_strat(any::<u64>(), keys.clone()),
+                    vote_strat(Just(2), tester.keys()),
+                    wish_strat(Just(2), Just(Domain::Wish), keys.clone()),
+                    wish_strat(Just(0), Just(Domain::Wish), tester.keys()),
+                    wish_strat(
+                        any::<u64>(),
+                        prop_oneof![
+                            Just(Domain::Prepare),
+                            Just(Domain::Vote),
+                            Just(Domain::Vote2),
+                            Just(Domain::Propose),
+                            Just(Domain::Possesion),
+                        ],
+                        tester.keys()
+                    ),
+                    cert_strat(
+                        Just(View(2)),
+                        Just(Domain::Wish),
+                        keys_strat(tester.keys().clone(), 4)
+                    )
+                    .prop_map(|certificate| { Message::Timeout(Timeout { certificate }) }),
+                    cert_strat(
+                        Just(View(2)),
+                        Just(Domain::Vote),
+                        keys_strat(tester.keys().clone(), 3)
+                    )
+                    .prop_map(|certificate| { Message::Timeout(Timeout { certificate }) }),
+                ]),
+                |msg| {
+                    inst.0[0].clone().on_message_err(msg);
+                    Ok(())
+                },
+            )
             .unwrap();
     })
 }

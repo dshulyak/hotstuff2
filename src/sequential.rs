@@ -19,21 +19,26 @@ pub enum Action {
 
     // send message to all participants
     Send(Message),
-    // send message to a specific participant. some messages may be delievered directly for aggregation purposes.
-    SendTo(Message, PublicKey),
+    // TODO
+    // // send message to a specific participant. some messages may be delievered directly for aggregation purposes.
+    // SendTo(Message, PublicKey),
+
+    // TODO this can be futher simplified. caller can notify every maximal network delay
+    // without waiting for any signals from the consensus SM.
+    // consensus SM internally can count 7 notifications (see below), and reset them every time it enters a view.
 
     // wait single network delay. see below what is expected.
     WaitDelay,
-    // reset ticks. single tick should be sufficient to finish consensus round.
+    // reset timers. single tick should be sufficient to finish consensus round.
     // - wait delay for leader to receive sync messages. during this delay leader needs to delive timeout certificate
     //   and obtain sync messages from all honest participants. should be equal to two maximal network delays.
     // - wait for 4 normal rounds, each one atleast one maximal network delay.
-    // single tick atleast 6 maximal network delays.
-    ResetTicks,
+    // - wait for 1 more to deliver propose to all participants, so that they enter next view.
+    // single tick atleast 7 maximal network delays.
+    EnteredView(View),
 
-    // node is a leader and ready to propose
-    // when this action received call Consensus::propose()
-    // TODO consider notifying a node that it is a leader in the next view after it voted
+    // node is a leader and ready to propose.
+    // leader is risking not finishing a round on time if it does not call `propose` method within short delay.
     Propose,
 }
 
@@ -54,16 +59,12 @@ impl Action {
         Action::Send(message)
     }
 
-    pub fn send_to(message: Message, to: PublicKey) -> Self {
-        Action::SendTo(message, to)
-    }
-
     pub fn wait_delay() -> Self {
         Action::WaitDelay
     }
 
-    pub fn reset_ticks() -> Self {
-        Action::ResetTicks
+    pub fn entered_view(view: View) -> Self {
+        Action::EnteredView(view)
     }
 
     pub fn propose() -> Self {
@@ -80,7 +81,6 @@ pub struct Consensus {
 
     // current view
     view: View,
-    next_tick: View,
     // last voted view
     voted: View,
     // single certificate from 2/3*f+1 Vote. initialized to genesis
@@ -121,7 +121,6 @@ impl Consensus {
             participants: Signers(participants),
             keys: keys,
             view,
-            next_tick: View(0),
             locked: lock,
             double: commit,
             actions: VecDeque::new(),
@@ -139,16 +138,17 @@ impl Consensus {
         }
     }
 
+    pub fn drain_actions(&mut self) -> impl Iterator<Item = Action> + '_ {
+        self.actions.drain(..)
+    }
+
     pub fn is_leader(&self, view: View) -> bool {
         let leader = self.participants.leader(view);
         self.keys.get(&leader).is_some()
     }
 
     pub fn on_tick(&mut self) {
-        if self.next_tick <= self.view && self.view != View(0) {
-            // view was advanced with double certificate, nothing else to do
-            self.next_tick += 1;
-        } else if self.is_epoch_boundary() {
+        if self.is_epoch_boundary() {
             // view will be advanced once leader aggregates timeout certificate from wishes.
             for (signer, pk) in self.keys.iter() {
                 let wish = Wish {
@@ -162,9 +162,8 @@ impl Consensus {
                 })));
             }
         } else {
-            self.enter_view(self.next_tick);
+            self.enter_view(self.view + 1);
             self.wait_delay();
-            self.next_tick += 1;
         }
     }
 
@@ -210,7 +209,7 @@ impl Consensus {
         let pk = self
             .keys
             .get(&signer)
-            .ok_or(anyhow!("no key for a view leader"))?;
+            .expect("propose shouldn't be called if node is not a leader");
         let signature = pk.sign(Domain::Propose, &proposal.to_bytes());
         self.actions
             .push_back(Action::Send(Message::Propose(Signed {
@@ -324,8 +323,6 @@ impl Consensus {
 
         ensure!(timeout.certificate.inner > self.view, "old view");
         self.enter_view(timeout.certificate.inner);
-        self.next_tick = self.view + 1;
-        self.actions.push_back(Action::ResetTicks);
         self.wait_delay();
         Ok(())
     }
@@ -372,18 +369,28 @@ impl Consensus {
             self.locked = propose.inner.locked.clone();
             self.actions.push_back(Action::Lock(self.locked.clone()));
         }
+        ensure!(
+            propose.inner.locked.inner.view == self.locked.inner.view,
+            "proposed block must use cert no lower then locally locked block"
+        );
+
         if propose.inner.double.view > self.double.view {
             self.double = propose.inner.double.clone();
             self.actions.push_back(Action::Commit(self.double.clone()));
             self.enter_view(self.double.inner.view + 1);
         }
+        ensure!(
+            propose.inner.double.inner == self.double.inner,
+            "propose must extend known highest doubly certified block"
+        );
 
-        ensure!(propose.inner.locked == self.locked);
-        ensure!(propose.inner.double == self.double);
-        ensure!(propose.inner.view == self.view);
+        ensure!(
+            propose.inner.view == self.view,
+            "node must be in the same round as propose"
+        );
         ensure!(
             self.voted < propose.inner.view,
-            "already voted in this view"
+            "should not vote more than once in the same view"
         );
         ensure!(
             propose.inner.block.height == self.double.inner.block.height + 1,
@@ -492,7 +499,7 @@ impl Consensus {
             "signer {} already voted",
             vote.signer,
         );
-        votes.add(vote);
+        votes.add(vote.clone());
         if votes.count() == self.participants.honest_majority() {
             let signature = AggregateSignature::aggregate(votes.signatures())
                 .expect("failed to aggregate signatures");
@@ -589,6 +596,7 @@ impl Consensus {
         self.timeouts.retain(|view, _| view >= &self.view);
         self.votes.retain(|(view, _), _| view >= &self.view);
         self.votes2.retain(|(view, _), _| view >= &self.view);
+        self.actions.push_back(Action::EnteredView(self.view));
     }
 
     fn wait_delay(&mut self) {

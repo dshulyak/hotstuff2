@@ -17,9 +17,9 @@ TODO:
   different order for good messages.
   1/3 of the network is voting differently.
 - [ ] synchronization
-  move signature verification, signing and aggregations to one layer above message processing code.
-  participants array should remain immutable by contract, any changes to array should result in different instance.
-  message processing will be guarded by single mutex.
+  private and public keys are immutable and trivially Sync. it is done so that they can be read without holding a lock.
+  the other state is moved behind the mutex, such as Mutex<State>.
+  actions is an unbounded tokio channel. 
 - [ ] loom
 
 ## Tests

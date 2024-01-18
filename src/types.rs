@@ -1,9 +1,6 @@
 use anyhow::{anyhow, Result};
 use bit_vec::BitVec;
 use blst::min_pk as blst;
-use rand::thread_rng;
-use rand::{rngs::OsRng, Rng};
-
 use std::ops::{Add, AddAssign, Deref, Rem};
 
 pub trait ToBytes {
@@ -16,7 +13,7 @@ pub trait FromBytes {
 
 pub type Signer = u16;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ID([u8; 32]);
 
 impl ID {
@@ -327,22 +324,12 @@ impl ToBytes for AggregateSignature {
 pub struct PrivateKey(blst::SecretKey);
 
 impl PrivateKey {
-    pub(crate) fn sign(&self, dst: Domain, message: &[u8]) -> Signature {
-        Signature(self.0.sign(message, dst.into(), &[]))
-    }
-
-    pub fn os_random() -> Self {
-        let seed = OsRng.gen::<[u8; 32]>();
-        Self::from_seed(&seed)
-    }
-
-    pub(crate) fn from_seed(seed: &[u8; 32]) -> Self {
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
         PrivateKey(blst::SecretKey::key_gen(seed, &[]).expect("failed to generate private key"))
     }
 
-    pub fn random() -> Self {
-        let seed = thread_rng().gen::<[u8; 32]>();
-        Self::from_seed(&seed)
+    pub(crate) fn sign(&self, dst: Domain, message: &[u8]) -> Signature {
+        Signature(self.0.sign(message, dst.into(), &[]))
     }
 
     pub(crate) fn public(&self) -> PublicKey {
