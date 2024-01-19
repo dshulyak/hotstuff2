@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::cmp::max;
 use std::fmt::Debug;
 
-use crate::sequential as seq;
 use crate::sequential::Action as action;
+use crate::sequential::{self as seq, ActionSinc};
 use crate::types::*;
 
 use bit_vec::BitVec;
@@ -13,6 +13,31 @@ use proptest::prelude::*;
 use proptest::sample::{subsequence, Subsequence};
 use proptest::test_runner::{Config, TestRunner};
 use rand::thread_rng;
+
+#[derive(Debug)]
+struct DequeSinc {
+    pub actions: RefCell<Vec<action>>,
+}
+
+impl DequeSinc {
+    fn new() -> Self {
+        Self {
+            actions: RefCell::new(vec![]),
+        }
+    }
+
+    fn drain(&self) -> Vec<action> {
+        self.actions.borrow_mut().drain(..).collect()
+    }
+}
+
+impl ActionSinc for DequeSinc {
+    fn send(&self, action: seq::Action) {
+        self.actions.borrow_mut().push(action);
+    }
+}
+
+type Consensus = seq::Consensus<DequeSinc>;
 
 struct Tester {
     keys: Vec<PrivateKey>,
@@ -50,14 +75,15 @@ impl Tester {
         self.genesis.clone()
     }
 
-    fn active(&self, i: usize) -> seq::Consensus {
-        seq::Consensus::new(
+    fn active(&self, i: usize) -> Consensus {
+        Consensus::new(
             View(0),
             self.publics(),
             self.genesis(),
             self.genesis(),
             View(0),
             &self.keys[i..i + 1],
+            DequeSinc::new(),
         )
     }
 
@@ -270,9 +296,9 @@ impl Tester {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Instance {
-    consensus: seq::Consensus,
+    consensus: Consensus,
     signer: Signer,
     actions: Vec<seq::Action>,
 }
@@ -350,7 +376,7 @@ impl Instance {
     }
 
     fn consume_actions(&mut self) {
-        for action in self.consensus.drain_actions() {
+        for action in self.consensus.sinc().drain() {
             self.actions.push(action);
         }
     }
@@ -360,10 +386,9 @@ impl Instance {
         assert_eq!(self.actions.drain(0..1).next(), Some(action));
     }
 
-    fn actions(&mut self, actions: Vec<seq::Action>) {
-        for action in actions {
-            self.action(action);
-        }
+    fn actions(&mut self) -> Vec<seq::Action> {
+        self.consume_actions();
+        self.actions.drain(..).collect()
     }
 
     fn no_actions(&mut self) {
@@ -410,12 +435,6 @@ impl Instances {
 
     fn send(&mut self, message: Message) {
         self.action(seq::Action::Send(message));
-    }
-
-    fn actions(&mut self, actions: Vec<seq::Action>) {
-        self.0
-            .iter_mut()
-            .for_each(|instance| instance.actions(actions.clone()));
     }
 
     fn no_actions(&mut self) {
@@ -705,7 +724,7 @@ impl SimState {
     ) -> bool {
         self.follow_protocol(i, inst);
         let mut acted = true;
-        for a in inst.consensus.drain_actions() {
+        for a in inst.actions() {
             acted = false;
             match a {
                 seq::Action::Send(m) => {
@@ -730,7 +749,7 @@ impl SimState {
     fn honest_actions(&mut self, i: usize, inst: &mut Instance) -> bool {
         self.follow_protocol(i, inst);
         let mut acted = true;
-        inst.consensus.consume_actions(|a| {
+        for a in inst.actions() {
             acted = false;
             match a {
                 seq::Action::Send(m) => self
@@ -749,7 +768,7 @@ impl SimState {
                 }
                 _ => {}
             }
-        });
+        }
         acted
     }
 
@@ -1050,7 +1069,8 @@ fn test_random_messages() {
         .collect::<Vec<_>>();
 
     gentest(4, |tester, inst: &mut Instances| {
-        inst.0[0].bootstrap(tester, View(1), "a");
+        let inst = RefCell::new(&mut inst.0[0]);
+        inst.borrow_mut().bootstrap(tester, View(1), "a");
         runner
             .run(
                 &(prop_oneof![
@@ -1083,7 +1103,7 @@ fn test_random_messages() {
                     .prop_map(|certificate| { Message::Timeout(Timeout { certificate }) }),
                 ]),
                 |msg| {
-                    inst.0[0].clone().on_message_err(msg);
+                    inst.borrow_mut().on_message_err(msg);
                     Ok(())
                 },
             )
