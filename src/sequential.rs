@@ -2,6 +2,7 @@ use crate::types::*;
 
 use anyhow::{anyhow, ensure, Result};
 use bit_vec::BitVec;
+use parking_lot::Mutex;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -42,6 +43,10 @@ pub enum Action {
     Propose,
 }
 
+pub trait ActionSinc {
+    fn send(&self, action: Action);
+}
+
 #[derive(Debug)]
 pub struct Consensus<T: ActionSinc> {
     // participants must be sorted lexicographically across all participating nodes.
@@ -49,28 +54,7 @@ pub struct Consensus<T: ActionSinc> {
     participants: Signers,
     keys: HashMap<Signer, PrivateKey>,
     actions: T,
-
-    // current view
-    view: View,
-    // last voted view
-    voted: View,
-    // single certificate from 2/3*f+1 Vote. initialized to genesis
-    locked: Certificate<Vote>,
-    // double certificate from 2/3*f+1 Vote2. initialized to genesis
-    double: Certificate<Vote>,
-    // to aggregate propose and prepare votes
-    // key is view, type of the vote, signer
-    // TODO this structs do not allow to easily spot equivocation
-    votes: BTreeMap<(View, Block), Votes<Vote>>,
-    votes2: BTreeMap<(View, Block), Votes<Certificate<Vote>>>,
-    timeouts: BTreeMap<View, Votes<Wish>>,
-    // after leader is ready to send a proposal it emulates asynchronous upcall
-    // and waits for a identifier of the payload
-    proposal: Option<Propose>,
-}
-
-pub trait ActionSinc {
-    fn send(&self, action: Action);
+    state: State,
 }
 
 impl<T: ActionSinc> Consensus<T> {
@@ -96,14 +80,16 @@ impl<T: ActionSinc> Consensus<T> {
             participants: Signers(participants),
             keys,
             actions,
-            view,
-            locked: lock,
-            double: commit,
-            voted,
-            proposal: None,
-            votes: BTreeMap::new(),
-            votes2: BTreeMap::new(),
-            timeouts: BTreeMap::new(),
+            state: State {
+                view,
+                voted,
+                locked: lock,
+                double: commit,
+                proposal: None,
+                votes: BTreeMap::new(),
+                votes2: BTreeMap::new(),
+                timeouts: BTreeMap::new(),
+            },
         }
     }
 
@@ -117,11 +103,14 @@ impl<T: ActionSinc> Consensus<T> {
     }
 
     pub fn on_tick(&mut self) {
-        if self.is_epoch_boundary() {
+        if self
+            .state
+            .is_epoch_boundary(self.participants.atleast_one_honest() as u64)
+        {
             // view will be advanced once leader aggregates timeout certificate from wishes.
             for (signer, pk) in self.keys.iter() {
                 let wish = Wish {
-                    view: self.view + 1,
+                    view: self.state.view + 1,
                 };
                 let signature = pk.sign(Domain::Wish, &wish.to_bytes());
                 self.actions.send(Action::Send(Message::Wish(Signed {
@@ -131,46 +120,58 @@ impl<T: ActionSinc> Consensus<T> {
                 })));
             }
         } else {
-            self.enter_view(self.view + 1);
-            self.wait_delay();
+            self.state.enter_view(self.state.view + 1);
+            self.actions.send(Action::EnteredView(self.state.view));
+            self.actions.send(Action::WaitDelay);
+            self.actions.send(Action::Send(Message::Sync(Sync {
+                locked: Some(self.state.locked.clone()),
+                double: Some(self.state.double.clone()),
+            })));
         }
     }
 
     pub fn on_delay(&mut self) {
         if self
             .keys
-            .get(&self.participants.leader(self.view))
+            .get(&self.participants.leader(self.state.view))
             .is_none()
         {
             return;
         }
         // unlike in the paper, i want to obtain double certificate on every block.
         // therefore i extend locked if it is equal to double, otherwise i retry locked block.
-        if self.locked.inner != self.double.inner {
-            self.proposal = Some(Propose {
-                view: self.view,
-                block: self.locked.inner.block.clone(),
-                locked: self.locked.clone(),
-                double: self.double.clone(),
+        if self.state.locked.inner != self.state.double.inner {
+            self.state.proposal = Some(Propose {
+                view: self.state.view,
+                block: self.state.locked.inner.block.clone(),
+                locked: self.state.locked.clone(),
+                double: self.state.double.clone(),
             });
             self.propose(None).expect("failed to propose block");
         } else {
-            self.proposal = Some(Propose {
-                view: self.view,
+            self.state.proposal = Some(Propose {
+                view: self.state.view,
                 block: Block {
-                    height: self.double.inner.block.height + 1,
+                    height: self.state.double.inner.block.height + 1,
                     id: ID::default(),
                 },
-                locked: self.locked.clone(),
-                double: self.double.clone(),
+                locked: self.state.locked.clone(),
+                double: self.state.double.clone(),
             });
             self.actions.send(Action::Propose);
         };
     }
 
     pub fn propose(&mut self, id: Option<ID>) -> Result<()> {
-        let mut proposal = self.proposal.take().ok_or_else(|| anyhow!("no proposal"))?;
-        ensure!(proposal.view >= self.view, "proposal wasn't built in time");
+        let mut proposal = self
+            .state
+            .proposal
+            .take()
+            .ok_or_else(|| anyhow!("no proposal"))?;
+        ensure!(
+            proposal.view >= self.state.view,
+            "proposal wasn't built in time"
+        );
         if let Some(id) = id {
             proposal.block.id = id;
         }
@@ -222,16 +223,17 @@ impl<T: ActionSinc> Consensus<T> {
             }
         }
         if let Some(locked) = sync.locked {
-            if locked.view > self.locked.view {
-                self.locked = locked;
-                self.actions.send(Action::Lock(self.locked.clone()));
+            if locked.view > self.state.locked.view {
+                self.state.locked = locked;
+                self.actions.send(Action::Lock(self.state.locked.clone()));
             }
         }
         if let Some(double) = sync.double {
-            if double.block.height == self.double.inner.block.height + 1 {
-                self.double = double;
-                self.actions.send(Action::Commit(self.double.clone()));
-                self.enter_view(self.double.inner.view + 1);
+            if double.block.height == self.state.double.inner.block.height + 1 {
+                self.state.double = double;
+                self.actions.send(Action::Commit(self.state.double.clone()));
+                self.state.enter_view(self.state.double.inner.view + 1);
+                self.actions.send(Action::EnteredView(self.state.view));
             }
         }
         Ok(())
@@ -248,9 +250,10 @@ impl<T: ActionSinc> Consensus<T> {
             &self.participants[wish.signer],
         )?;
 
-        ensure!(wish.inner.view > self.view, "old view");
+        ensure!(wish.inner.view > self.state.view, "old view");
 
         let wishes = self
+            .state
             .timeouts
             .entry(wish.inner.view)
             .or_insert_with(|| Votes::new(self.participants.len()));
@@ -288,9 +291,14 @@ impl<T: ActionSinc> Consensus<T> {
             self.participants.decode(&timeout.certificate.signers),
         )?;
 
-        ensure!(timeout.certificate.inner > self.view, "old view");
-        self.enter_view(timeout.certificate.inner);
-        self.wait_delay();
+        ensure!(timeout.certificate.inner > self.state.view, "old view");
+        self.state.enter_view(timeout.certificate.inner);
+        self.actions.send(Action::EnteredView(self.state.view));
+        self.actions.send(Action::WaitDelay);
+        self.actions.send(Action::Send(Message::Sync(Sync {
+            locked: Some(self.state.locked.clone()),
+            double: Some(self.state.double.clone()),
+        })));
         Ok(())
     }
 
@@ -332,42 +340,43 @@ impl<T: ActionSinc> Consensus<T> {
             )?;
         }
 
-        if propose.inner.locked.view > self.locked.view {
-            self.locked = propose.inner.locked.clone();
-            self.actions.send(Action::Lock(self.locked.clone()));
+        if propose.inner.locked.view > self.state.locked.view {
+            self.state.locked = propose.inner.locked.clone();
+            self.actions.send(Action::Lock(self.state.locked.clone()));
         }
         ensure!(
-            propose.inner.locked.inner.view == self.locked.inner.view,
+            propose.inner.locked.inner.view == self.state.locked.inner.view,
             "proposed block must use cert no lower then locally locked block"
         );
 
-        if propose.inner.double.view > self.double.view {
-            self.double = propose.inner.double.clone();
-            self.actions.send(Action::Commit(self.double.clone()));
-            self.enter_view(self.double.inner.view + 1);
+        if propose.inner.double.view > self.state.double.view {
+            self.state.double = propose.inner.double.clone();
+            self.actions.send(Action::Commit(self.state.double.clone()));
+            self.state.enter_view(self.state.double.inner.view + 1);
+            self.actions.send(Action::EnteredView(self.state.view));
         }
         ensure!(
-            propose.inner.double.inner == self.double.inner,
+            propose.inner.double.inner == self.state.double.inner,
             "propose must extend known highest doubly certified block"
         );
 
         ensure!(
-            propose.inner.view == self.view,
+            propose.inner.view == self.state.view,
             "node must be in the same round as propose"
         );
         ensure!(
-            self.voted < propose.inner.view,
+            self.state.voted < propose.inner.view,
             "should not vote more than once in the same view"
         );
         ensure!(
-            propose.inner.block.height == self.double.inner.block.height + 1,
+            propose.inner.block.height == self.state.double.inner.block.height + 1,
             "proposed block height {:?} must be one after the commited block {:?}",
             propose.inner.block.height,
-            self.double.inner.block.height,
+            self.state.double.inner.block.height,
         );
 
-        self.voted = propose.inner.view;
-        self.actions.send(Action::Voted(self.voted));
+        self.state.voted = propose.inner.view;
+        self.actions.send(Action::Voted(self.state.voted));
         self.keys.iter().for_each(|(signer, pk)| {
             let vote = Vote {
                 view: propose.inner.view.clone(),
@@ -414,17 +423,17 @@ impl<T: ActionSinc> Consensus<T> {
         )?;
 
         ensure!(
-            prepare.inner.certificate.inner.view == self.view,
+            prepare.inner.certificate.inner.view == self.state.view,
             "accepting prepare only for view {:?}",
-            self.view,
+            self.state.view,
         );
         ensure!(
-            prepare.inner.certificate.inner.view > self.locked.inner.view,
+            prepare.inner.certificate.inner.view > self.state.locked.inner.view,
             "certificatate for old view {:?}",
             prepare.inner.certificate.inner.view,
         );
-        self.locked = prepare.inner.certificate.clone();
-        self.actions.send(Action::Lock(self.locked.clone()));
+        self.state.locked = prepare.inner.certificate.clone();
+        self.actions.send(Action::Lock(self.state.locked.clone()));
 
         let locked: Certificate<Vote> = prepare.inner.certificate;
         self.keys.iter().for_each(|(signer, pk)| {
@@ -450,14 +459,15 @@ impl<T: ActionSinc> Consensus<T> {
             &self.participants[vote.signer],
         )?;
 
-        ensure!(vote.inner.view == self.view, "invalid view");
-        let signer = self.participants.leader(self.view);
+        ensure!(vote.inner.view == self.state.view, "invalid view");
+        let signer = self.participants.leader(self.state.view);
         let pk = self
             .keys
             .get(&signer)
-            .ok_or_else(|| anyhow!("not a leader in view {:?}", self.view))?;
+            .ok_or_else(|| anyhow!("not a leader in view {:?}", self.state.view))?;
 
         let votes = self
+            .state
             .votes
             .entry((vote.inner.view, vote.inner.block.clone()))
             .or_insert_with(|| Votes::new(self.participants.len()));
@@ -510,19 +520,20 @@ impl<T: ActionSinc> Consensus<T> {
 
         ensure!(
             self.keys
-                .get(&self.participants.leader(self.view + 1))
+                .get(&self.participants.leader(self.state.view + 1))
                 .is_some(),
             "not a leader in view {:?}",
-            self.view + 1
+            self.state.view + 1
         );
         ensure!(
-            vote.inner.view == self.view,
+            vote.inner.view == self.state.view,
             "vote view {:?} not equal to local view {:?}",
             vote.inner.view,
-            self.view
+            self.state.view
         );
 
         let votes = self
+            .state
             .votes2
             .entry((vote.inner.view, vote.inner.block.clone()))
             .or_insert_with(|| Votes::new(self.participants.len()));
@@ -539,7 +550,7 @@ impl<T: ActionSinc> Consensus<T> {
                     .expect("failed to aggregate signatures"),
                 signers: votes.signers(),
             };
-            self.proposal = Some(Propose {
+            self.state.proposal = Some(Propose {
                 view: cert.view + 1,
                 block: Block {
                     height: cert.height + 1,
@@ -552,9 +563,32 @@ impl<T: ActionSinc> Consensus<T> {
         }
         Ok(())
     }
+}
 
-    fn is_epoch_boundary(&self) -> bool {
-        self.view % self.participants.atleast_one_honest() as u64 == 0
+#[derive(Debug)]
+struct State {
+    // current view
+    view: View,
+    // last voted view
+    voted: View,
+    // single certificate from 2/3*f+1 Vote. initialized to genesis
+    locked: Certificate<Vote>,
+    // double certificate from 2/3*f+1 Vote2. initialized to genesis
+    double: Certificate<Vote>,
+    // to aggregate propose and prepare votes
+    // key is view, type of the vote, signer
+    // TODO this structs do not allow to easily spot equivocation
+    votes: BTreeMap<(View, Block), Votes<Vote>>,
+    votes2: BTreeMap<(View, Block), Votes<Certificate<Vote>>>,
+    timeouts: BTreeMap<View, Votes<Wish>>,
+    // after leader is ready to send a proposal it emulates asynchronous upcall
+    // and waits for a identifier of the payload
+    proposal: Option<Propose>,
+}
+
+impl State {
+    fn is_epoch_boundary(&self, threshold: u64) -> bool {
+        self.view % threshold == 0
     }
 
     fn enter_view(&mut self, view: View) {
@@ -562,17 +596,6 @@ impl<T: ActionSinc> Consensus<T> {
         self.timeouts.retain(|view, _| view >= &self.view);
         self.votes.retain(|(view, _), _| view >= &self.view);
         self.votes2.retain(|(view, _), _| view >= &self.view);
-        self.actions.send(Action::EnteredView(self.view));
-    }
-
-    fn wait_delay(&mut self) {
-        // it will be more optimal to output it only if this node
-        // is not a leader in the next view
-        self.actions.send(Action::WaitDelay);
-        self.actions.send(Action::Send(Message::Sync(Sync {
-            locked: Some(self.locked.clone()),
-            double: Some(self.double.clone()),
-        })));
     }
 }
 
@@ -612,7 +635,7 @@ impl Index<u16> for Signers {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Votes<T: ToBytes + Clone + Debug> {
     signers: BitVec,
     votes: Vec<Signed<T>>,
