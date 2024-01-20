@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::cmp::max;
 use std::fmt::Debug;
 
-use crate::sequential::{self as seq, ActionSinc};
+use crate::sequential::{self as seq, ActionSink};
 use crate::types::*;
 
 use bit_vec::BitVec;
@@ -14,56 +14,67 @@ use proptest::test_runner::{Config, TestRunner};
 use rand::thread_rng;
 
 #[derive(Debug)]
-struct DequeSinc {
+struct DequeSink {
     pub actions: RefCell<Vec<seq::Action>>,
 }
 
-impl DequeSinc {
+impl DequeSink {
+    fn drain(&self) -> Vec<seq::Action> {
+        self.actions.borrow_mut().drain(..).collect()
+    }
+}
+
+impl ActionSink for DequeSink {
     fn new() -> Self {
         Self {
             actions: RefCell::new(vec![]),
         }
     }
 
-    fn drain(&self) -> Vec<seq::Action> {
-        self.actions.borrow_mut().drain(..).collect()
-    }
-}
-
-impl ActionSinc for DequeSinc {
     fn send(&self, action: seq::Action) {
         self.actions.borrow_mut().push(action);
     }
 }
 
-type Consensus = seq::Consensus<DequeSinc>;
+type Consensus = seq::Consensus<DequeSink>;
 
 struct Tester {
     keys: Vec<PrivateKey>,
     genesis: Certificate<Vote>,
 }
 
+pub(crate) fn gen_keys(n: usize) -> Vec<PrivateKey> {
+    let mut keys: Vec<_> = (0..n)
+        .map(|_| {
+            let seed = thread_rng().gen::<[u8; 32]>();
+            PrivateKey::from_seed(&seed)
+        })
+        .collect();
+    keys.sort_by(|a, b| a.public().cmp(&b.public()));
+    keys
+}
+
+pub(crate) fn gen_genesis() -> Certificate<Vote> {
+    let empty_seed = [0; 32];
+    let genesis = Certificate {
+        inner: Vote {
+            view: View(0),
+            block: Block::new(0, ID::new([0; 32])),
+        },
+        signature: PrivateKey::from_seed(&empty_seed)
+            .sign(Domain::Vote, &[0; 32])
+            .into(),
+        signers: BitVec::new(),
+    };
+    genesis
+}
+
 impl Tester {
     fn new(n: usize) -> Self {
-        let mut keys: Vec<_> = (0..n)
-            .map(|_| {
-                let seed = thread_rng().gen::<[u8; 32]>();
-                PrivateKey::from_seed(&seed)
-            })
-            .collect();
-        keys.sort_by(|a, b| a.public().cmp(&b.public()));
-        let empty_seed = [0; 32];
-        let genesis = Certificate {
-            inner: Vote {
-                view: View(0),
-                block: Block::new(0, ID::new([0; 32])),
-            },
-            signature: PrivateKey::from_seed(&empty_seed)
-                .sign(Domain::Vote, &[0; 32])
-                .into(),
-            signers: BitVec::new(),
-        };
-        Self { keys, genesis }
+        Self {
+            keys: gen_keys(n),
+            genesis: gen_genesis(),
+        }
     }
 
     fn keys(&self) -> Vec<PrivateKey> {
@@ -82,7 +93,6 @@ impl Tester {
             self.genesis(),
             View(0),
             &self.keys[i..i + 1],
-            DequeSinc::new(),
         )
     }
 
@@ -375,7 +385,7 @@ impl Instance {
     }
 
     fn consume_actions(&mut self) {
-        for action in self.consensus.sinc().drain() {
+        for action in self.consensus.sink().drain() {
             self.actions.push(action);
         }
     }

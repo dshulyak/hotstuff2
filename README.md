@@ -9,18 +9,17 @@
 
 
 TODO:
-- [ ] coverage
-  single and multi instances unit tests so that consensus makes progress
-  exactly as i expect it too.
-- [ ] proptests
-  completely random messages.
-  different order for good messages.
-  1/3 of the network is voting differently.
-- [ ] synchronization
-  private and public keys are immutable and trivially Sync. it is done so that they can be read without holding a lock.
-  the other state is moved behind the mutex, such as Mutex<State>.
-  actions is an unbounded tokio channel. 
 - [ ] loom
+- [ ] codec for types
+  simple to_bytes / from_bytes
+- [ ] example node with tokio
+  use tokio, quinn, tracing, metrics
+- [ ] tester to setup cluster in subprocesses
+  features:
+    - setup network delay with qdisc
+    - periodically kill processes
+    - save logs per node
+    - periodically dump metrics per node 
 
 ## Tests
 

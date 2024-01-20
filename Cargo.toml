@@ -9,6 +9,9 @@ edition = "2021"
 blst = "0.3.11"
 bit-vec = "0.6.3"
 anyhow = "1.0"
-rand = "0.8.0"
 parking_lot = "0.12.1"
+
+[dev-dependencies]
+rand = "0.8.0"
 proptest = "1.4.0"
+loom = "0.7.1"

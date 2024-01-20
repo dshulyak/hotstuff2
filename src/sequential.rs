@@ -1,8 +1,8 @@
+use crate::sync::Mutex;
 use crate::types::*;
 
 use anyhow::{anyhow, ensure, Ok, Result};
 use bit_vec::BitVec;
-use parking_lot::Mutex;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
@@ -43,12 +43,13 @@ pub enum Action {
     Propose,
 }
 
-pub trait ActionSinc {
+pub trait ActionSink {
+    fn new() -> Self;
     fn send(&self, action: Action);
 }
 
 #[derive(Debug)]
-pub struct Consensus<T: ActionSinc> {
+pub struct Consensus<T: ActionSink> {
     // participants must be sorted lexicographically across all participating nodes.
     // used to decode public keys by reference.
     participants: Signers,
@@ -57,7 +58,7 @@ pub struct Consensus<T: ActionSinc> {
     state: Mutex<State>,
 }
 
-impl<T: ActionSinc> Consensus<T> {
+impl<T: ActionSink> Consensus<T> {
     pub fn new(
         view: View,
         participants: Box<[PublicKey]>,
@@ -65,7 +66,6 @@ impl<T: ActionSinc> Consensus<T> {
         commit: Certificate<Vote>,
         voted: View,
         keys: &[PrivateKey],
-        actions: T,
     ) -> Self {
         let keys = keys
             .iter()
@@ -79,7 +79,7 @@ impl<T: ActionSinc> Consensus<T> {
         Self {
             participants: Signers(participants),
             keys,
-            actions,
+            actions: T::new(),
             state: Mutex::new(State {
                 view,
                 voted,
@@ -93,7 +93,7 @@ impl<T: ActionSinc> Consensus<T> {
         }
     }
 
-    pub fn sinc(&self) -> &T {
+    pub fn sink(&self) -> &T {
         &self.actions
     }
 
