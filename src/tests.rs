@@ -343,7 +343,7 @@ impl Instance {
     fn on_propose(&mut self, id: &str) {
         let mut _id = [0; 32];
         _id[..id.len()].copy_from_slice(id.as_bytes());
-        self.consensus.propose(Some(ID::new(_id))).expect("ERROR");
+        self.consensus.propose(ID::new(_id)).expect("ERROR");
     }
 
     fn send(&mut self, message: Message) {
@@ -799,7 +799,7 @@ impl SimState {
             self.wait_delay[i] = false;
         }
         if let Some(p) = self.propose[i].take() {
-            inst.consensus.propose(Some(ID::new(p))).expect("no error");
+            inst.consensus.propose(ID::new(p)).expect("no error");
         }
     }
 }
