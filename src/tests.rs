@@ -4,7 +4,6 @@ use std::cell::RefCell;
 use std::cmp::max;
 use std::fmt::Debug;
 
-use crate::sequential::Action as action;
 use crate::sequential::{self as seq, ActionSinc};
 use crate::types::*;
 
@@ -16,7 +15,7 @@ use rand::thread_rng;
 
 #[derive(Debug)]
 struct DequeSinc {
-    pub actions: RefCell<Vec<action>>,
+    pub actions: RefCell<Vec<seq::Action>>,
 }
 
 impl DequeSinc {
@@ -26,7 +25,7 @@ impl DequeSinc {
         }
     }
 
-    fn drain(&self) -> Vec<action> {
+    fn drain(&self) -> Vec<seq::Action> {
         self.actions.borrow_mut().drain(..).collect()
     }
 }
@@ -311,7 +310,7 @@ impl Instance {
         self.wait_delay();
         self.send(tester.sync_genesis());
         self.on_message(tester.propose_first(view, id));
-        self.action(action::voted(view));
+        self.voted(view);
         self.send(tester.vote(view, 1, id, self.signer));
         self.on_message(tester.prepare(view, 1, id, vec![0, 1, 2]));
         self.lock(tester.certify_vote(view, 1, id, vec![0, 1, 2]));
@@ -352,27 +351,27 @@ impl Instance {
     }
 
     fn lock(&mut self, lock: Certificate<Vote>) {
-        self.action(seq::Action::lock(lock));
+        self.action(seq::Action::Lock(lock));
     }
 
     fn commit(&mut self, commit: Certificate<Vote>) {
-        self.action(seq::Action::commit(commit));
+        self.action(seq::Action::Commit(commit));
     }
 
     fn voted(&mut self, view: View) {
-        self.action(action::voted(view));
+        self.action(seq::Action::Voted(view));
     }
 
     fn entered_view(&mut self, view: View) {
-        self.action(seq::Action::entered_view(view));
+        self.action(seq::Action::EnteredView(view));
     }
 
     fn wait_delay(&mut self) {
-        self.action(seq::Action::wait_delay());
+        self.action(seq::Action::WaitDelay);
     }
 
     fn propose(&mut self) {
-        self.action(seq::Action::propose());
+        self.action(seq::Action::Propose);
     }
 
     fn consume_actions(&mut self) {
@@ -431,6 +430,26 @@ impl Instances {
         self.0
             .iter_mut()
             .for_each(|instance| instance.action(action.clone()));
+    }
+
+    fn lock(&mut self, lock: Certificate<Vote>) {
+        self.0
+            .iter_mut()
+            .for_each(|instance| instance.lock(lock.clone()));
+    }
+
+    fn voted(&mut self, view: View) {
+        self.0.iter_mut().for_each(|instance| instance.voted(view));
+    }
+
+    fn wait_delay(&mut self) {
+        self.0.iter_mut().for_each(|instance| instance.wait_delay());
+    }
+
+    fn entered_view(&mut self, view: View) {
+        self.0
+            .iter_mut()
+            .for_each(|instance| instance.entered_view(view));
     }
 
     fn send(&mut self, message: Message) {
@@ -628,29 +647,29 @@ fn test_repetetive_messages() {
 fn test_multi_bootstrap() {
     gentest(4, |tester, instances: &mut Instances| {
         instances.on_tick();
-        instances.for_each(|i| i.action(action::send(tester.wish(1.into(), i.signer))));
+        instances.for_each(|i| i.send(tester.wish(1.into(), i.signer)));
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
-        instances.action(action::entered_view(1.into()));
-        instances.action(action::wait_delay());
-        instances.action(action::send(tester.sync_genesis()));
+        instances.entered_view(1.into());
+        instances.wait_delay();
+        instances.send(tester.sync_genesis());
         instances.on_delay();
-        instances.leader(1.into()).action(action::propose());
+        instances.leader(1.into()).propose();
 
         instances.no_actions();
 
         instances.leader(1.into()).on_propose("a");
         instances
             .leader(1.into())
-            .action(action::send(tester.propose_first(1.into(), "a")));
+            .send(tester.propose_first(1.into(), "a"));
         instances.on_message(tester.propose_first(1.into(), "a"));
-        instances.action(action::voted(1.into()));
+        instances.voted(1.into());
 
         let votes = instances
             .0
             .iter_mut()
             .map(|i| {
                 let vote = tester.vote(1.into(), 1, "a", i.signer);
-                i.action(action::send(vote.clone()));
+                i.send(vote.clone());
                 vote
             })
             .collect::<Vec<_>>();
@@ -664,31 +683,26 @@ fn test_multi_bootstrap() {
             .leader(1.into())
             .send(tester.prepare(1.into(), 1, "a", vec![0, 1, 2]));
         instances.on_message(tester.prepare(1.into(), 1, "a", vec![0, 1, 2]));
-        instances.action(action::lock(tester.certify_vote(
-            1.into(),
-            1,
-            "a",
-            vec![0, 1, 2],
-        )));
+        instances.lock(tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]));
         instances
             .map(|i| {
                 let vote = tester.vote2(1.into(), 1, "a", i.signer, vec![0, 1, 2]);
-                i.action(action::send(vote.clone()));
+                i.send(vote.clone());
                 vote
             })
             .into_iter()
             .for_each(|v| instances.leader(2.into()).on_message(v));
 
         let leader2 = instances.leader(2.into());
-        leader2.action(action::propose());
+        leader2.propose();
         leader2.on_propose("b");
-        leader2.action(action::send(tester.propose(
+        leader2.send(tester.propose(
             2.into(),
             2,
             "b",
             tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]),
             tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
-        )));
+        ));
 
         instances.no_actions();
     })

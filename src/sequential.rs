@@ -42,36 +42,6 @@ pub enum Action {
     Propose,
 }
 
-impl Action {
-    pub fn commit(certificate: Certificate<Vote>) -> Self {
-        Action::Commit(certificate)
-    }
-
-    pub fn lock(certificate: Certificate<Vote>) -> Self {
-        Action::Lock(certificate)
-    }
-
-    pub fn voted(view: View) -> Self {
-        Action::Voted(view)
-    }
-
-    pub fn send(message: Message) -> Self {
-        Action::Send(message)
-    }
-
-    pub fn wait_delay() -> Self {
-        Action::WaitDelay
-    }
-
-    pub fn entered_view(view: View) -> Self {
-        Action::EnteredView(view)
-    }
-
-    pub fn propose() -> Self {
-        Action::Propose
-    }
-}
-
 #[derive(Debug)]
 pub struct Consensus<T: ActionSinc> {
     // participants must be sorted lexicographically across all participating nodes.
