@@ -10,10 +10,7 @@
 
 TODO:
 - [ ] loom
-- [ ] codec for types
-  simple to_bytes / from_bytes
 - [ ] example node with tokio
-  use tokio, quinn, tracing, metrics
 - [ ] tester to setup cluster in subprocesses
   features:
     - setup network delay with qdisc

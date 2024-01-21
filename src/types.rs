@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use bit_vec::BitVec;
 use blst::min_pk as blst;
+use std::hash::{Hash, Hasher};
 use std::ops::{Add, AddAssign, Deref, Rem};
 
 pub trait ToBytes {
@@ -16,11 +17,21 @@ impl ID {
     pub fn new(bytes: [u8; 32]) -> Self {
         ID(bytes.into())
     }
-}
 
-impl ID {
+    pub fn from_str(id: &str) -> Self {
+        let mut fid = [0; 32];
+        fid[..id.len()].copy_from_slice(id.as_bytes());
+        ID::new(fid)
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl From<[u8; 32]> for ID {
+    fn from(bytes: [u8; 32]) -> Self {
+        ID(bytes.into())
     }
 }
 
@@ -163,6 +174,18 @@ impl ToBytes for View {
     }
 }
 
+impl From<u64> for View {
+    fn from(v: u64) -> Self {
+        View(v)
+    }
+}
+
+impl Into<u64> for View {
+    fn into(self) -> u64 {
+        self.0
+    }
+}
+
 impl From<i32> for View {
     fn from(v: i32) -> Self {
         View(v as u64)
@@ -230,6 +253,24 @@ pub enum Message {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicKey(blst::PublicKey);
+
+impl PublicKey {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(PublicKey(
+            blst::PublicKey::from_bytes(bytes).map_err(|_| anyhow!("invalid public key"))?,
+        ))
+    }
+
+    pub fn to_bytes(&self) -> [u8; PUBLIC_KEY_SIZE] {
+        self.0.to_bytes()
+    }
+}
+
+impl Hash for PublicKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_bytes().hash(state);
+    }
+}
 
 impl PartialOrd for PublicKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -307,14 +348,31 @@ impl PrivateKey {
         PrivateKey(blst::SecretKey::key_gen(seed, &[]).expect("failed to generate private key"))
     }
 
-    pub(crate) fn sign(&self, dst: Domain, message: &[u8]) -> Signature {
+    pub fn sign(&self, dst: Domain, message: &[u8]) -> Signature {
         Signature(self.0.sign(message, dst.into(), &[]))
     }
 
-    pub(crate) fn public(&self) -> PublicKey {
+    pub fn public(&self) -> PublicKey {
         PublicKey(self.0.sk_to_pk())
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(PrivateKey(
+            blst::SecretKey::from_bytes(bytes).map_err(|_| anyhow!("invalid private key"))?,
+        ))
+    }
+
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
+    pub fn prove_possession(&self) -> Signature {
+        self.sign(Domain::Possesion, &self.public().to_bytes())
+    }
 }
+
+pub const PUBLIC_KEY_SIZE: usize = 48;
+pub const SIGNATURE_SIZE: usize = 96;
 
 #[derive(Debug, Clone)]
 pub struct Signature(blst::Signature);
@@ -347,6 +405,20 @@ impl Signature {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
             err => Err(anyhow!("invalid signature: {:?}", err)),
         }
+    }
+
+    pub fn verify_possesion(&self, public_key: &PublicKey) -> Result<()> {
+        self.verify(Domain::Possesion, &public_key.to_bytes(), public_key)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_bytes().to_vec()
+    }
+
+    pub fn from_bytes(bytes: &[u8; SIGNATURE_SIZE]) -> Result<Self> {
+        blst::Signature::from_bytes(bytes)
+            .map(Signature)
+            .map_err(|err| anyhow!("failed to parse signature: {:?}", err))
     }
 }
 

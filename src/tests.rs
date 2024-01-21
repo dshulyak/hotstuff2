@@ -1,13 +1,16 @@
 #![allow(dead_code)]
 
+use std::borrow::{Borrow, BorrowMut};
 use std::cell::RefCell;
 use std::cmp::max;
 use std::fmt::Debug;
+use std::rc::Rc;
 
-use crate::sequential::{self as seq, ActionSink};
+use crate::sequential::{self as seq, Actions};
 use crate::types::*;
 
 use bit_vec::BitVec;
+use parking_lot::Mutex;
 use proptest::prelude::*;
 use proptest::sample::{subsequence, Subsequence};
 use proptest::test_runner::{Config, TestRunner};
@@ -15,28 +18,32 @@ use rand::thread_rng;
 
 #[derive(Debug)]
 struct DequeSink {
-    pub actions: RefCell<Vec<seq::Action>>,
+    pub actions: Mutex<Vec<seq::Action>>,
 }
 
 impl DequeSink {
-    fn drain(&self) -> Vec<seq::Action> {
-        self.actions.borrow_mut().drain(..).collect()
-    }
-}
-
-impl ActionSink for DequeSink {
     fn new() -> Self {
         Self {
-            actions: RefCell::new(vec![]),
+            actions: Mutex::new(Vec::new()),
         }
     }
 
-    fn send(&self, action: seq::Action) {
-        self.actions.borrow_mut().push(action);
+    fn drain(&self) -> Vec<seq::Action> {
+        self.actions.lock().drain(..).collect()
     }
 }
 
-type Consensus = seq::Consensus<DequeSink>;
+impl Actions for Rc<DequeSink> {
+    fn send(&self, action: seq::Action) {
+        self.actions.lock().push(action);
+    }
+}
+
+#[derive(Debug)]
+struct Consensus {
+    c: seq::Consensus<Rc<DequeSink>>,
+    sink: Rc<DequeSink>,
+}
 
 struct Tester {
     keys: Vec<PrivateKey>,
@@ -86,14 +93,17 @@ impl Tester {
     }
 
     fn active(&self, i: usize) -> Consensus {
-        Consensus::new(
+        let deq = Rc::new(DequeSink::new());
+        let c = seq::Consensus::new(
             View(0),
             self.publics(),
             self.genesis(),
             self.genesis(),
             View(0),
             &self.keys[i..i + 1],
-        )
+            deq.clone(),
+        );
+        Consensus { c, sink: deq }
     }
 
     fn leader(&self, view: View) -> Signer {
@@ -142,11 +152,7 @@ impl Tester {
     ) -> Certificate<Vote> {
         let vote = Vote {
             view,
-            block: {
-                let mut _id = [0; 32];
-                _id[..id.len()].copy_from_slice(id.as_bytes());
-                Block::new(height, ID::new(_id))
-            },
+            block: Block::new(height, ID::from_str(id)),
         };
         self.certify(Domain::Vote, signers, &vote)
     }
@@ -160,11 +166,7 @@ impl Tester {
     ) -> Certificate<Vote> {
         let vote = Vote {
             view,
-            block: {
-                let mut _id = [0; 32];
-                _id[..id.len()].copy_from_slice(id.as_bytes());
-                Block::new(height, ID::new(_id))
-            },
+            block: Block::new(height, ID::from_str(id)),
         };
         self.certify(Domain::Vote2, signers, &vote)
     }
@@ -174,11 +176,7 @@ impl Tester {
     fn prepare(&self, view: View, height: u64, id: &str, signers: Vec<Signer>) -> Message {
         let vote = Vote {
             view,
-            block: {
-                let mut _id = [0; 32];
-                _id[..id.len()].copy_from_slice(id.as_bytes());
-                Block::new(height, ID::new(_id))
-            },
+            block: Block::new(height, ID::from_str(id)),
         };
         let certificate = self.certify(Domain::Vote, signers, &vote);
         let prepare = Prepare { certificate };
@@ -194,11 +192,7 @@ impl Tester {
     fn propose_first(&self, view: View, id: &str) -> Message {
         let propose = Propose {
             view,
-            block: {
-                let mut _id = [0; 32];
-                _id[..id.len()].copy_from_slice(id.as_bytes());
-                Block::new(1, ID::new(_id))
-            },
+            block: Block::new(1, ID::from_str(id)),
             locked: self.genesis(),
             double: self.genesis(),
         };
@@ -219,11 +213,7 @@ impl Tester {
         locked: Certificate<Vote>,
         double: Certificate<Vote>,
     ) -> Message {
-        let block = {
-            let mut _id = [0; 32];
-            _id[..id.len()].copy_from_slice(id.as_bytes());
-            Block::new(height, ID::new(_id))
-        };
+        let block = Block::new(height, ID::from_str(id));
         let propose = Propose {
             view,
             block,
@@ -240,11 +230,7 @@ impl Tester {
     }
 
     fn vote(&self, view: View, height: u64, id: &str, signer: Signer) -> Message {
-        let block = {
-            let mut _id = [0; 32];
-            _id[..id.len()].copy_from_slice(id.as_bytes());
-            Block::new(height, ID::new(_id))
-        };
+        let block = Block::new(height, ID::from_str(id));
         let vote = Vote { view, block };
         let signature = self.sign(Domain::Vote, signer, &vote);
         Message::Vote(Signed {
@@ -262,11 +248,7 @@ impl Tester {
         signer: Signer,
         signers: Vec<Signer>,
     ) -> Message {
-        let block = {
-            let mut _id = [0; 32];
-            _id[..id.len()].copy_from_slice(id.as_bytes());
-            Block::new(height, ID::new(_id))
-        };
+        let block = Block::new(height, ID::from_str(id));
         let vote = Vote { view, block };
         let cert = self.certify(Domain::Vote, signers, &vote);
         let signature = self.sign(Domain::Vote2, signer, &vote);
@@ -328,15 +310,16 @@ impl Instance {
     }
 
     fn is_leader(&self, view: View) -> bool {
-        self.consensus.is_leader(view)
+        self.consensus.c.is_leader(view)
     }
 
     fn on_message(&mut self, message: Message) {
-        self.consensus.on_message(message).expect("message:");
+        self.consensus.c.on_message(message).expect("message:");
     }
 
     fn on_message_err(&mut self, message: Message) {
         self.consensus
+            .c
             .on_message(message)
             .expect_err("expected to fail");
     }
@@ -346,13 +329,11 @@ impl Instance {
     }
 
     fn on_delay(&mut self) {
-        self.consensus.on_delay();
+        self.consensus.c.on_delay();
     }
 
     fn on_propose(&mut self, id: &str) {
-        let mut _id = [0; 32];
-        _id[..id.len()].copy_from_slice(id.as_bytes());
-        self.consensus.propose(ID::new(_id)).expect("ERROR");
+        self.consensus.c.propose(ID::from_str(id)).expect("ERROR");
     }
 
     fn send(&mut self, message: Message) {
@@ -380,7 +361,7 @@ impl Instance {
     }
 
     fn consume_actions(&mut self) {
-        for action in self.consensus.sink().drain() {
+        for action in self.consensus.sink.drain() {
             self.actions.push(action);
         }
     }
@@ -783,13 +764,13 @@ impl SimState {
         {
             let msgs = &mut self.inputs[i];
             msgs.iter().for_each(|m| {
-                _ = inst.consensus.on_message(m.clone());
+                _ = inst.consensus.c.on_message(m.clone());
             });
             msgs.clear();
         }
         inst.on_delay();
         if let Some(p) = self.propose[i].take() {
-            inst.consensus.propose(ID::new(p)).expect("no error");
+            inst.consensus.c.propose(ID::new(p)).expect("no error");
         }
     }
 }

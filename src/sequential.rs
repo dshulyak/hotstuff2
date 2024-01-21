@@ -25,7 +25,7 @@ pub enum Action {
     Commit(Certificate<Vote>),
     // node should not vote below highest known locked certificate. persisted for safety.
     Lock(Certificate<Vote>),
-    // node should not vote more than once in the view. persisted for safety.
+    // node should not vote more than once in the view. hence when this even is received it has to be persisted.
     Voted(View),
 
     // TODO this can be dropped, and instead exposed with pub view()
@@ -42,13 +42,12 @@ pub enum Action {
     Propose,
 }
 
-pub trait ActionSink {
-    fn new() -> Self;
+pub trait Actions: Debug {
     fn send(&self, action: Action);
 }
 
 #[derive(Debug)]
-pub struct Consensus<T: ActionSink> {
+pub struct Consensus<T: Actions> {
     // participants must be sorted lexicographically across all participating nodes.
     // used to decode public keys by reference.
     participants: Signers,
@@ -57,7 +56,7 @@ pub struct Consensus<T: ActionSink> {
     state: Mutex<State>,
 }
 
-impl<T: ActionSink> Consensus<T> {
+impl<T: Actions> Consensus<T> {
     pub fn new(
         view: View,
         participants: Box<[PublicKey]>,
@@ -65,6 +64,7 @@ impl<T: ActionSink> Consensus<T> {
         commit: Certificate<Vote>,
         voted: View,
         keys: &[PrivateKey],
+        actions: T,
     ) -> Self {
         let keys = keys
             .iter()
@@ -78,7 +78,7 @@ impl<T: ActionSink> Consensus<T> {
         Self {
             participants: Signers(participants),
             keys,
-            actions: T::new(),
+            actions: actions,
             state: Mutex::new(State {
                 view,
                 voted,
