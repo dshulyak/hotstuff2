@@ -19,6 +19,7 @@ const DELAY: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    // TODO consider grouping all state updates into single message, with multiple Option's
     // persist the following data before sending messages.
     // committed certificate can be executed.
     Commit(Certificate<Vote>),
@@ -26,6 +27,8 @@ pub enum Action {
     Lock(Certificate<Vote>),
     // node should not vote more than once in the view. persisted for safety.
     Voted(View),
+
+    // TODO this can be dropped, and instead exposed with pub view()
     EnteredView(View),
 
     // send message to all participants
@@ -213,7 +216,7 @@ impl<T: ActionSink> Consensus<T> {
     fn on_sync(&self, sync: Sync) -> Result<()> {
         if let Some(double) = &sync.double {
             ensure!(double.signers.len() <= self.participants.len());
-            if double.view > View(0) {
+            if double.inner.view > View(0) {
                 double.signature.verify(
                     Domain::Vote2,
                     &double.inner.to_bytes(),
@@ -223,7 +226,7 @@ impl<T: ActionSink> Consensus<T> {
         }
         if let Some(locked) = &sync.locked {
             ensure!(locked.signers.len() <= self.participants.len());
-            if locked.view > View(0) {
+            if locked.inner.view > View(0) {
                 locked.signature.verify(
                     Domain::Vote,
                     &locked.inner.to_bytes(),
@@ -235,13 +238,13 @@ impl<T: ActionSink> Consensus<T> {
         let mut state = self.state.lock();
 
         if let Some(locked) = sync.locked {
-            if locked.view > state.locked.view {
+            if locked.inner.view > state.locked.inner.view {
                 state.locked = locked;
                 self.actions.send(Action::Lock(state.locked.clone()));
             }
         }
         if let Some(double) = sync.double {
-            if double.block.height == state.double.inner.block.height + 1 {
+            if double.inner.block.height == state.double.inner.block.height + 1 {
                 state.double = double;
                 let next = state.double.inner.view + 1;
                 state.enter_view(next);
@@ -365,7 +368,7 @@ impl<T: ActionSink> Consensus<T> {
 
         {
             let mut state = self.state.lock();
-            if propose.inner.locked.view > state.locked.view {
+            if propose.inner.locked.inner.view > state.locked.inner.view {
                 state.locked = propose.inner.locked.clone();
                 self.actions.send(Action::Lock(state.locked.clone()));
             }
@@ -374,7 +377,7 @@ impl<T: ActionSink> Consensus<T> {
                 "proposed block must use cert no lower then locally locked block"
             );
 
-            if propose.inner.double.view > state.double.view {
+            if propose.inner.double.inner.view > state.double.inner.view {
                 state.double = propose.inner.double.clone();
                 self.actions.send(Action::Commit(state.double.clone()));
                 let next = state.double.inner.view + 1;

@@ -7,10 +7,6 @@ pub trait ToBytes {
     fn to_bytes(&self) -> Vec<u8>;
 }
 
-pub trait FromBytes {
-    fn from_bytes(bytes: &[u8]) -> Self;
-}
-
 pub type Signer = u16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,23 +217,6 @@ pub struct Sync {
     pub double: Option<Certificate<Vote>>,
 }
 
-impl ToBytes for Sync {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        if let Some(locked) = &self.locked {
-            bytes.extend_from_slice(&locked.to_bytes());
-        } else {
-            bytes.extend_from_slice(&[0; 1]);
-        }
-        if let Some(double) = &self.double {
-            bytes.extend_from_slice(&double.to_bytes());
-        } else {
-            bytes.extend_from_slice(&[0; 1]);
-        }
-        bytes
-    }
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Message {
     Propose(Signed<Propose>),
@@ -343,18 +322,6 @@ pub struct Signature(blst::Signature);
 impl Into<AggregateSignature> for Signature {
     fn into(self) -> AggregateSignature {
         AggregateSignature(blst::AggregateSignature::from_signature(&self.0))
-    }
-}
-
-impl ToBytes for Signature {
-    fn to_bytes(&self) -> Vec<u8> {
-        self.0.to_bytes().to_vec()
-    }
-}
-
-impl FromBytes for Signature {
-    fn from_bytes(bytes: &[u8]) -> Self {
-        Signature(blst::Signature::from_bytes(bytes).expect("fixme"))
     }
 }
 
