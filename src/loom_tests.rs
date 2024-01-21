@@ -25,4 +25,6 @@ impl ActionSink for LoomSink {
 type LConsensus = Consensus<LoomSink>;
 
 #[test]
-fn test_propose() {}
+fn test_timeout() {
+    loom::model(|| {});
+}

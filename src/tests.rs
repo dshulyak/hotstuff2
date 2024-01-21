@@ -317,7 +317,6 @@ impl Instance {
     fn bootstrap(&mut self, tester: &Tester, view: View, id: &str) {
         self.on_message(tester.timeout(view, vec![0, 1, 2]));
         self.entered_view(view);
-        self.wait_delay();
         self.send(tester.sync_genesis());
         self.on_message(tester.propose_first(view, id));
         self.voted(view);
@@ -343,7 +342,7 @@ impl Instance {
     }
 
     fn on_tick(&mut self) {
-        self.consensus.on_tick();
+        (0..seq::TIMEOUT).for_each(|_| self.on_delay());
     }
 
     fn on_delay(&mut self) {
@@ -374,10 +373,6 @@ impl Instance {
 
     fn entered_view(&mut self, view: View) {
         self.action(seq::Action::EnteredView(view));
-    }
-
-    fn wait_delay(&mut self) {
-        self.action(seq::Action::WaitDelay);
     }
 
     fn propose(&mut self) {
@@ -450,10 +445,6 @@ impl Instances {
 
     fn voted(&mut self, view: View) {
         self.0.iter_mut().for_each(|instance| instance.voted(view));
-    }
-
-    fn wait_delay(&mut self) {
-        self.0.iter_mut().for_each(|instance| instance.wait_delay());
     }
 
     fn entered_view(&mut self, view: View) {
@@ -548,7 +539,6 @@ fn test_tick_on_epoch_boundary() {
         inst.send(tester.wish(3.into(), inst.signer));
         inst.on_message(tester.timeout(3.into(), vec![0, 1, 2]));
         inst.entered_view(3.into());
-        inst.wait_delay();
         let locked_b = tester.certify_vote(2.into(), 2, "b", vec![1, 2, 3]);
         let double_a = tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]);
         inst.send(tester.sync(Some(locked_b.clone()), Some(double_a.clone())));
@@ -567,7 +557,6 @@ fn test_propose_after_delay() {
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
         inst.entered_view(2.into());
-        inst.wait_delay();
         let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
         inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
 
@@ -580,13 +569,11 @@ fn test_propose_after_delay() {
 #[test]
 fn test_nonleader_on_delay() {
     gentest(4, |tester, instances| {
-        // leaders are assigned in round-robin
-        // therefore leader for view 2 will be at index 2.
-        let inst = &mut instances.0[1];
+        // leaders are assigned in round-robin. 0 is leader for view 1, 1 for view 2, etc.
+        let inst = &mut instances.0[0];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
         inst.entered_view(2.into());
-        inst.wait_delay();
         let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
         inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
         inst.on_delay();
@@ -660,7 +647,6 @@ fn test_multi_bootstrap() {
         instances.for_each(|i| i.send(tester.wish(1.into(), i.signer)));
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
         instances.entered_view(1.into());
-        instances.wait_delay();
         instances.send(tester.sync_genesis());
         instances.on_delay();
         instances.leader(1.into()).propose();
@@ -720,7 +706,6 @@ fn test_multi_bootstrap() {
 
 struct SimState {
     inputs: Vec<Vec<Message>>,
-    wait_delay: Vec<bool>,
     propose: Vec<Option<[u8; 32]>>,
     commits: Vec<Option<Certificate<Vote>>>,
     max_view: View,
@@ -730,7 +715,6 @@ impl SimState {
     fn new(n: usize) -> Self {
         SimState {
             inputs: vec![vec![]; n],
-            wait_delay: vec![false; n],
             propose: vec![None; n],
             commits: vec![None; n],
             max_view: View(0),
@@ -754,7 +738,7 @@ impl SimState {
                 seq::Action::Send(m) => {
                     send_random_messages(m, tester, i as Signer, &mut self.inputs, runner)
                 }
-                seq::Action::WaitDelay => self.wait_delay[i] = true,
+                // seq::Action::WaitDelay => self.wait_delay[i] = true,
                 seq::Action::Propose => {
                     self.propose[i] = Some(thread_rng().gen::<[u8; 32]>());
                 }
@@ -780,7 +764,6 @@ impl SimState {
                     .inputs
                     .iter_mut()
                     .for_each(|input| input.push(m.clone())),
-                seq::Action::WaitDelay => self.wait_delay[i] = true,
                 seq::Action::Propose => {
                     self.propose[i] = Some(thread_rng().gen::<[u8; 32]>());
                 }
@@ -804,10 +787,7 @@ impl SimState {
             });
             msgs.clear();
         }
-        if self.wait_delay[i] {
-            inst.on_delay();
-            self.wait_delay[i] = false;
-        }
+        inst.on_delay();
         if let Some(p) = self.propose[i].take() {
             inst.consensus.propose(ID::new(p)).expect("no error");
         }
@@ -902,20 +882,12 @@ fn send_random_messages(
 }
 
 #[test]
-fn test_simulation() {
+fn test_simulation_honest() {
     gentest(4, |_, instances| {
         let mut sim = SimState::new(instances.0.len());
-        for _r in 0..22 {
-            let mut no_actions = true;
+        for _r in 0..28 {
             for (i, inst) in instances.0.iter_mut().enumerate() {
-                if !sim.honest_actions(i, inst) {
-                    no_actions = false;
-                }
-            }
-            if no_actions {
-                for inst in instances.0.iter_mut() {
-                    inst.on_tick();
-                }
+                sim.honest_actions(i, inst);
             }
         }
         let commit = sim.commits[0].as_ref().expect("certificate exists");
@@ -927,7 +899,7 @@ fn test_simulation() {
 }
 
 #[test]
-fn test_simulation_with_unavailable() {
+fn test_simulation_unavailable() {
     // in this test one of the nodes (4th, last node) will not be voting or performing aggregation when it is a leader.
     // nodes are expected to time out on the turn of this node.
     gentest(4, |_, instances| {
@@ -939,16 +911,8 @@ fn test_simulation_with_unavailable() {
         let working = &mut instances.0[..3];
         let mut sim = SimState::new(working.len());
         for _r in 0..steps {
-            let mut no_actions = true;
             for (i, inst) in working.iter_mut().enumerate() {
-                if !sim.honest_actions(i, inst) {
-                    no_actions = false;
-                }
-            }
-            if no_actions {
-                for inst in working.iter_mut() {
-                    inst.on_tick();
-                }
+                sim.honest_actions(i, inst);
             }
         }
         let commit = sim.commits[0].as_ref().expect("certificate exists");
@@ -964,7 +928,7 @@ fn test_simulation_with_adversary() {
     gentest(4, |tester, instances| {
         let adversary = 3;
         let mut sim = SimState::new(instances.0.len());
-        for _r in 0..30 {
+        for _r in 0..32 {
             let mut no_actions = true;
             let mut runner = TestRunner::new(Config {
                 cases: 10, // 10 random actions per single adversary action
@@ -988,7 +952,7 @@ fn test_simulation_with_adversary() {
             }
         }
         let commit = sim.commits[0].as_ref().expect("certificate exists");
-        assert_eq!(commit.height, 7);
+        assert_eq!(commit.height, 8);
         for other in sim.commits.iter() {
             assert_eq!(other.as_ref().unwrap(), commit);
         }

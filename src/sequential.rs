@@ -8,6 +8,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::ops::Index;
 
+// reset timers. single tick should be sufficient to finish consensus round.
+// - wait delay for leader to receive sync messages. during this delay leader needs to delive timeout certificate
+//   and obtain sync messages from all honest participants. should be equal to two maximal network delays.
+// - wait for 4 normal rounds, each one atleast one maximal network delay.
+// - wait for 1 more to deliver propose to all participants, so that they enter next view.
+// single tick atleast 7 maximal network delays.
+pub(crate) const TIMEOUT: u8 = 7 * DELAY;
+const DELAY: u8 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     // persist the following data before sending messages.
@@ -17,26 +26,13 @@ pub enum Action {
     Lock(Certificate<Vote>),
     // node should not vote more than once in the view. persisted for safety.
     Voted(View),
+    EnteredView(View),
 
     // send message to all participants
     Send(Message),
     // TODO
     // // send message to a specific participant. some messages may be delievered directly for aggregation purposes.
     // SendTo(Message, PublicKey),
-
-    // TODO this can be futher simplified. caller can notify every maximal network delay
-    // without any signals from the consensus SM.
-    // consensus SM internally can count 7 notifications (see below), and reset them every time it enters a view.
-
-    // wait single network delay. see below what is expected.
-    WaitDelay,
-    // reset timers. single tick should be sufficient to finish consensus round.
-    // - wait delay for leader to receive sync messages. during this delay leader needs to delive timeout certificate
-    //   and obtain sync messages from all honest participants. should be equal to two maximal network delays.
-    // - wait for 4 normal rounds, each one atleast one maximal network delay.
-    // - wait for 1 more to deliver propose to all participants, so that they enter next view.
-    // single tick atleast 7 maximal network delays.
-    EnteredView(View),
 
     // node is a leader and ready to propose.
     // leader is risking not finishing a round on time if it does not call `propose` method within short delay.
@@ -89,6 +85,8 @@ impl<T: ActionSink> Consensus<T> {
                 votes: BTreeMap::new(),
                 votes2: BTreeMap::new(),
                 timeouts: BTreeMap::new(),
+                ticks: 0,
+                waiting_delay_view: None,
             }),
         }
     }
@@ -102,72 +100,77 @@ impl<T: ActionSink> Consensus<T> {
         self.keys.get(&leader).is_some()
     }
 
-    pub fn on_tick(&self) {
-        let wish = {
-            let mut state = self.state.lock();
-            if state.is_epoch_boundary(self.participants.atleast_one_honest() as u64) {
-                Some(Wish {
-                    view: state.view + 1,
-                })
-            } else {
-                let next = state.view + 1;
-                state.enter_view(next);
-                self.actions.send(Action::EnteredView(state.view));
-                self.actions.send(Action::WaitDelay);
-                self.actions.send(Action::Send(Message::Sync(Sync {
-                    locked: Some(state.locked.clone()),
-                    double: Some(state.double.clone()),
-                })));
-                None
-            }
-        };
-        if let Some(wish) = wish {
-            for (signer, pk) in self.keys.iter() {
-                let signature = pk.sign(Domain::Wish, &wish.to_bytes());
-                self.actions.send(Action::Send(Message::Wish(Signed {
-                    inner: wish.clone(),
-                    signer: *signer,
-                    signature,
-                })));
-            }
-        }
-    }
-
     pub fn on_delay(&self) {
-        // unlike in the paper, i want to obtain double certificate on every block.
-        // therefore i extend locked if it is equal to double, otherwise i retry locked block.
-        let proposal = {
+        let rst = {
             let mut state = self.state.lock();
-
-            if self
-                .keys
-                .get(&self.participants.leader(state.view))
-                .is_none()
+            state.ticks += 1;
+            if state.ticks == TIMEOUT {
+                state.ticks = 0;
+                if state.is_epoch_boundary(self.participants.atleast_one_honest() as u64) {
+                    (
+                        None,
+                        Some(Wish {
+                            view: state.view + 1,
+                        }),
+                    )
+                } else {
+                    let next = state.view + 1;
+                    state.enter_view(next);
+                    state.wait_first_delay(next);
+                    self.actions.send(Action::EnteredView(state.view));
+                    self.actions.send(Action::Send(Message::Sync(Sync {
+                        locked: Some(state.locked.clone()),
+                        double: Some(state.double.clone()),
+                    })));
+                    (None, None)
+                }
+            } else if state.ticks == DELAY
+                && state.is_waiting(state.view)
+                && self.is_leader(state.view)
             {
-                None
-            } else if state.locked.inner != state.double.inner {
-                Some(Propose {
-                    view: state.view,
-                    block: state.locked.inner.block.clone(),
-                    locked: state.locked.clone(),
-                    double: state.double.clone(),
-                })
+                state.reset_delay();
+                // unlike in the paper, i want to obtain double certificate on every block.
+                // therefore i extend locked if it is equal to double, otherwise i retry locked block.
+                if state.locked.inner != state.double.inner {
+                    (
+                        Some(Propose {
+                            view: state.view,
+                            block: state.locked.inner.block.clone(),
+                            locked: state.locked.clone(),
+                            double: state.double.clone(),
+                        }),
+                        None,
+                    )
+                } else {
+                    state.proposal = Some(Propose {
+                        view: state.view,
+                        block: Block {
+                            height: state.double.inner.block.height + 1,
+                            id: ID::default(), // will be overwritten in propose method
+                        },
+                        locked: state.locked.clone(),
+                        double: state.double.clone(),
+                    });
+                    self.actions.send(Action::Propose);
+                    (None, None)
+                }
             } else {
-                state.proposal = Some(Propose {
-                    view: state.view,
-                    block: Block {
-                        height: state.double.inner.block.height + 1,
-                        id: ID::default(),
-                    },
-                    locked: state.locked.clone(),
-                    double: state.double.clone(),
-                });
-                self.actions.send(Action::Propose);
-                None
+                (None, None)
             }
         };
-        if let Some(proposal) = proposal {
-            self.send_proposal(proposal);
+        match rst {
+            (Some(proposal), None) => self.send_proposal(proposal),
+            (None, Some(wish)) => {
+                for (signer, pk) in self.keys.iter() {
+                    let signature = pk.sign(Domain::Wish, &wish.to_bytes());
+                    self.actions.send(Action::Send(Message::Wish(Signed {
+                        inner: wish.clone(),
+                        signer: *signer,
+                        signature,
+                    })));
+                }
+            }
+            _ => (),
         }
     }
 
@@ -313,8 +316,8 @@ impl<T: ActionSink> Consensus<T> {
         let mut state = self.state.lock();
         ensure!(timeout.certificate.inner > state.view, "old view");
         state.enter_view(timeout.certificate.inner);
+        state.wait_first_delay(timeout.certificate.inner);
         self.actions.send(Action::EnteredView(state.view));
-        self.actions.send(Action::WaitDelay);
         self.actions.send(Action::Send(Message::Sync(Sync {
             locked: Some(state.locked.clone()),
             double: Some(state.double.clone()),
@@ -627,6 +630,9 @@ struct State {
     // after leader is ready to send a proposal it emulates asynchronous upcall
     // and waits for a identifier of the payload
     proposal: Option<Propose>,
+
+    ticks: u8,
+    waiting_delay_view: Option<View>,
 }
 
 impl State {
@@ -636,14 +642,37 @@ impl State {
 
     fn enter_view(&mut self, view: View) {
         self.view = view;
+        self.ticks = 0;
         self.timeouts.retain(|view, _| view >= &self.view);
         self.votes.retain(|(view, _), _| view >= &self.view);
         self.votes2.retain(|(view, _), _| view >= &self.view);
     }
 
+    fn wait_first_delay(&mut self, view: View) {
+        self.waiting_delay_view = Some(view);
+    }
+
+    fn reset_delay(&mut self) {
+        self.waiting_delay_view = None;
+    }
+
+    fn is_waiting(&self, view: View) -> bool {
+        if let Some(current) = self.waiting_delay_view {
+            current == view
+        } else {
+            false
+        }
+    }
+
     fn take_proposal(&mut self) -> Result<Propose> {
         let proposal = self.proposal.take().ok_or_else(|| anyhow!("no proposal"))?;
-        ensure!(proposal.view >= self.view, "proposal wasn't built in time");
+        ensure!(
+            proposal.view >= self.view,
+            "proposal wasn't built in time. proposal view {:?}. current view {:?} ticks {}",
+            proposal.view,
+            self.view,
+            self.ticks,
+        );
         Ok(proposal)
     }
 }
