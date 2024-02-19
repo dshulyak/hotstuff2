@@ -1,14 +1,24 @@
 use std::{collections::HashMap, sync::Arc};
 
-use async_scoped::TokioScope;
+use async_trait::async_trait;
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 pub(crate) type Protocol = u32;
 
+pub(crate) struct Stream {
+    pub(crate) id: usize,
+    pub(crate) r: quinn::RecvStream,
+    pub(crate) w: quinn::SendStream,
+}
+
+#[async_trait]
+pub trait ProtocolHandler: Send + Sync {
+    async fn handle(&self, mut stream: Stream);
+}
+
 pub(crate) struct Host {
-    handlers:
-        Mutex<HashMap<Protocol, Arc<dyn Fn(quinn::SendStream, quinn::RecvStream) + Sync + Send>>>,
+    handlers: Mutex<HashMap<Protocol, Arc<dyn ProtocolHandler>>>,
 }
 
 impl Host {
@@ -18,18 +28,15 @@ impl Host {
         }
     }
 
-    pub(crate) fn register(
-        &mut self,
-        protocol: Protocol,
-        handler: Arc<dyn Fn(quinn::SendStream, quinn::RecvStream) + Sync + Send>,
-    ) {
+    pub(crate) fn register(&mut self, protocol: Protocol, handler: Arc<dyn ProtocolHandler>) {
         self.handlers.lock().insert(protocol, handler);
     }
 
-    pub(crate) async fn handle(&self, mut w: quinn::SendStream, mut r: quinn::RecvStream) {
-        let protocol = r.read_u32().await.unwrap();
-        if let Some(handler) = self.handlers.lock().get(&protocol).map(|h| Arc::clone(h)) {
-            handler(w, r);
+    pub(crate) async fn handle(&self, mut stream: Stream) {
+        let protocol = stream.r.read_u32().await.unwrap();
+        let handler = self.handlers.lock().get(&protocol).map(|h| Arc::clone(h));
+        if let Some(handler) = handler {
+            handler.handle(stream);
         } else {
             tracing::warn!(protocol = ?protocol, "unknown protocol",);
         }
@@ -41,8 +48,13 @@ pub(crate) async fn run_protocols(host: Arc<Host>, endpoint: &quinn::Endpoint) {
         let host = Arc::clone(&host);
         tokio::spawn(async move {
             if let Ok(conn) = conn.await {
-                while let Ok((r, w)) = conn.accept_bi().await {
-                    host.handle(r, w).await;
+                while let Ok((w, r)) = conn.accept_bi().await {
+                    host.handle(Stream {
+                        r,
+                        w,
+                        id: conn.stable_id(),
+                    })
+                    .await;
                 }
             }
         });

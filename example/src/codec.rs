@@ -295,8 +295,8 @@ impl AsyncDecode for Message {
 }
 
 pub(crate) struct Handshake {
-    public: PublicKey,
-    signature: Signature,
+    pub(crate) public: PublicKey,
+    pub(crate) signature: Signature,
 }
 
 #[async_trait]
