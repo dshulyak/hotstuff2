@@ -28,8 +28,8 @@ impl Host {
         }
     }
 
-    pub(crate) fn register(&mut self, protocol: Protocol, handler: Arc<dyn ProtocolHandler>) {
-        self.handlers.lock().insert(protocol, handler);
+    pub(crate) fn register(&mut self, protocol: Protocol, handler: Box<dyn ProtocolHandler>) {
+        self.handlers.lock().insert(protocol, Arc::from(handler));
     }
 
     pub(crate) async fn handle(&self, mut stream: Stream) {
