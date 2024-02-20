@@ -1,13 +1,18 @@
-use std::{collections::HashMap, sync::Arc};
+use crate::codec::AsyncEncode;
+
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
+use hotstuff2::types::Message;
 use parking_lot::Mutex;
-use tokio::io::AsyncReadExt;
+use quinn::StreamId;
+use tokio::{io::AsyncReadExt, sync::mpsc};
 
 pub(crate) type Protocol = u32;
 
 pub(crate) struct Stream {
-    pub(crate) id: usize,
+    pub(crate) id: StreamId,
+    pub(crate) remote: SocketAddr,
     pub(crate) r: quinn::RecvStream,
     pub(crate) w: quinn::SendStream,
 }
@@ -18,41 +23,52 @@ pub trait ProtocolHandler: Send + Sync {
 }
 
 pub(crate) struct Host {
-    handlers: Mutex<HashMap<Protocol, Arc<dyn ProtocolHandler>>>,
+    gossip_protocol: Box<dyn ProtocolHandler>,
+    sync_protocol: Box<dyn ProtocolHandler>,
 }
 
 impl Host {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(
+        gossip_protocol: Box<dyn ProtocolHandler>,
+        sync_protocol: Box<dyn ProtocolHandler>,
+    ) -> Self {
         Self {
-            handlers: Mutex::new(HashMap::new()),
+            gossip_protocol: gossip_protocol,
+            sync_protocol: sync_protocol,
         }
     }
 
-    pub(crate) fn register(&mut self, protocol: Protocol, handler: Box<dyn ProtocolHandler>) {
-        self.handlers.lock().insert(protocol, Arc::from(handler));
-    }
-
-    pub(crate) async fn handle(&self, mut stream: Stream) {
-        let protocol = stream.r.read_u32().await.unwrap();
-        let handler = self.handlers.lock().get(&protocol).map(|h| Arc::clone(h));
-        if let Some(handler) = handler {
-            handler.handle(stream);
-        } else {
-            tracing::warn!(protocol = ?protocol, "unknown protocol",);
+    async fn muxer(&self, mut stream: Stream) {
+        match stream.r.read_u32().await {
+            Ok(0) => {
+                tracing::debug!("gossip");
+                self.gossip_protocol.handle(stream).await;
+            }
+            Ok(1) => {
+                tracing::debug!("sync");
+                self.sync_protocol.handle(stream).await;
+            }
+            Ok(other) => {
+                tracing::warn!(protocol = ?other, "unknown protocol");
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, "read error");
+            }
         }
     }
 }
 
-pub(crate) async fn run_protocols(host: Arc<Host>, endpoint: &quinn::Endpoint) {
+pub(crate) async fn server(host: Arc<Host>, endpoint: Arc<quinn::Endpoint>) {
     while let Some(conn) = endpoint.accept().await {
-        let host = Arc::clone(&host);
+        let host = host.clone();
         tokio::spawn(async move {
             if let Ok(conn) = conn.await {
                 while let Ok((w, r)) = conn.accept_bi().await {
-                    host.handle(Stream {
+                    host.muxer(Stream {
+                        id: w.id(),
                         r,
                         w,
-                        id: conn.stable_id(),
+                        remote: conn.remote_address(),
                     })
                     .await;
                 }

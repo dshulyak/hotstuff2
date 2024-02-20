@@ -293,31 +293,3 @@ impl AsyncDecode for Message {
         }
     }
 }
-
-pub(crate) struct Handshake {
-    pub(crate) public: PublicKey,
-    pub(crate) signature: Signature,
-}
-
-#[async_trait]
-impl AsyncEncode for Handshake {
-    async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
-        w.write_all(&self.public.to_bytes()).await?;
-        w.write_all(&self.signature.to_bytes()).await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl AsyncDecode for Handshake {
-    async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self> {
-        let mut public = [0u8; PUBLIC_KEY_SIZE];
-        r.read_exact(&mut public).await?;
-        let mut signature = [0u8; SIGNATURE_SIZE];
-        r.read_exact(&mut signature).await?;
-        Ok(Handshake {
-            public: PublicKey::from_bytes(&public)?,
-            signature: Signature::from_bytes(&signature)?,
-        })
-    }
-}

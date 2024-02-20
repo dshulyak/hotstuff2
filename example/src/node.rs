@@ -34,35 +34,6 @@ pub(crate) fn genesis() -> Certificate<Vote> {
     genesis
 }
 
-pub(crate) struct Broadcaster {
-    peers: Mutex<HashMap<PublicKey, mpsc::Sender<Message>>>,
-}
-
-impl Broadcaster {
-    fn new() -> Self {
-        Self {
-            peers: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn add_peer(&self, peer: PublicKey, sender: mpsc::Sender<Message>) {
-        let mut peers = self.peers.lock();
-        peers.insert(peer, sender);
-    }
-
-    fn broadcast(&self, msg: Message) {
-        let mut peers = self.peers.lock();
-        peers.retain(|_, sender| {
-            if let Err(err) = sender.try_send(msg.clone()) {
-                tracing::warn!(error = ?err, "failed to send message to peer. peer will be disconnected");
-                false
-            } else {
-                true
-            }
-        });
-    }
-}
-
 pub(crate) struct Config {
     delay: Duration,
     participants: Vec<PublicKey>,
@@ -75,7 +46,6 @@ pub(crate) async fn run(
     config: &Config,
     consensus: &Consensus<Sink>,
     mut receiver: mpsc::UnboundedReceiver<Action>,
-    broadcaster: &Broadcaster,
 ) {
     async_scoped::TokioScope::scope_and_block(|scope| {
         scope.spawn(async {
@@ -89,9 +59,11 @@ pub(crate) async fn run(
             while let Some(action) = receiver.recv().await {
                 match action {
                     Action::Send(msg) => {
-                        broadcaster.broadcast(msg);
+                        tracing::debug!(message=?msg, "broadcasting message");
                     }
-                    Action::Propose => {}
+                    Action::Propose => {
+                        tracing::debug!("ready to propose");
+                    }
                     default => {
                         tracing::warn!("unexpected action: {:?}", default);
                     }

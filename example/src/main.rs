@@ -6,7 +6,7 @@ use hotstuff2::types::{PrivateKey, PublicKey};
 use rcgen;
 
 mod codec;
-mod handshake;
+mod gossip;
 mod node;
 mod p2p;
 
