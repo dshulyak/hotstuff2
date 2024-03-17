@@ -38,7 +38,7 @@ pub enum Action {
     // SendTo(Message, PublicKey),
 
     // node is a leader and ready to propose.
-    // leader is risking not finishing a round on time if it does not call `propose` method within short delay.
+    // leader will not finish a round on time if it does not call `propose` method within short delay.
     Propose,
 }
 

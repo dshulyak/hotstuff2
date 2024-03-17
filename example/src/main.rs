@@ -6,9 +6,7 @@ use hotstuff2::types::{PrivateKey, PublicKey};
 use rcgen;
 
 mod codec;
-mod gossip;
-mod node;
-mod p2p;
+mod protocol;
 
 #[derive(Debug, Parser)]
 #[clap(name = "example")]

@@ -2,8 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bit_vec::BitVec;
 use hotstuff2::types::{
-    Block, Certificate, Message, Prepare, Propose, PublicKey, Signature, Signed, Sync as SyncMsg,
-    Timeout, ToBytes, View, Vote, Wish, PUBLIC_KEY_SIZE, SIGNATURE_SIZE,
+    Block, Certificate, Message, Prepare, Propose, Signature, Signed, Sync as SyncMsg, Timeout,
+    ToBytes, View, Vote, Wish, SIGNATURE_SIZE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
