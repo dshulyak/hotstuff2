@@ -11,6 +11,7 @@ use quinn::StreamId;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio_scoped::scope;
+use tokio_util::sync::CancellationToken;
 
 use crate::codec::{AsyncDecode, AsyncEncode};
 
@@ -179,14 +180,14 @@ async fn protocol(
     // after that both sides register for sync and gossip in the router
     // setup receiver that will emit messages to the stream
     let mut gossip = router.register(stream.remote);
+    let cancellation = CancellationToken::new();
 
-    let (shutdown_gossip, mut shutdown_gossip_receiver) = mpsc::unbounded_channel();
     scope(|s| {
         s.spawn(async {
             while let Some(msg) = gossip.recv().await {
                 if let Err(err) = msg.encode(&mut stream.w).await {
                     tracing::warn!(error = ?err, "failed to send gossip message");
-                    shutdown_gossip.send(()).unwrap();
+                    cancellation.cancel();
                     return;
                 }
             }
@@ -208,7 +209,7 @@ async fn protocol(
                         }
                     }
                 } => {},
-                _ = shutdown_gossip_receiver.recv() => {},
+                _ = cancellation.cancelled() => {},
             }
         });
     });
