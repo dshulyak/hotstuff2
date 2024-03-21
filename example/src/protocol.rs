@@ -1,6 +1,7 @@
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use async_scoped::TokioScope;
 use bit_vec::BitVec;
 use hotstuff2::sequential::{Action, Actions, Consensus};
 use hotstuff2::types::{
@@ -10,7 +11,6 @@ use parking_lot::Mutex;
 use quinn::StreamId;
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio_scoped::scope;
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::{AsyncDecode, AsyncEncode};
@@ -99,16 +99,15 @@ pub struct History {
 }
 
 async fn protocol(
-    history: Arc<Mutex<History>>,
-    router: Arc<Router>,
-    consensus: Arc<Consensus<Sink>>,
+    cancel: CancellationToken,
+    history: &Mutex<History>,
+    router: &Router,
+    consensus: &Consensus<Sink>,
     mut stream: Stream,
 ) -> anyhow::Result<()> {
     // negotiate last synced state
     // both sides write their last locked and commit state, and read it concurrently
 
-    // TODO implement reconciliation routine, do it one synchronously and then periodically over original stream.
-    // for gossip establish a new stream.
     let local = {
         let history = history.lock();
         let double = history.commits.last().map(|cert| cert.clone());
@@ -117,9 +116,14 @@ async fn protocol(
             double: double,
         }
     };
+
+    // TODO implement reconciliation routine, do it one synchronously and then periodically over original stream.
+    // for gossip establish a new stream.
+
     let mut send = None;
     let mut receive = None;
-    scope(|s| {
+
+    TokioScope::scope_and_block(|s| {
         s.spawn(async {
             send = Some(local.encode(&mut stream.w).await);
         });
@@ -137,7 +141,7 @@ async fn protocol(
 
     // one that behind, waits for synchronous messages to catchup
     // the other one starts sending sync msgs based on the difference in commit history
-    if let Some(mut i) = needs_catchup(&local.double, &remote.double) {
+    if let Some(mut i) = needs_boost(&local.double, &remote.double) {
         let mut end = false;
         while !end {
             let next = {
@@ -160,7 +164,7 @@ async fn protocol(
             end = next.double.is_none();
             i += 1
         }
-    } else if let Some(_) = needs_catchup(&remote.double, &local.double) {
+    } else if let Some(_) = needs_boost(&remote.double, &local.double) {
         let mut end = false;
         while !end {
             let sync = match SyncMsg::decode(&mut stream.r).await {
@@ -182,7 +186,7 @@ async fn protocol(
     let mut gossip = router.register(stream.remote);
     let cancellation = CancellationToken::new();
 
-    scope(|s| {
+    TokioScope::scope_and_block(|s| {
         s.spawn(async {
             while let Some(msg) = gossip.recv().await {
                 if let Err(err) = msg.encode(&mut stream.w).await {
@@ -219,7 +223,7 @@ async fn protocol(
     Ok(())
 }
 
-fn needs_catchup(
+fn needs_boost(
     local: &Option<Certificate<Vote>>,
     remote: &Option<Certificate<Vote>>,
 ) -> Option<usize> {
@@ -238,9 +242,9 @@ fn needs_catchup(
 }
 
 async fn consensus(
-    history: Arc<Mutex<History>>,
-    router: Arc<Router>,
-    consensus: Arc<Consensus<Sink>>,
+    history: &Mutex<History>,
+    router: &Router,
+    consensus: &Consensus<Sink>,
     mut receiver: mpsc::UnboundedReceiver<Action>,
 ) -> anyhow::Result<()> {
     // wait for ticks and notify consensus state machine
@@ -249,4 +253,98 @@ async fn consensus(
 
     // wait for history updates and persist them before broadcasting messages
     Ok(())
+}
+
+async fn connect_one(
+    cancel: CancellationToken,
+    endpoint: &quinn::Endpoint,
+    peer: SocketAddr,
+    history: &Mutex<History>,
+    router: &Router,
+    consensus: &Consensus<Sink>,
+) -> anyhow::Result<()> {
+    let conn = match endpoint.connect(peer, "localhost") {
+        Ok(conn) => conn,
+        Err(err) => {
+            anyhow::bail!("failed to connect to peer: {}", err);
+        }
+    };
+    let conn = match conn.await {
+        Ok(conn) => conn,
+        Err(err) => {
+            anyhow::bail!("establish connection: {}", err);
+        }
+    };
+    let (send, receive) = conn.open_bi().await?;
+    let stream = Stream {
+        id: send.id(),
+        remote: peer,
+        w: send,
+        r: receive,
+    };
+    protocol(cancel, history, router, consensus, stream).await
+}
+
+fn connect(
+    cancel: CancellationToken,
+    endpoint: &quinn::Endpoint,
+    peers: Vec<SocketAddr>,
+    history: &Mutex<History>,
+    router: &Router,
+    consensus: &Consensus<Sink>,
+) {
+    TokioScope::scope_and_block(|s| {
+        for peer in peers {
+            let cancel = cancel.clone();
+            s.spawn(async move {
+                loop {
+                    if let Err(err) =
+                        connect_one(cancel.clone(), endpoint, peer, history, router, consensus)
+                            .await
+                    {
+                        tracing::warn!(error = ?err, "failed to connect to peer");
+                    }
+                    select! {
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                        _ = cancel.cancelled() => {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+async fn accept(
+    cancel: CancellationToken,
+    endpoint: &quinn::Endpoint,
+    history: &Mutex<History>,
+    router: &Router,
+    consensus: &Consensus<Sink>,
+) {
+    let mut scope = unsafe { TokioScope::create(Default::default()) };
+    while let Some(conn) = endpoint.accept().await {
+        let conn = match conn.await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!(error = ?err, "failed to accept connection");
+                continue;
+            }
+        };
+        let (send, receive) = conn.open_bi().await.unwrap();
+        let stream = Stream {
+            id: send.id(),
+            remote: conn.remote_address(),
+            w: send,
+            r: receive,
+        };
+        let cancel = cancel.clone();
+        scope.spawn(async move {
+            if let Err(err) = protocol(cancel, history, router, consensus, stream).await {
+                tracing::warn!(error = ?err, "failed to handle connection");
+            }
+        });
+    }
+    scope.collect().await;
 }
