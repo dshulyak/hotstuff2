@@ -7,6 +7,8 @@ use rcgen;
 
 mod codec;
 mod protocol;
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, Parser)]
 #[clap(name = "example")]
