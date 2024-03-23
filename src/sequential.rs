@@ -208,7 +208,7 @@ impl<T: Actions> Consensus<T> {
         })));
     }
 
-    pub fn propose(&mut self, id: ID) -> Result<()> {
+    pub fn propose(&self, id: ID) -> Result<()> {
         let proposal = {
             let mut proposal = self.state.lock().take_proposal()?;
             proposal.block.id = id;

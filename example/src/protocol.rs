@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
@@ -59,18 +60,20 @@ pub(crate) struct Stream {
 }
 
 struct Router {
+    per_channel_buffer_size: usize,
     gossip: Mutex<HashMap<SocketAddr, mpsc::Sender<Arc<Message>>>>,
 }
 
 impl Router {
-    pub fn new() -> Self {
+    pub fn new(per_channel_buffer_size: usize) -> Self {
         Self {
+            per_channel_buffer_size: per_channel_buffer_size,
             gossip: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn register(&self, addr: SocketAddr) -> mpsc::Receiver<Arc<Message>> {
-        let (sender, receiver) = mpsc::channel(1000);
+        let (sender, receiver) = mpsc::channel(self.per_channel_buffer_size);
         self.gossip.lock().insert(addr, sender);
         receiver
     }
@@ -79,23 +82,28 @@ impl Router {
         self.gossip.lock().remove(addr);
     }
 
-    pub fn gossip(&self, msg: Message, except: Option<SocketAddr>) {
-        let gossip = self.gossip.lock();
-        for (socket, sender) in gossip.iter() {
+    pub fn send_all(&self, msg: Message) {
+        self.gossip(msg, None)
+    }
+
+    fn gossip(&self, msg: Message, except: Option<SocketAddr>) {
+        self.gossip.lock().retain(|socket, sender| {
             if except.map(|addr| addr == *socket).unwrap_or(false) {
-                continue;
+                return true;
             }
             if let Err(err) = sender.try_send(Arc::new(msg.clone())) {
                 tracing::debug!(error = ?err, "failed to send message to peer");
+                return false;
             }
-        }
+            return true;
+        });
     }
 }
 
 pub struct History {
-    voted_view: View,
+    voted: View,
     locked: Option<Certificate<Vote>>,
-    commits: Vec<Certificate<Vote>>,
+    commits: BTreeMap<View, Certificate<Vote>>,
 }
 
 async fn protocol(
@@ -105,15 +113,17 @@ async fn protocol(
     consensus: &Consensus<Sink>,
     mut stream: Stream,
 ) -> anyhow::Result<()> {
-    // negotiate last synced state
+    // negotiate last known state
     // both sides write their last locked and commit state, and read it concurrently
 
     let local = {
-        let history = history.lock();
-        let double = history.commits.last().map(|cert| cert.clone());
+        let mut history = history.lock();
         SyncMsg {
             locked: history.locked.clone(),
-            double: double,
+            double: history
+                .commits
+                .last_entry()
+                .map(|entry| entry.get().clone()),
         }
     };
 
@@ -146,7 +156,7 @@ async fn protocol(
         while !end {
             let next = {
                 let history = history.lock();
-                let double = history.commits.get(i).map(|cert| cert.clone());
+                let double = history.commits.get(&i).map(|cert| cert.clone());
                 SyncMsg {
                     locked: {
                         if double.is_some() {
@@ -184,17 +194,17 @@ async fn protocol(
     // after that both sides register for sync and gossip in the router
     // setup receiver that will emit messages to the stream
     let mut gossip = router.register(stream.remote);
-    let cancellation = CancellationToken::new();
+    let child = cancel.child_token();
 
     TokioScope::scope_and_block(|s| {
         s.spawn(async {
             while let Some(msg) = gossip.recv().await {
                 if let Err(err) = msg.encode(&mut stream.w).await {
                     tracing::warn!(error = ?err, "failed to send gossip message");
-                    cancellation.cancel();
-                    return;
+                    break;
                 }
             }
+            child.cancel();
         });
         s.spawn(async {
             select! {
@@ -204,8 +214,6 @@ async fn protocol(
                         Ok(msg) => {
                             if let Err(err) = consensus.on_message(msg.clone()) {
                                 tracing::debug!(error = ?err, "failed to process gossip message");
-                            } else {
-                                router.gossip(msg, None);
                             }
                         }
                         Err(err) => {
@@ -213,7 +221,7 @@ async fn protocol(
                         }
                     }
                 } => {},
-                _ = cancellation.cancelled() => {},
+                _ = child.cancelled() => {},
             }
         });
     });
@@ -226,33 +234,82 @@ async fn protocol(
 fn needs_boost(
     local: &Option<Certificate<Vote>>,
     remote: &Option<Certificate<Vote>>,
-) -> Option<usize> {
+) -> Option<View> {
     match (local, remote) {
         (Some(local), Some(remote)) => {
             if local.inner.block.height <= remote.inner.block.height {
                 None
             } else {
-                Some(remote.inner.block.height as usize)
+                Some(remote.inner.view)
             }
         }
-        (Some(_), None) => Some(1),
+        (Some(_), None) => Some(1.into()),
         (None, Some(_)) => None,
         (None, None) => None,
     }
 }
 
 async fn consensus(
+    cancel: CancellationToken,
     history: &Mutex<History>,
     router: &Router,
     consensus: &Consensus<Sink>,
     mut receiver: mpsc::UnboundedReceiver<Action>,
-) -> anyhow::Result<()> {
-    // wait for ticks and notify consensus state machine
-
-    // wait for p2p messages and send them to the appropriate peers
-
-    // wait for history updates and persist them before broadcasting messages
-    Ok(())
+) {
+    TokioScope::scope_and_block(|s| {
+        s.spawn(async {
+            loop {
+                select! {
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        consensus.on_delay();
+                    },
+                    _ = cancel.cancelled() => {
+                        return;
+                    },
+                }
+            }
+        });
+        // TODO consider moving it into its own thread for two reasons:
+        // - it is possible offload signature aggregation to this custom thread, this may be suboptimal to use
+        //   tokio runtime for that
+        // - this task is expected to write only small values to disk, under 1MB, which should take less than 1ms
+        s.spawn(async {
+            loop {
+                select! {
+                    action = receiver.recv() => {
+                        match action {
+                            Some(Action::Send(msg)) => {
+                                router.send_all(msg);
+                            }
+                            Some(Action::StateChange(change)) => {
+                                let mut history = history.lock();
+                                if let Some(commit) = change.commit {
+                                    history.commits.insert(commit.view, commit);
+                                }
+                                if let Some(locked) = change.lock {
+                                    history.locked = Some(locked);
+                                }
+                                if let Some(voted) = change.voted {
+                                    history.voted = voted;
+                                }
+                            }
+                            Some(Action::Propose) => {
+                                if let Err(err) = consensus.propose(ID::from_str("test block")) {
+                                    tracing::warn!(error = ?err, "failed to propose block");
+                                }
+                            }
+                            None => {
+                                return;
+                            }
+                        }
+                    },
+                    _ = cancel.cancelled() => {
+                        return;
+                    },
+                }
+            }
+        })
+    });
 }
 
 async fn connect_one(
@@ -285,7 +342,7 @@ async fn connect_one(
     protocol(cancel, history, router, consensus, stream).await
 }
 
-fn connect(
+async fn connect(
     cancel: CancellationToken,
     endpoint: &quinn::Endpoint,
     peers: Vec<SocketAddr>,
