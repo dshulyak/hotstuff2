@@ -11,7 +11,7 @@ use hotstuff2::types::{
 use parking_lot::Mutex;
 use quinn::StreamId;
 use tokio::select;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
 use crate::codec::{AsyncDecode, AsyncEncode};
@@ -104,6 +104,16 @@ pub struct History {
     voted: View,
     locked: Option<Certificate<Vote>>,
     commits: BTreeMap<View, Certificate<Vote>>,
+}
+
+impl History {
+    pub fn new() -> Self {
+        Self {
+            voted: View(0),
+            locked: None,
+            commits: BTreeMap::new(),
+        }
+    }
 }
 
 async fn protocol(
@@ -249,70 +259,64 @@ fn needs_boost(
     }
 }
 
-async fn consensus(
+async fn loop_delay(cancel: CancellationToken, interval: Duration, consensus: &Consensus<Sink>) {
+    loop {
+        select! {
+            _ = tokio::time::sleep(interval) => {
+                consensus.on_delay();
+            },
+            _ = cancel.cancelled() => {
+                return;
+            },
+        }
+    }
+}
+
+async fn loop_actions_handler(
     cancel: CancellationToken,
     history: &Mutex<History>,
     router: &Router,
     consensus: &Consensus<Sink>,
-    mut receiver: mpsc::UnboundedReceiver<Action>,
+    receiver: &mut mpsc::UnboundedReceiver<Action>,
 ) {
-    TokioScope::scope_and_block(|s| {
-        s.spawn(async {
-            loop {
-                select! {
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        consensus.on_delay();
-                    },
-                    _ = cancel.cancelled() => {
-                        return;
-                    },
-                }
-            }
-        });
-        // TODO consider moving it into its own thread for two reasons:
-        // - it is possible offload signature aggregation to this custom thread, this may be suboptimal to use
-        //   tokio runtime for that
-        // - this task is expected to write only small values to disk, under 1MB, which should take less than 1ms
-        s.spawn(async {
-            loop {
-                select! {
-                    action = receiver.recv() => {
-                        match action {
-                            Some(Action::Send(msg)) => {
-                                router.send_all(msg);
-                            }
-                            Some(Action::StateChange(change)) => {
-                                let mut history = history.lock();
-                                if let Some(commit) = change.commit {
-                                    history.commits.insert(commit.view, commit);
-                                }
-                                if let Some(locked) = change.lock {
-                                    history.locked = Some(locked);
-                                }
-                                if let Some(voted) = change.voted {
-                                    history.voted = voted;
-                                }
-                            }
-                            Some(Action::Propose) => {
-                                if let Err(err) = consensus.propose(ID::from_str("test block")) {
-                                    tracing::warn!(error = ?err, "failed to propose block");
-                                }
-                            }
-                            None => {
-                                return;
-                            }
+    loop {
+        select! {
+            action = receiver.recv() => {
+                match action {
+                    Some(Action::Send(msg)) => {
+                        router.send_all(msg);
+                    }
+                    Some(Action::StateChange(change)) => {
+                        let mut history = history.lock();
+                        if let Some(commit) = change.commit {
+                            history.commits.insert(commit.view, commit);
                         }
-                    },
-                    _ = cancel.cancelled() => {
+                        if let Some(locked) = change.lock {
+                            history.locked = Some(locked);
+                        }
+                        if let Some(voted) = change.voted {
+                            history.voted = voted;
+                        }
+                    }
+                    Some(Action::Propose) => {
+                        // here i can plug mempool
+                        if let Err(err) = consensus.propose(ID::from_str("test block")) {
+                            tracing::error!(error = ?err, "failed to propose block");
+                        }
+                    }
+                    None => {
                         return;
-                    },
+                    }
                 }
-            }
-        })
-    });
+            },
+            _ = cancel.cancelled() => {
+                return;
+            },
+        }
+    }
 }
 
-async fn connect_one(
+async fn connect(
     cancel: CancellationToken,
     endpoint: &quinn::Endpoint,
     peer: SocketAddr,
@@ -342,35 +346,27 @@ async fn connect_one(
     protocol(cancel, history, router, consensus, stream).await
 }
 
-async fn connect(
+async fn loop_retriable_connect(
     cancel: CancellationToken,
+    peer: SocketAddr,
+    reconnect_interval: Duration,
     endpoint: &quinn::Endpoint,
-    peers: Vec<SocketAddr>,
     history: &Mutex<History>,
     router: &Router,
     consensus: &Consensus<Sink>,
 ) {
-    TokioScope::scope_and_block(|s| {
-        for peer in peers {
-            let cancel = cancel.clone();
-            s.spawn(async move {
-                loop {
-                    if let Err(err) =
-                        connect_one(cancel.clone(), endpoint, peer, history, router, consensus)
-                            .await
-                    {
-                        tracing::warn!(error = ?err, "failed to connect to peer");
-                    }
-                    select! {
-                        _ = tokio::time::sleep(Duration::from_secs(5)) => {},
-                        _ = cancel.cancelled() => {
-                            return;
-                        }
-                    }
-                }
-            });
+    loop {
+        if let Err(err) = connect(cancel.clone(), endpoint, peer, history, router, consensus).await
+        {
+            tracing::warn!(error = ?err, "failed to connect to peer");
         }
-    });
+        select! {
+            _ = tokio::time::sleep(reconnect_interval) => {},
+            _ = cancel.cancelled() => {
+                return;
+            }
+        }
+    }
 }
 
 async fn accept(
@@ -380,7 +376,7 @@ async fn accept(
     router: &Router,
     consensus: &Consensus<Sink>,
 ) {
-    let mut scope = unsafe { TokioScope::create(Default::default()) };
+    let mut s = unsafe { TokioScope::create(Default::default()) };
     while let Some(conn) = endpoint.accept().await {
         let conn = match conn.await {
             Ok(conn) => conn,
@@ -397,11 +393,74 @@ async fn accept(
             r: receive,
         };
         let cancel = cancel.clone();
-        scope.spawn(async move {
+        s.spawn(async move {
             if let Err(err) = protocol(cancel, history, router, consensus, stream).await {
                 tracing::warn!(error = ?err, "failed to handle connection");
             }
         });
     }
-    scope.collect().await;
+    s.collect().await;
+}
+
+pub(crate) struct Node {
+    peers: Vec<SocketAddr>,
+    history: Mutex<History>,
+    router: Router,
+    consensus: Consensus<Sink>,
+    endpoint: quinn::Endpoint,
+    receiver: mpsc::UnboundedReceiver<Action>,
+}
+
+impl Node {
+    pub(crate) fn init(peers: Vec<SocketAddr>, endpoint: quinn::Endpoint) -> anyhow::Result<Self> {
+        let history = History::new();
+        let (sender, receiver) = unbounded_channel();
+        let consensus = Consensus::<Sink>::new();
+        Ok(Self {
+            peers,
+            history: Mutex::new(history),
+            router: Router::new(10_000),
+            consensus: consensus,
+            endpoint,
+            receiver: receiver,
+        })
+    }
+
+    pub(crate) async fn run(&mut self, cancel: CancellationToken) {
+        // TODO it will be better to get rid of scope and stuff Arc everywhere
+        let mut s = unsafe { TokioScope::create(Default::default()) };
+        s.spawn(loop_delay(
+            cancel.clone(),
+            Duration::from_millis(100),
+            &self.consensus,
+        ));
+        s.spawn(loop_actions_handler(
+            cancel.clone(),
+            &self.history,
+            &self.router,
+            &self.consensus,
+            &mut self.receiver,
+        ));
+        // TODO in accept and connect compare public keys identities
+        // public key with a lower value will be responsible for establishing a connection
+        for peer in &self.peers {
+            s.spawn(loop_retriable_connect(
+                cancel.clone(),
+                *peer,
+                Duration::from_secs(1),
+                &self.endpoint,
+                &self.history,
+                &self.router,
+                &self.consensus,
+            ));
+        }
+        s.spawn(accept(
+            cancel.clone(),
+            &self.endpoint,
+            &self.history,
+            &self.router,
+            &self.consensus,
+        ));
+        s.collect().await;
+    }
 }
