@@ -11,12 +11,6 @@
 TODO:
 - [ ] loom
 - [ ] example node with tokio
-- [ ] tester to setup cluster in subprocesses
-  features:
-    - setup network delay with qdisc
-    - periodically kill processes
-    - save logs per node
-    - periodically dump metrics per node 
 
 ## Tests
 

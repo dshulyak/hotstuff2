@@ -1,11 +1,10 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::cmp::max;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::sequential::{self as seq, Actions};
+use crate::sequential::{self as seq, Actions, StateChange};
 use crate::types::*;
 
 use bit_vec::BitVec;
@@ -297,7 +296,6 @@ impl Instance {
     // bootstrap enter specified view and generates lock verificate in that view for block with id
     fn bootstrap(&mut self, tester: &Tester, view: View, id: &str) {
         self.on_message(tester.timeout(view, vec![0, 1, 2]));
-        self.entered_view(view);
         self.send(tester.sync_genesis());
         self.on_message(tester.propose_first(view, id));
         self.voted(view);
@@ -339,20 +337,29 @@ impl Instance {
         self.action(seq::Action::Send(message));
     }
 
+    fn state_change(
+        &mut self,
+        lock: Option<Certificate<Vote>>,
+        commit: Option<Certificate<Vote>>,
+        voted: Option<View>,
+    ) {
+        self.action(seq::Action::StateChange(StateChange {
+            lock,
+            commit,
+            voted,
+        }));
+    }
+
     fn lock(&mut self, lock: Certificate<Vote>) {
-        self.action(seq::Action::Lock(lock));
+        self.state_change(Some(lock), None, None)
     }
 
     fn commit(&mut self, commit: Certificate<Vote>) {
-        self.action(seq::Action::Commit(commit));
+        self.state_change(None, Some(commit), None)
     }
 
     fn voted(&mut self, view: View) {
-        self.action(seq::Action::Voted(view));
-    }
-
-    fn entered_view(&mut self, view: View) {
-        self.action(seq::Action::EnteredView(view));
+        self.state_change(None, None, Some(view))
     }
 
     fn propose(&mut self) {
@@ -427,12 +434,6 @@ impl Instances {
         self.0.iter_mut().for_each(|instance| instance.voted(view));
     }
 
-    fn entered_view(&mut self, view: View) {
-        self.0
-            .iter_mut()
-            .for_each(|instance| instance.entered_view(view));
-    }
-
     fn send(&mut self, message: Message) {
         self.action(seq::Action::Send(message));
     }
@@ -488,9 +489,11 @@ fn test_commit_one() {
             tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]),
             tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
         ));
-        inst.commit(tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]));
-        inst.entered_view(2.into());
-        inst.voted(2.into());
+        inst.state_change(
+            None,
+            Some(tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2])),
+            Some(2.into()),
+        );
         inst.send(tester.vote(2.into(), 2, "b", inst.signer));
     });
 }
@@ -507,8 +510,11 @@ fn test_tick_on_epoch_boundary() {
             tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]),
             tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]),
         ));
-        inst.commit(tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]));
-        inst.entered_view(2.into());
+        inst.state_change(
+            None,
+            Some(tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2])),
+            Some(View(2)),
+        );
         inst.drain_actions();
         inst.on_message(tester.prepare(2.into(), 2, "b", vec![1, 2, 3]));
         inst.lock(tester.certify_vote(2.into(), 2, "b", vec![1, 2, 3]));
@@ -518,7 +524,6 @@ fn test_tick_on_epoch_boundary() {
         inst.consume_actions();
         inst.send(tester.wish(3.into(), inst.signer));
         inst.on_message(tester.timeout(3.into(), vec![0, 1, 2]));
-        inst.entered_view(3.into());
         let locked_b = tester.certify_vote(2.into(), 2, "b", vec![1, 2, 3]);
         let double_a = tester.certify_vote2(1.into(), 1, "a", vec![0, 1, 2]);
         inst.send(tester.sync(Some(locked_b.clone()), Some(double_a.clone())));
@@ -536,7 +541,6 @@ fn test_propose_after_delay() {
         let inst = &mut instances.0[2];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
-        inst.entered_view(2.into());
         let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
         inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
 
@@ -553,7 +557,6 @@ fn test_nonleader_on_delay() {
         let inst = &mut instances.0[0];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
-        inst.entered_view(2.into());
         let locked_a = tester.certify_vote(1.into(), 1, "a", vec![0, 1, 2]);
         inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
         inst.on_delay();
@@ -626,7 +629,6 @@ fn test_multi_bootstrap() {
         instances.on_tick();
         instances.for_each(|i| i.send(tester.wish(1.into(), i.signer)));
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
-        instances.entered_view(1.into());
         instances.send(tester.sync_genesis());
         instances.on_delay();
         instances.leader(1.into()).propose();
@@ -688,7 +690,6 @@ struct SimState {
     inputs: Vec<Vec<Message>>,
     propose: Vec<Option<[u8; 32]>>,
     commits: Vec<Option<Certificate<Vote>>>,
-    max_view: View,
 }
 
 impl SimState {
@@ -697,7 +698,6 @@ impl SimState {
             inputs: vec![vec![]; n],
             propose: vec![None; n],
             commits: vec![None; n],
-            max_view: View(0),
         }
     }
 
@@ -722,13 +722,11 @@ impl SimState {
                 seq::Action::Propose => {
                     self.propose[i] = Some(thread_rng().gen::<[u8; 32]>());
                 }
-                seq::Action::Commit(commit) => {
-                    self.commits[i] = Some(commit);
+                seq::Action::StateChange(change) => {
+                    if let Some(commit) = change.commit {
+                        self.commits[i] = Some(commit);
+                    }
                 }
-                seq::Action::EnteredView(view) => {
-                    self.max_view = max(self.max_view, view);
-                }
-                _ => {}
             }
         }
         acted
@@ -747,13 +745,11 @@ impl SimState {
                 seq::Action::Propose => {
                     self.propose[i] = Some(thread_rng().gen::<[u8; 32]>());
                 }
-                seq::Action::Commit(commit) => {
-                    self.commits[i] = Some(commit);
+                seq::Action::StateChange(change) => {
+                    if let Some(commit) = change.commit {
+                        self.commits[i] = Some(commit);
+                    }
                 }
-                seq::Action::EnteredView(view) => {
-                    self.max_view = max(self.max_view, view);
-                }
-                _ => {}
             }
         }
         acted

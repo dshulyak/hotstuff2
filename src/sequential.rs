@@ -18,18 +18,32 @@ pub(crate) const TIMEOUT: u8 = 7 * DELAY;
 const DELAY: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    // TODO consider grouping all state updates into single message, with multiple Option's
-    // persist the following data before sending messages.
+pub struct StateChange {
     // committed certificate can be executed.
-    Commit(Certificate<Vote>),
+    pub commit: Option<Certificate<Vote>>,
     // node should not vote below highest known locked certificate. persisted for safety.
-    Lock(Certificate<Vote>),
+    pub lock: Option<Certificate<Vote>>,
     // node should not vote more than once in the view. hence when this even is received it has to be persisted.
-    Voted(View),
+    pub voted: Option<View>,
+}
 
-    // TODO this can be dropped, and instead exposed with pub view()
-    EnteredView(View),
+impl StateChange {
+    fn new() -> Self {
+        Self {
+            commit: None,
+            lock: None,
+            voted: None,
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        self.commit.is_none() && self.lock.is_none() && self.voted.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    StateChange(StateChange),
 
     // send message to all participants
     Send(Message),
@@ -94,6 +108,10 @@ impl<T: Actions> Consensus<T> {
         }
     }
 
+    pub fn current_view(&self) -> View {
+        self.state.lock().view
+    }
+
     pub fn sink(&self) -> &T {
         &self.actions
     }
@@ -120,7 +138,6 @@ impl<T: Actions> Consensus<T> {
                     let next = state.view + 1;
                     state.enter_view(next);
                     state.wait_first_delay(next);
-                    self.actions.send(Action::EnteredView(state.view));
                     self.actions.send(Action::Send(Message::Sync(Sync {
                         locked: Some(state.locked.clone()),
                         double: Some(state.double.clone()),
@@ -236,11 +253,11 @@ impl<T: Actions> Consensus<T> {
         }
 
         let mut state = self.state.lock();
-
+        let mut change = StateChange::new();
         if let Some(locked) = sync.locked {
             if locked.inner.view > state.locked.inner.view {
                 state.locked = locked;
-                self.actions.send(Action::Lock(state.locked.clone()));
+                change.lock = Some(state.locked.clone());
             }
         }
         if let Some(double) = sync.double {
@@ -248,10 +265,11 @@ impl<T: Actions> Consensus<T> {
                 state.double = double;
                 let next = state.double.inner.view + 1;
                 state.enter_view(next);
-
-                self.actions.send(Action::Commit(state.double.clone()));
-                self.actions.send(Action::EnteredView(state.view));
+                change.commit = Some(state.double.clone());
             }
+        }
+        if !change.is_none() {
+            self.actions.send(Action::StateChange(change));
         }
         Ok(())
     }
@@ -320,7 +338,6 @@ impl<T: Actions> Consensus<T> {
         ensure!(timeout.certificate.inner > state.view, "old view");
         state.enter_view(timeout.certificate.inner);
         state.wait_first_delay(timeout.certificate.inner);
-        self.actions.send(Action::EnteredView(state.view));
         self.actions.send(Action::Send(Message::Sync(Sync {
             locked: Some(state.locked.clone()),
             double: Some(state.double.clone()),
@@ -365,12 +382,12 @@ impl<T: Actions> Consensus<T> {
                 self.participants.decode(&propose.inner.double.signers),
             )?;
         }
-
+        let mut change = StateChange::new();
         {
             let mut state = self.state.lock();
             if propose.inner.locked.inner.view > state.locked.inner.view {
                 state.locked = propose.inner.locked.clone();
-                self.actions.send(Action::Lock(state.locked.clone()));
+                change.lock = Some(state.locked.clone());
             }
             ensure!(
                 propose.inner.locked.inner.view == state.locked.inner.view,
@@ -379,10 +396,9 @@ impl<T: Actions> Consensus<T> {
 
             if propose.inner.double.inner.view > state.double.inner.view {
                 state.double = propose.inner.double.clone();
-                self.actions.send(Action::Commit(state.double.clone()));
+                change.commit = Some(state.double.clone());
                 let next = state.double.inner.view + 1;
                 state.enter_view(next);
-                self.actions.send(Action::EnteredView(state.view));
             }
             ensure!(
                 propose.inner.double.inner == state.double.inner,
@@ -405,9 +421,11 @@ impl<T: Actions> Consensus<T> {
             );
 
             state.voted = propose.inner.view;
-            self.actions.send(Action::Voted(state.voted));
+            change.voted = Some(state.voted);
         };
-
+        if !change.is_none() {
+            self.actions.send(Action::StateChange(change));
+        }
         self.keys.iter().for_each(|(signer, pk)| {
             let vote = Vote {
                 view: propose.inner.view.clone(),
@@ -452,7 +470,7 @@ impl<T: Actions> Consensus<T> {
             &prepare.certificate.inner.to_bytes(),
             self.participants.decode(&prepare.inner.certificate.signers),
         )?;
-
+        let mut change = StateChange::new();
         {
             let mut state = self.state.lock();
             ensure!(
@@ -466,7 +484,10 @@ impl<T: Actions> Consensus<T> {
                 prepare.inner.certificate.inner.view,
             );
             state.locked = prepare.inner.certificate.clone();
-            self.actions.send(Action::Lock(state.locked.clone()));
+            change.lock = Some(state.locked.clone());
+        }
+        if !change.is_none() {
+            self.actions.send(Action::StateChange(change));
         }
 
         let locked: Certificate<Vote> = prepare.inner.certificate;
