@@ -65,24 +65,24 @@ struct Router {
 }
 
 impl Router {
-    pub fn new(per_channel_buffer_size: usize) -> Self {
+    fn new(per_channel_buffer_size: usize) -> Self {
         Self {
             per_channel_buffer_size: per_channel_buffer_size,
             gossip: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn register(&self, addr: SocketAddr) -> mpsc::Receiver<Arc<Message>> {
+    fn register(&self, addr: SocketAddr) -> mpsc::Receiver<Arc<Message>> {
         let (sender, receiver) = mpsc::channel(self.per_channel_buffer_size);
         self.gossip.lock().insert(addr, sender);
         receiver
     }
 
-    pub fn remove(&self, addr: &SocketAddr) {
+    fn remove(&self, addr: &SocketAddr) {
         self.gossip.lock().remove(addr);
     }
 
-    pub fn send_all(&self, msg: Message) {
+    fn send_all(&self, msg: Message) {
         self.gossip(msg, None)
     }
 
@@ -100,19 +100,38 @@ impl Router {
     }
 }
 
-pub struct History {
+struct History {
     voted: View,
     locked: Option<Certificate<Vote>>,
     commits: BTreeMap<View, Certificate<Vote>>,
 }
 
 impl History {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             voted: View(0),
             locked: None,
             commits: BTreeMap::new(),
         }
+    }
+
+    fn last_view(&self) -> View {
+        let mut last = self.voted;
+        if let Some(locked) = &self.locked {
+            last = last.max(locked.inner.view);
+        }
+        if let Some(commit) = self.commits.last_key_value() {
+            last = last.max(*commit.0 + 1);
+        }
+        last
+    }
+
+    fn lock(&self) -> Certificate<Vote> {
+        self.locked.as_ref().unwrap().clone()
+    }
+
+    fn last_commit(&self) -> Certificate<Vote> {
+        self.commits.last_key_value().unwrap().1.clone()
     }
 }
 
@@ -127,13 +146,13 @@ async fn protocol(
     // both sides write their last locked and commit state, and read it concurrently
 
     let local = {
-        let mut history = history.lock();
+        let history = history.lock();
         SyncMsg {
             locked: history.locked.clone(),
             double: history
                 .commits
-                .last_entry()
-                .map(|entry| entry.get().clone()),
+                .last_key_value()
+                .map(|(_, cert)| cert.clone()),
         }
     };
 
@@ -402,7 +421,7 @@ async fn accept(
     s.collect().await;
 }
 
-pub(crate) struct Node {
+pub struct Node {
     peers: Vec<SocketAddr>,
     history: Mutex<History>,
     router: Router,
@@ -412,10 +431,23 @@ pub(crate) struct Node {
 }
 
 impl Node {
-    pub(crate) fn init(peers: Vec<SocketAddr>, endpoint: quinn::Endpoint) -> anyhow::Result<Self> {
+    pub fn init(
+        peers: Vec<SocketAddr>,
+        participants: Box<[PublicKey]>,
+        keys: Box<[PrivateKey]>,
+        endpoint: quinn::Endpoint,
+    ) -> anyhow::Result<Self> {
         let history = History::new();
         let (sender, receiver) = unbounded_channel();
-        let consensus = Consensus::<Sink>::new();
+        let consensus = Consensus::<Sink>::new(
+            history.last_view(),
+            participants,
+            history.lock(),
+            history.last_commit(),
+            history.voted,
+            &keys,
+            Sink(sender),
+        );
         Ok(Self {
             peers,
             history: Mutex::new(history),
@@ -426,7 +458,7 @@ impl Node {
         })
     }
 
-    pub(crate) async fn run(&mut self, cancel: CancellationToken) {
+    pub async fn run(&mut self, cancel: CancellationToken) {
         // TODO it will be better to get rid of scope and stuff Arc everywhere
         let mut s = unsafe { TokioScope::create(Default::default()) };
         s.spawn(loop_delay(
