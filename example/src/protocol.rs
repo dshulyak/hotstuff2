@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
@@ -9,10 +10,9 @@ use hotstuff2::types::{
     Block, Certificate, Domain, Message, PrivateKey, PublicKey, Sync as SyncMsg, View, Vote, ID,
 };
 use parking_lot::Mutex;
-use quinn::StreamId;
 use tokio::select;
 use tokio::sync::mpsc::{self, unbounded_channel};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::codec::{AsyncDecode, AsyncEncode};
 
@@ -21,7 +21,9 @@ pub(crate) struct Sink(mpsc::UnboundedSender<Action>);
 
 impl Actions for Sink {
     fn send(&self, action: Action) {
-        self.0.send(action).unwrap();
+        self.0
+            .send(action)
+            .expect("consumer should never be dropped before producer");
     }
 }
 
@@ -48,15 +50,6 @@ pub(crate) struct Config {
     timeout: Duration,
     connect: Vec<SocketAddr>,
     listener: SocketAddr,
-}
-
-pub(crate) type Protocol = u32;
-
-pub(crate) struct Stream {
-    pub(crate) id: StreamId,
-    pub(crate) remote: SocketAddr,
-    pub(crate) r: quinn::RecvStream,
-    pub(crate) w: quinn::SendStream,
 }
 
 struct Router {
@@ -136,51 +129,75 @@ impl History {
 }
 
 async fn protocol(
-    cancel: CancellationToken,
+    ctx: &Context,
     history: &Mutex<History>,
     router: &Router,
     consensus: &Consensus<Sink>,
-    mut stream: Stream,
+    conn: quinn::Connection,
+    initiator: bool,
 ) -> anyhow::Result<()> {
     // negotiate last known state
     // both sides write their last locked and commit state, and read it concurrently
 
-    let local = {
-        let history = history.lock();
-        SyncMsg {
-            locked: history.locked.clone(),
-            double: history
-                .commits
-                .last_key_value()
-                .map(|(_, cert)| cert.clone()),
-        }
-    };
+    let (mut w, mut r) = if initiator {
+        ctx.timeout_secs(1).select(conn.open_bi()).await?
+    } else {
+        ctx.timeout_secs(1).select(conn.accept_bi()).await?
+    }?;
 
-    // TODO implement reconciliation routine, do it one synchronously and then periodically over original stream.
+    // TODO implement reconciliation routine, do it once synchronously and then periodically over original stream.
     // for gossip establish a new stream.
-
-    let mut send = None;
-    let mut receive = None;
-
-    TokioScope::scope_and_block(|s| {
+    let (_, results) = TokioScope::scope_and_block(|s| {
         s.spawn(async {
-            send = Some(local.encode(&mut stream.w).await);
+            let local = {
+                let history = history.lock();
+                SyncMsg {
+                    locked: history.locked.clone(),
+                    double: history
+                        .commits
+                        .last_key_value()
+                        .map(|(_, cert)| cert.clone()),
+                }
+            };
+            match ctx
+                .timeout(Duration::from_secs(1))
+                .select(local.encode(&mut w))
+                .await
+            {
+                Ok(Ok(())) => Ok(local),
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(err),
+            }
         });
         s.spawn(async {
-            receive = Some(SyncMsg::decode(&mut stream.r).await);
+            match ctx
+                .timeout(Duration::from_secs(1))
+                .select(SyncMsg::decode(&mut r))
+                .await
+            {
+                Ok(Ok(remote)) => Ok(remote),
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(err),
+            }
         });
     });
-    if let Err(err) = send.unwrap() {
-        anyhow::bail!("send sync message: {}", err);
-    }
-    let remote = match receive.unwrap() {
-        Ok(remote) => remote,
-        Err(err) => anyhow::bail!("receive sync message: {}", err),
+    let mut results = results.into_iter();
+    let local = match results.next() {
+        Some(Ok(Ok(local))) => local,
+        Some(Ok(Err(err))) => anyhow::bail!("send sync message: {}", err),
+        Some(Err(err)) => anyhow::bail!("send sync message: {}", err),
+        None => anyhow::bail!("tasks didn't complete"),
+    };
+    let remote = match results.next() {
+        Some(Ok(Ok(remote))) => remote,
+        Some(Ok(Err(err))) => anyhow::bail!("receive sync message: {}", err),
+        Some(Err(err)) => anyhow::bail!("receive sync message: {}", err),
+        None => anyhow::bail!("tasks didn't complete"),
     };
 
     // one that behind, waits for synchronous messages to catchup
     // the other one starts sending sync msgs based on the difference in commit history
-    if let Some(mut i) = needs_boost(&local.double, &remote.double) {
+    if let Some(mut i) = needs_sync(&local.double, &remote.double) {
         let mut end = false;
         while !end {
             let next = {
@@ -197,70 +214,82 @@ async fn protocol(
                     double,
                 }
             };
-            if let Err(err) = next.encode(&mut stream.w).await {
-                anyhow::bail!("send sync message: {}", err);
+            match ctx.timeout_secs(2).select(next.encode(&mut w)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    anyhow::bail!("send sync message: {}", err);
+                }
+                Err(err) => {
+                    anyhow::bail!("send sync message: {}", err);
+                }
             }
             end = next.double.is_none();
             i += 1
         }
-    } else if let Some(_) = needs_boost(&remote.double, &local.double) {
+    } else if let Some(_) = needs_sync(&remote.double, &local.double) {
         let mut end = false;
         while !end {
-            let sync = match SyncMsg::decode(&mut stream.r).await {
-                Ok(sync) => sync,
+            let sync = match ctx.timeout_secs(1).select(SyncMsg::decode(&mut r)).await {
+                Ok(Ok(sync)) => sync,
+                Ok(Err(err)) => {
+                    anyhow::bail!("receive sync message: {}", err);
+                }
                 Err(err) => {
                     anyhow::bail!("receive sync message: {}", err);
                 }
             };
             end = sync.double.is_none();
             if let Err(err) = consensus.on_message(Message::Sync(sync)) {
-                tracing::warn!(error = ?err, "failed to process sync message");
+                tracing::warn!(error = ?err, "process sync message");
             }
         }
     }
 
+    let (mut gossip_w, mut gossip_r) = if initiator {
+        ctx.timeout_secs(2).select(conn.open_bi()).await?
+    } else {
+        ctx.timeout_secs(2).select(conn.accept_bi()).await?
+    }?;
+
     // if they are equally up to date they are both added to the gossip
     // after that both sides register for sync and gossip in the router
     // setup receiver that will emit messages to the stream
-    let mut gossip = router.register(stream.remote);
-    let child = cancel.child_token();
 
+    let mut gossip = router.register(conn.remote_address());
+    let child = ctx.child();
     TokioScope::scope_and_block(|s| {
         s.spawn(async {
-            while let Some(msg) = gossip.recv().await {
-                if let Err(err) = msg.encode(&mut stream.w).await {
-                    tracing::warn!(error = ?err, "failed to send gossip message");
-                    break;
+            while let Ok(Some(msg)) = child.select(gossip.recv()).await {
+                match child
+                    .timeout(Duration::from_secs(1))
+                    .select(msg.encode(&mut gossip_w))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::debug!(error = ?err, "failed to send message to peer");
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = ?err, "task to send message was interrupted");
+                        break;
+                    }
                 }
             }
             child.cancel();
         });
         s.spawn(async {
-            select! {
-                _ = async {
-                    let msg = Message::decode(&mut stream.r).await;
-                    match msg {
-                        Ok(msg) => {
-                            if let Err(err) = consensus.on_message(msg.clone()) {
-                                tracing::debug!(error = ?err, "failed to process gossip message");
-                            }
-                        }
-                        Err(err) => {
-                            tracing::debug!(error = ?err, "failed to receive gossip message");
-                        }
-                    }
-                } => {},
-                _ = child.cancelled() => {},
+            while let Ok(Ok(msg)) = child.select(Message::decode(&mut gossip_r)).await {
+                if let Err(err) = consensus.on_message(msg.clone()) {
+                    tracing::warn!(error = ?err, "failed to process gossip message");
+                }
             }
         });
     });
-
-    // protocol can terminate without error if peer goes away with eof
-    // otherwise it terminates on write timeout
     Ok(())
 }
 
-fn needs_boost(
+fn needs_sync(
     local: &Option<Certificate<Vote>>,
     remote: &Option<Certificate<Vote>>,
 ) -> Option<View> {
@@ -278,13 +307,13 @@ fn needs_boost(
     }
 }
 
-async fn loop_delay(cancel: CancellationToken, interval: Duration, consensus: &Consensus<Sink>) {
+async fn loop_delay(ctx: &Context, interval: Duration, consensus: &Consensus<Sink>) {
     loop {
         select! {
             _ = tokio::time::sleep(interval) => {
                 consensus.on_delay();
             },
-            _ = cancel.cancelled() => {
+            _ = ctx.cancelled() => {
                 return;
             },
         }
@@ -292,7 +321,7 @@ async fn loop_delay(cancel: CancellationToken, interval: Duration, consensus: &C
 }
 
 async fn loop_actions_handler(
-    cancel: CancellationToken,
+    ctx: &Context,
     history: &Mutex<History>,
     router: &Router,
     consensus: &Consensus<Sink>,
@@ -328,7 +357,7 @@ async fn loop_actions_handler(
                     }
                 }
             },
-            _ = cancel.cancelled() => {
+            _ = ctx.cancelled() => {
                 return;
             },
         }
@@ -336,7 +365,7 @@ async fn loop_actions_handler(
 }
 
 async fn connect(
-    cancel: CancellationToken,
+    ctx: &Context,
     endpoint: &quinn::Endpoint,
     peer: SocketAddr,
     history: &Mutex<History>,
@@ -349,24 +378,20 @@ async fn connect(
             anyhow::bail!("failed to connect to peer: {}", err);
         }
     };
-    let conn = match conn.await {
-        Ok(conn) => conn,
-        Err(err) => {
+    let conn = match ctx.timeout_secs(1).select(conn).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(err)) => {
             anyhow::bail!("establish connection: {}", err);
         }
+        Err(err) => {
+            anyhow::bail!("task to establish connection: {}", err);
+        }
     };
-    let (send, receive) = conn.open_bi().await?;
-    let stream = Stream {
-        id: send.id(),
-        remote: peer,
-        w: send,
-        r: receive,
-    };
-    protocol(cancel, history, router, consensus, stream).await
+    protocol(ctx, history, router, consensus, conn, true).await
 }
 
 async fn loop_retriable_connect(
-    cancel: CancellationToken,
+    ctx: &Context,
     peer: SocketAddr,
     reconnect_interval: Duration,
     endpoint: &quinn::Endpoint,
@@ -375,21 +400,17 @@ async fn loop_retriable_connect(
     consensus: &Consensus<Sink>,
 ) {
     loop {
-        if let Err(err) = connect(cancel.clone(), endpoint, peer, history, router, consensus).await
-        {
+        if let Err(err) = connect(ctx, endpoint, peer, history, router, consensus).await {
             tracing::warn!(error = ?err, "failed to connect to peer");
         }
-        select! {
-            _ = tokio::time::sleep(reconnect_interval) => {},
-            _ = cancel.cancelled() => {
-                return;
-            }
+        if let Err(_) = ctx.select(tokio::time::sleep(reconnect_interval)).await {
+            return;
         }
     }
 }
 
 async fn accept(
-    cancel: CancellationToken,
+    ctx: &Context,
     endpoint: &quinn::Endpoint,
     history: &Mutex<History>,
     router: &Router,
@@ -397,24 +418,20 @@ async fn accept(
 ) {
     let mut s = unsafe { TokioScope::create(Default::default()) };
     while let Some(conn) = endpoint.accept().await {
-        let conn = match conn.await {
-            Ok(conn) => conn,
-            Err(err) => {
-                tracing::warn!(error = ?err, "failed to accept connection");
-                continue;
-            }
-        };
-        let (send, receive) = conn.open_bi().await.unwrap();
-        let stream = Stream {
-            id: send.id(),
-            remote: conn.remote_address(),
-            w: send,
-            r: receive,
-        };
-        let cancel = cancel.clone();
-        s.spawn(async move {
-            if let Err(err) = protocol(cancel, history, router, consensus, stream).await {
-                tracing::warn!(error = ?err, "failed to handle connection");
+        s.spawn(async {
+            let conn = match ctx.timeout(Duration::from_secs(1)).select(conn).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(err)) => {
+                    tracing::debug!(error = ?err, "failed to accept connection");
+                    return;
+                }
+                Err(err) => {
+                    tracing::debug!(error = ?err, "task failed");
+                    return;
+                }
+            };
+            if let Err(err) = protocol(ctx, history, router, consensus, conn, false).await {
+                tracing::warn!(error = ?err, "protocol failed");
             }
         });
     }
@@ -432,9 +449,9 @@ pub struct Node {
 
 impl Node {
     pub fn init(
-        peers: Vec<SocketAddr>,
         participants: Box<[PublicKey]>,
         keys: Box<[PrivateKey]>,
+        peers: Vec<SocketAddr>,
         endpoint: quinn::Endpoint,
     ) -> anyhow::Result<Self> {
         let history = History::new();
@@ -451,23 +468,23 @@ impl Node {
         Ok(Self {
             peers,
             history: Mutex::new(history),
-            router: Router::new(10_000),
+            router: Router::new(1_000),
             consensus: consensus,
             endpoint,
             receiver: receiver,
         })
     }
 
-    pub async fn run(&mut self, cancel: CancellationToken) {
+    pub async fn run(&mut self, ctx: Context) {
         // TODO it will be better to get rid of scope and stuff Arc everywhere
         let mut s = unsafe { TokioScope::create(Default::default()) };
         s.spawn(loop_delay(
-            cancel.clone(),
+            &ctx,
             Duration::from_millis(100),
             &self.consensus,
         ));
         s.spawn(loop_actions_handler(
-            cancel.clone(),
+            &ctx,
             &self.history,
             &self.router,
             &self.consensus,
@@ -477,7 +494,7 @@ impl Node {
         // public key with a lower value will be responsible for establishing a connection
         for peer in &self.peers {
             s.spawn(loop_retriable_connect(
-                cancel.clone(),
+                &ctx,
                 *peer,
                 Duration::from_secs(1),
                 &self.endpoint,
@@ -487,12 +504,79 @@ impl Node {
             ));
         }
         s.spawn(accept(
-            cancel.clone(),
+            &ctx,
             &self.endpoint,
             &self.history,
             &self.router,
             &self.consensus,
         ));
         s.collect().await;
+    }
+}
+
+struct Context {
+    cancel: CancellationToken,
+}
+
+impl Context {
+    fn new() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    fn child(&self) -> Self {
+        let ctx = Context {
+            cancel: self.cancel.child_token(),
+        };
+        ctx
+    }
+
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    fn cancelled(&self) -> WaitForCancellationFuture<'_> {
+        self.cancel.cancelled()
+    }
+
+    fn timeout<'a>(&'a self, timeout: Duration) -> Timeout<'a> {
+        Timeout { ctx: self, timeout }
+    }
+
+    fn timeout_secs<'a>(&'a self, secs: u64) -> Timeout<'a> {
+        self.timeout(Duration::from_secs(secs))
+    }
+
+    async fn select<T, F: Future<Output = T>>(&self, f: F) -> anyhow::Result<T> {
+        select! {
+            _ = self.cancel.cancelled() => {
+                anyhow::bail!("cancelled");
+            },
+            res = f => {
+                Ok(res)
+            }
+        }
+    }
+}
+
+struct Timeout<'a> {
+    ctx: &'a Context,
+    timeout: Duration,
+}
+
+impl<'a> Timeout<'a> {
+    async fn select<T, F: Future<Output = T>>(&self, f: F) -> anyhow::Result<T> {
+        select! {
+            _ = self.ctx.cancelled() => {
+                anyhow::bail!("cancelled");
+            },
+            _ = tokio::time::sleep(self.timeout) => {
+                anyhow::bail!("timeout");
+            },
+            res = f => {
+                Ok(res)
+            }
+        }
     }
 }
