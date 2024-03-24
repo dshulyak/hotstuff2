@@ -7,7 +7,8 @@ use async_scoped::TokioScope;
 use bit_vec::BitVec;
 use hotstuff2::sequential::{Action, Actions, Consensus};
 use hotstuff2::types::{
-    Block, Certificate, Domain, Message, PrivateKey, PublicKey, Sync as SyncMsg, View, Vote, ID,
+    AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Signature,
+    Sync as SyncMsg, View, Vote, ID, SIGNATURE_SIZE,
 };
 use parking_lot::Mutex;
 use tokio::select;
@@ -29,18 +30,14 @@ impl Actions for Sink {
 }
 
 pub(crate) fn genesis() -> Certificate<Vote> {
-    let empty_seed = [0; 32];
-    let genesis = Certificate {
+    Certificate {
         inner: Vote {
             view: View(0),
             block: Block::new(0, ID::from_str("genesis")),
         },
-        signature: PrivateKey::from_seed(&empty_seed)
-            .sign(Domain::Vote, &[0; 32])
-            .into(),
+        signature: AggregateSignature::empty(),
         signers: BitVec::new(),
-    };
-    genesis
+    }
 }
 
 pub(crate) struct Config {

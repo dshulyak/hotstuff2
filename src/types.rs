@@ -285,17 +285,32 @@ impl Ord for PublicKey {
 }
 
 #[derive(Debug, Clone)]
-pub struct AggregateSignature(blst::AggregateSignature);
+pub struct AggregateSignature([u8; SIGNATURE_SIZE]);
 
 impl AggregateSignature {
+    pub fn empty() -> Self {
+        AggregateSignature([0; SIGNATURE_SIZE])
+    }
+
     pub fn aggregate<'a>(
         signatures: impl IntoIterator<Item = &'a Signature>,
     ) -> Result<Self, ::blst::BLST_ERROR> {
+        let signatures = signatures
+            .into_iter()
+            .map(|sig| {
+                sig.to_blst()
+                    .expect("singature must be verified before it is being used in aggregate")
+            })
+            .collect::<Vec<_>>();
         let signature = blst::AggregateSignature::aggregate(
-            &signatures.into_iter().map(|sig| &sig.0).collect::<Vec<_>>(),
+            &signatures.iter().map(|sig| sig).collect::<Vec<_>>(),
             false,
         )?;
-        Ok(AggregateSignature(signature))
+        Ok(AggregateSignature(signature.to_signature().to_bytes()))
+    }
+
+    fn to_signature(&self) -> anyhow::Result<blst::Signature> {
+        blst::Signature::from_bytes(&self.0).map_err(|_| anyhow!("invalid signature"))
     }
 
     pub fn verify<'a>(
@@ -312,7 +327,7 @@ impl AggregateSignature {
             false,
         )
         .expect("failed to aggregate public key");
-        match self.0.to_signature().verify(
+        match self.to_signature()?.verify(
             true,
             message,
             domain.into(),
@@ -328,7 +343,7 @@ impl AggregateSignature {
 
 impl PartialEq for AggregateSignature {
     fn eq(&self, other: &Self) -> bool {
-        self.0.to_signature() == other.0.to_signature()
+        self.0 == other.0
     }
 }
 
@@ -336,7 +351,7 @@ impl Eq for AggregateSignature {}
 
 impl ToBytes for AggregateSignature {
     fn to_bytes(&self) -> Vec<u8> {
-        self.0.to_signature().to_bytes().to_vec()
+        self.0.to_vec()
     }
 }
 
@@ -349,7 +364,7 @@ impl PrivateKey {
     }
 
     pub fn sign(&self, dst: Domain, message: &[u8]) -> Signature {
-        Signature(self.0.sign(message, dst.into(), &[]))
+        Signature(self.0.sign(message, dst.into(), &[]).to_bytes())
     }
 
     pub fn public(&self) -> PublicKey {
@@ -375,11 +390,11 @@ pub const PUBLIC_KEY_SIZE: usize = 48;
 pub const SIGNATURE_SIZE: usize = 96;
 
 #[derive(Debug, Clone)]
-pub struct Signature(blst::Signature);
+pub struct Signature([u8; SIGNATURE_SIZE]);
 
 impl Into<AggregateSignature> for Signature {
     fn into(self) -> AggregateSignature {
-        AggregateSignature(blst::AggregateSignature::from_signature(&self.0))
+        AggregateSignature(self.0)
     }
 }
 
@@ -392,6 +407,10 @@ impl PartialEq for Signature {
 impl Eq for Signature {}
 
 impl Signature {
+    pub fn new(bytes: [u8; SIGNATURE_SIZE]) -> Self {
+        Signature(bytes)
+    }
+
     pub(crate) fn verify(
         &self,
         domain: Domain,
@@ -399,7 +418,7 @@ impl Signature {
         public_key: &PublicKey,
     ) -> Result<()> {
         match self
-            .0
+            .to_blst()?
             .verify(true, message, domain.into(), &[], &public_key.0, false)
         {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
@@ -411,14 +430,16 @@ impl Signature {
         self.verify(Domain::Possesion, &public_key.to_bytes(), public_key)
     }
 
+    fn to_blst(&self) -> anyhow::Result<blst::Signature> {
+        blst::Signature::from_bytes(&self.0).map_err(|_| anyhow!("invalid signature"))
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
-        self.0.to_bytes().to_vec()
+        self.0.to_vec()
     }
 
     pub fn from_bytes(bytes: &[u8; SIGNATURE_SIZE]) -> Result<Self> {
-        blst::Signature::from_bytes(bytes)
-            .map(Signature)
-            .map_err(|err| anyhow!("failed to parse signature: {:?}", err))
+        Ok(Signature(*bytes))
     }
 }
 
