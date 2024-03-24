@@ -12,6 +12,7 @@ use hotstuff2::types::{
 use parking_lot::Mutex;
 use tokio::select;
 use tokio::sync::mpsc::{self, unbounded_channel};
+use tokio::time::sleep;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::codec::{AsyncDecode, AsyncEncode};
@@ -310,7 +311,7 @@ fn needs_sync(
 async fn loop_delay(ctx: &Context, interval: Duration, consensus: &Consensus<Sink>) {
     loop {
         select! {
-            _ = tokio::time::sleep(interval) => {
+            _ = sleep(interval) => {
                 consensus.on_delay();
             },
             _ = ctx.cancelled() => {
@@ -403,7 +404,7 @@ async fn loop_retriable_connect(
         if let Err(err) = connect(ctx, endpoint, peer, history, router, consensus).await {
             tracing::warn!(error = ?err, "failed to connect to peer");
         }
-        if let Err(_) = ctx.select(tokio::time::sleep(reconnect_interval)).await {
+        if let Err(_) = ctx.select(sleep(reconnect_interval)).await {
             return;
         }
     }
@@ -571,7 +572,7 @@ impl<'a> Timeout<'a> {
             _ = self.ctx.cancelled() => {
                 anyhow::bail!("cancelled");
             },
-            _ = tokio::time::sleep(self.timeout) => {
+            _ = sleep(self.timeout) => {
                 anyhow::bail!("timeout");
             },
             res = f => {
