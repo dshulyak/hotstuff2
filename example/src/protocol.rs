@@ -8,9 +8,10 @@ use bit_vec::BitVec;
 use hotstuff2::sequential::{Action, Actions, Consensus};
 use hotstuff2::types::{
     AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Signature,
-    Sync as SyncMsg, View, Vote, ID, SIGNATURE_SIZE,
+    Sync as SyncMsg, View, Vote, ID,
 };
 use parking_lot::Mutex;
+use quinn::StreamId;
 use tokio::select;
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
@@ -52,7 +53,7 @@ pub(crate) struct Config {
 
 struct Router {
     per_channel_buffer_size: usize,
-    gossip: Mutex<HashMap<SocketAddr, mpsc::Sender<Arc<Message>>>>,
+    gossip: Mutex<HashMap<StreamId, mpsc::Sender<Arc<Message>>>>,
 }
 
 impl Router {
@@ -63,25 +64,22 @@ impl Router {
         }
     }
 
-    fn register(&self, addr: SocketAddr) -> mpsc::Receiver<Arc<Message>> {
+    fn register(&self, addr: StreamId) -> mpsc::Receiver<Arc<Message>> {
         let (sender, receiver) = mpsc::channel(self.per_channel_buffer_size);
         self.gossip.lock().insert(addr, sender);
         receiver
     }
 
-    fn remove(&self, addr: &SocketAddr) {
+    fn remove(&self, addr: &StreamId) {
         self.gossip.lock().remove(addr);
     }
 
     fn send_all(&self, msg: Message) {
-        self.gossip(msg, None)
+        self.gossip(msg)
     }
 
-    fn gossip(&self, msg: Message, except: Option<SocketAddr>) {
+    fn gossip(&self, msg: Message) {
         self.gossip.lock().retain(|socket, sender| {
-            if except.map(|addr| addr == *socket).unwrap_or(false) {
-                return true;
-            }
             if let Err(err) = sender.try_send(Arc::new(msg.clone())) {
                 tracing::debug!(error = ?err, "failed to send message to peer");
                 return false;
@@ -124,185 +122,137 @@ impl History {
     fn last_commit(&self) -> Certificate<Vote> {
         self.commits.last_key_value().unwrap().1.clone()
     }
-}
 
-async fn protocol(
-    ctx: &Context,
-    history: &Mutex<History>,
-    router: &Router,
-    consensus: &Consensus<Sink>,
-    conn: quinn::Connection,
-    initiator: bool,
-) -> anyhow::Result<()> {
-    // negotiate last known state
-    // both sides write their last locked and commit state, and read it concurrently
-
-    let (mut w, mut r) = if initiator {
-        ctx.timeout_secs(1).select(conn.open_bi()).await?
-    } else {
-        ctx.timeout_secs(1).select(conn.accept_bi()).await?
-    }?;
-
-    // TODO implement reconciliation routine, do it once synchronously and then periodically over original stream.
-    // for gossip establish a new stream.
-    let (_, results) = TokioScope::scope_and_block(|s| {
-        s.spawn(async {
-            let local = {
-                let history = history.lock();
-                SyncMsg {
-                    locked: history.locked.clone(),
-                    double: history
-                        .commits
-                        .last_key_value()
-                        .map(|(_, cert)| cert.clone()),
-                }
-            };
-            match ctx
-                .timeout(Duration::from_secs(1))
-                .select(local.encode(&mut w))
-                .await
-            {
-                Ok(Ok(())) => Ok(local),
-                Ok(Err(err)) => Err(err),
-                Err(err) => Err(err),
-            }
-        });
-        s.spawn(async {
-            match ctx
-                .timeout(Duration::from_secs(1))
-                .select(SyncMsg::decode(&mut r))
-                .await
-            {
-                Ok(Ok(remote)) => Ok(remote),
-                Ok(Err(err)) => Err(err),
-                Err(err) => Err(err),
-            }
-        });
-    });
-    let mut results = results.into_iter();
-    let local = match results.next() {
-        Some(Ok(Ok(local))) => local,
-        Some(Ok(Err(err))) => anyhow::bail!("send sync message: {}", err),
-        Some(Err(err)) => anyhow::bail!("send sync message: {}", err),
-        None => anyhow::bail!("tasks didn't complete"),
-    };
-    let remote = match results.next() {
-        Some(Ok(Ok(remote))) => remote,
-        Some(Ok(Err(err))) => anyhow::bail!("receive sync message: {}", err),
-        Some(Err(err)) => anyhow::bail!("receive sync message: {}", err),
-        None => anyhow::bail!("tasks didn't complete"),
-    };
-
-    // one that behind, waits for synchronous messages to catchup
-    // the other one starts sending sync msgs based on the difference in commit history
-    if let Some(mut i) = needs_sync(&local.double, &remote.double) {
-        let mut end = false;
-        while !end {
-            let next = {
-                let history = history.lock();
-                let double = history.commits.get(&i).map(|cert| cert.clone());
-                SyncMsg {
-                    locked: {
-                        if double.is_some() {
-                            None
-                        } else {
-                            history.locked.clone()
-                        }
-                    },
-                    double,
-                }
-            };
-            match ctx.timeout_secs(2).select(next.encode(&mut w)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    anyhow::bail!("send sync message: {}", err);
-                }
-                Err(err) => {
-                    anyhow::bail!("send sync message: {}", err);
-                }
-            }
-            end = next.double.is_none();
-            i += 1
-        }
-    } else if let Some(_) = needs_sync(&remote.double, &local.double) {
-        let mut end = false;
-        while !end {
-            let sync = match ctx.timeout_secs(1).select(SyncMsg::decode(&mut r)).await {
-                Ok(Ok(sync)) => sync,
-                Ok(Err(err)) => {
-                    anyhow::bail!("receive sync message: {}", err);
-                }
-                Err(err) => {
-                    anyhow::bail!("receive sync message: {}", err);
-                }
-            };
-            end = sync.double.is_none();
-            if let Err(err) = consensus.on_message(Message::Sync(sync)) {
-                tracing::warn!(error = ?err, "process sync message");
-            }
+    fn sync_state(&self) -> SyncMsg {
+        SyncMsg {
+            locked: self.locked.clone(),
+            double: Some(self.last_commit()),
         }
     }
 
-    let (mut gossip_w, mut gossip_r) = if initiator {
-        ctx.timeout_secs(2).select(conn.open_bi()).await?
-    } else {
-        ctx.timeout_secs(2).select(conn.accept_bi()).await?
-    }?;
-
-    // if they are equally up to date they are both added to the gossip
-    // after that both sides register for sync and gossip in the router
-    // setup receiver that will emit messages to the stream
-
-    let mut gossip = router.register(conn.remote_address());
-    let child = ctx.child();
-    TokioScope::scope_and_block(|s| {
-        s.spawn(async {
-            while let Ok(Some(msg)) = child.select(gossip.recv()).await {
-                match child
-                    .timeout(Duration::from_secs(1))
-                    .select(msg.encode(&mut gossip_w))
-                    .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        tracing::debug!(error = ?err, "failed to send message to peer");
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::debug!(error = ?err, "task to send message was interrupted");
-                        break;
-                    }
-                }
+    fn get(&self, view: View) -> SyncMsg {
+        let commit = self.commits.get(&view).cloned();
+        if commit.is_none() {
+            return SyncMsg {
+                locked: self.locked.clone(),
+                double: None,
+            };
+        } else {
+            SyncMsg {
+                locked: None,
+                double: commit,
             }
-            child.cancel();
-        });
-        s.spawn(async {
-            while let Ok(Ok(msg)) = child.select(Message::decode(&mut gossip_r)).await {
-                if let Err(err) = consensus.on_message(msg.clone()) {
-                    tracing::warn!(error = ?err, "failed to process gossip message");
-                }
-            }
-        });
-    });
+        }
+    }
+}
+
+async fn sync_initiate(
+    ctx: &Context,
+    history: &Mutex<History>,
+    consensus: &Consensus<Sink>,
+    conn: &quinn::Connection,
+) -> anyhow::Result<()> {
+    let (mut send, mut recv) = ctx.timeout_secs(10).select(conn.open_bi()).await??;
+    let state = {
+        let history = history.lock();
+        history.sync_state()
+    };
+    match ctx.timeout_secs(10).select(state.encode(&mut send)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(err) => return Err(err),
+    }
+    while let Ok(Ok(msg)) = ctx
+        .timeout_secs(10)
+        .select(SyncMsg::decode(&mut recv))
+        .await
+    {
+        if let Err(err) = consensus.on_message(Message::Sync(msg)) {
+            tracing::debug!(error = ?err, remote = ?conn.remote_address(), "failed to process sync message");
+        }
+    }
     Ok(())
 }
 
-fn needs_sync(
-    local: &Option<Certificate<Vote>>,
-    remote: &Option<Certificate<Vote>>,
-) -> Option<View> {
-    match (local, remote) {
-        (Some(local), Some(remote)) => {
-            if local.inner.block.height <= remote.inner.block.height {
-                None
-            } else {
-                Some(remote.inner.view)
+async fn sync_accept(
+    ctx: &Context,
+    history: &Mutex<History>,
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+) {
+    let state = match ctx.timeout_secs(10).select(SyncMsg::decode(recv)).await {
+        Ok(Ok(state)) => state,
+        Ok(Err(err)) => {
+            tracing::debug!(error = ?err, "failed to decode sync message");
+            return;
+        }
+        Err(err) => {
+            tracing::debug!(error = ?err, "failed to receive sync message");
+            return;
+        }
+    };
+    loop {
+        let next = {
+            let history = history.lock();
+            history.get(
+                state
+                    .locked
+                    .as_ref()
+                    .map(|v| v.inner.view)
+                    .unwrap_or(View(1)),
+            )
+        };
+        match ctx.timeout_secs(10).select(next.encode(send)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::debug!(error = ?err, "failed to encode sync message");
+                return;
+            }
+            Err(err) => {
+                tracing::debug!(error = ?err, "failed to send sync message");
+                return;
+            }
+        };
+        if next.double.is_none() {
+            return;
+        }
+    }
+}
+
+async fn gossip_initiate(
+    ctx: &Context,
+    consensus: &Consensus<Sink>,
+    conn: &quinn::Connection,
+) -> anyhow::Result<()> {
+    let (_, mut recv) = ctx.timeout_secs(10).select(conn.open_bi()).await??;
+    while let Ok(Ok(msg)) = ctx
+        .timeout_secs(10)
+        .select(Message::decode(&mut recv))
+        .await
+    {
+        if let Err(err) = consensus.on_message(msg) {
+            tracing::debug!(error = ?err, remote = ?conn.remote_address(), "failed to process gossip message");
+        }
+    }
+    Ok(())
+}
+
+async fn gossip_accept(ctx: &Context, router: &Router, mut send: quinn::SendStream) {
+    let mut msgs = router.register(send.id());
+    while let Ok(Some(msg)) = ctx.select(msgs.recv()).await {
+        match ctx.timeout_secs(10).select(msg.encode(&mut send)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::debug!(error = ?err,  "failed to send gossip message");
+                break;
+            }
+            Err(err) => {
+                tracing::debug!(error = ?err,  "failed to send gossip message");
+                break;
             }
         }
-        (Some(_), None) => Some(1.into()),
-        (None, Some(_)) => None,
-        (None, None) => None,
     }
+    router.remove(&send.id());
 }
 
 async fn loop_delay(ctx: &Context, interval: Duration, consensus: &Consensus<Sink>) {
@@ -362,12 +312,11 @@ async fn loop_actions_handler(
     }
 }
 
-async fn connect(
+async fn initiate(
     ctx: &Context,
     endpoint: &quinn::Endpoint,
     peer: SocketAddr,
     history: &Mutex<History>,
-    router: &Router,
     consensus: &Consensus<Sink>,
 ) -> anyhow::Result<()> {
     let conn = match endpoint.connect(peer, "localhost") {
@@ -376,7 +325,7 @@ async fn connect(
             anyhow::bail!("failed to connect to peer: {}", err);
         }
     };
-    let conn = match ctx.timeout_secs(1).select(conn).await {
+    let conn = match ctx.timeout_secs(10).select(conn).await {
         Ok(Ok(conn)) => conn,
         Ok(Err(err)) => {
             anyhow::bail!("establish connection: {}", err);
@@ -385,7 +334,9 @@ async fn connect(
             anyhow::bail!("task to establish connection: {}", err);
         }
     };
-    protocol(ctx, history, router, consensus, conn, true).await
+    sync_initiate(ctx, history, consensus, &conn).await?;
+    gossip_initiate(ctx, consensus, &conn).await?;
+    Ok(())
 }
 
 async fn loop_retriable_connect(
@@ -394,11 +345,10 @@ async fn loop_retriable_connect(
     reconnect_interval: Duration,
     endpoint: &quinn::Endpoint,
     history: &Mutex<History>,
-    router: &Router,
     consensus: &Consensus<Sink>,
 ) {
     loop {
-        if let Err(err) = connect(ctx, endpoint, peer, history, router, consensus).await {
+        if let Err(err) = initiate(ctx, endpoint, peer, history, consensus).await {
             tracing::warn!(error = ?err, "failed to connect to peer");
         }
         if let Err(_) = ctx.select(sleep(reconnect_interval)).await {
@@ -417,7 +367,7 @@ async fn accept(
     let mut s = unsafe { TokioScope::create(Default::default()) };
     while let Some(conn) = endpoint.accept().await {
         s.spawn(async {
-            let conn = match ctx.timeout(Duration::from_secs(1)).select(conn).await {
+            let conn = match ctx.timeout(Duration::from_secs(10)).select(conn).await {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(err)) => {
                     tracing::debug!(error = ?err, "failed to accept connection");
@@ -428,9 +378,12 @@ async fn accept(
                     return;
                 }
             };
-            if let Err(err) = protocol(ctx, history, router, consensus, conn, false).await {
-                tracing::warn!(error = ?err, "protocol failed");
+            let mut s = unsafe { TokioScope::create(Default::default()) };
+            while let Ok(Ok((send, mut recv))) = ctx.select(conn.open_bi()).await {
+                s.spawn(gossip_accept(ctx, router, send));
+                // s.spawn(sync_accept(ctx, history, &mut send, &mut recv));
             }
+            s.collect().await;
         });
     }
     s.collect().await;
@@ -497,7 +450,6 @@ impl Node {
                 Duration::from_secs(1),
                 &self.endpoint,
                 &self.history,
-                &self.router,
                 &self.consensus,
             ));
         }
