@@ -11,13 +11,16 @@ use hotstuff2::types::{
     Sync as SyncMsg, View, Vote, ID,
 };
 use parking_lot::Mutex;
-use quinn::StreamId;
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::select;
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
-use crate::codec::{AsyncDecode, AsyncEncode};
+use crate::codec::{AsyncDecode, AsyncEncode, Protocol};
+
+const GOSSIP_PROTOCOL: Protocol = Protocol::new(1);
+const SYNC_PROTOCOL: Protocol = Protocol::new(2);
 
 #[derive(Debug)]
 pub(crate) struct Sink(mpsc::UnboundedSender<Action>);
@@ -41,19 +44,9 @@ pub(crate) fn genesis() -> Certificate<Vote> {
     }
 }
 
-pub(crate) struct Config {
-    delay: Duration,
-    participants: Vec<PublicKey>,
-    keys: Vec<PrivateKey>,
-    genesis: Certificate<Vote>,
-    timeout: Duration,
-    connect: Vec<SocketAddr>,
-    listener: SocketAddr,
-}
-
 struct Router {
     per_channel_buffer_size: usize,
-    gossip: Mutex<HashMap<StreamId, mpsc::Sender<Arc<Message>>>>,
+    gossip: Mutex<HashMap<SocketAddr, mpsc::Sender<Arc<Message>>>>,
 }
 
 impl Router {
@@ -64,21 +57,17 @@ impl Router {
         }
     }
 
-    fn register(&self, addr: StreamId) -> mpsc::Receiver<Arc<Message>> {
+    fn register(&self, addr: SocketAddr) -> mpsc::Receiver<Arc<Message>> {
         let (sender, receiver) = mpsc::channel(self.per_channel_buffer_size);
         self.gossip.lock().insert(addr, sender);
         receiver
     }
 
-    fn remove(&self, addr: &StreamId) {
+    fn remove(&self, addr: &SocketAddr) {
         self.gossip.lock().remove(addr);
     }
 
     fn send_all(&self, msg: Message) {
-        self.gossip(msg)
-    }
-
-    fn gossip(&self, msg: Message) {
         self.gossip.lock().retain(|socket, sender| {
             if let Err(err) = sender.try_send(Arc::new(msg.clone())) {
                 tracing::debug!(error = ?err, "failed to send message to peer");
@@ -150,38 +139,40 @@ async fn sync_initiate(
     ctx: &Context,
     history: &Mutex<History>,
     consensus: &Consensus<Sink>,
-    conn: &quinn::Connection,
+    conn: &Connection,
 ) -> anyhow::Result<()> {
-    let (mut send, mut recv) = ctx.timeout_secs(10).select(conn.open_bi()).await??;
+    let mut stream = ctx
+        .timeout_secs(10)
+        .select(conn.open(SYNC_PROTOCOL.into()))
+        .await??;
     let state = {
         let history = history.lock();
         history.sync_state()
     };
-    match ctx.timeout_secs(10).select(state.encode(&mut send)).await {
+    match ctx
+        .timeout_secs(10)
+        .select(stream.send_msg(&Message::Sync(state)))
+        .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(err)) => return Err(err),
         Err(err) => return Err(err),
     }
-    while let Ok(Ok(msg)) = ctx
-        .timeout_secs(10)
-        .select(SyncMsg::decode(&mut recv))
-        .await
-    {
-        if let Err(err) = consensus.on_message(Message::Sync(msg)) {
-            tracing::debug!(error = ?err, remote = ?conn.remote_address(), "failed to process sync message");
+    while let Ok(Ok(msg)) = ctx.timeout_secs(10).select(stream.recv_msg()).await {
+        if let Err(err) = consensus.on_message(msg) {
+            tracing::debug!(error = ?err, remote = ?stream.remote(), "failed to process sync message");
         }
     }
     Ok(())
 }
 
-async fn sync_accept(
-    ctx: &Context,
-    history: &Mutex<History>,
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
-) {
-    let state = match ctx.timeout_secs(10).select(SyncMsg::decode(recv)).await {
-        Ok(Ok(state)) => state,
+async fn sync_accept(ctx: &Context, history: &Mutex<History>, mut stream: MsgStream) {
+    let state = match ctx.timeout_secs(10).select(stream.recv_msg()).await {
+        Ok(Ok(Message::Sync(state))) => state,
+        Ok(Ok(msg)) => {
+            tracing::debug!(message = ?msg, "unexpected message");
+            return;
+        }
         Ok(Err(err)) => {
             tracing::debug!(error = ?err, "failed to decode sync message");
             return;
@@ -191,7 +182,8 @@ async fn sync_accept(
             return;
         }
     };
-    loop {
+    let mut end = false;
+    while !end {
         let next = {
             let history = history.lock();
             history.get(
@@ -202,7 +194,12 @@ async fn sync_accept(
                     .unwrap_or(View(1)),
             )
         };
-        match ctx.timeout_secs(10).select(next.encode(send)).await {
+        end = next.double.is_none();
+        match ctx
+            .timeout_secs(10)
+            .select(stream.send_msg(&Message::Sync(next)))
+            .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 tracing::debug!(error = ?err, "failed to encode sync message");
@@ -213,34 +210,30 @@ async fn sync_accept(
                 return;
             }
         };
-        if next.double.is_none() {
-            return;
-        }
     }
 }
 
 async fn gossip_initiate(
     ctx: &Context,
     consensus: &Consensus<Sink>,
-    conn: &quinn::Connection,
+    conn: &Connection,
 ) -> anyhow::Result<()> {
-    let (_, mut recv) = ctx.timeout_secs(10).select(conn.open_bi()).await??;
-    while let Ok(Ok(msg)) = ctx
+    let mut stream = ctx
         .timeout_secs(10)
-        .select(Message::decode(&mut recv))
-        .await
-    {
+        .select(conn.open(GOSSIP_PROTOCOL.into()))
+        .await??;
+    while let Ok(Ok(msg)) = ctx.timeout_secs(10).select(stream.recv_msg()).await {
         if let Err(err) = consensus.on_message(msg) {
-            tracing::debug!(error = ?err, remote = ?conn.remote_address(), "failed to process gossip message");
+            tracing::debug!(error = ?err, remote = ?stream.remote(), "failed to process gossip message");
         }
     }
     Ok(())
 }
 
-async fn gossip_accept(ctx: &Context, router: &Router, mut send: quinn::SendStream) {
-    let mut msgs = router.register(send.id());
+async fn gossip_accept(ctx: &Context, router: &Router, mut stream: MsgStream) {
+    let mut msgs = router.register(stream.remote());
     while let Ok(Some(msg)) = ctx.select(msgs.recv()).await {
-        match ctx.timeout_secs(10).select(msg.encode(&mut send)).await {
+        match ctx.timeout_secs(10).select(stream.send_msg(&msg)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 tracing::debug!(error = ?err,  "failed to send gossip message");
@@ -252,10 +245,10 @@ async fn gossip_accept(ctx: &Context, router: &Router, mut send: quinn::SendStre
             }
         }
     }
-    router.remove(&send.id());
+    router.remove(&stream.remote());
 }
 
-async fn loop_delay(ctx: &Context, interval: Duration, consensus: &Consensus<Sink>) {
+async fn notify_delays(ctx: &Context, interval: Duration, consensus: &Consensus<Sink>) {
     loop {
         select! {
             _ = sleep(interval) => {
@@ -268,7 +261,7 @@ async fn loop_delay(ctx: &Context, interval: Duration, consensus: &Consensus<Sin
     }
 }
 
-async fn loop_actions_handler(
+async fn process_actions(
     ctx: &Context,
     history: &Mutex<History>,
     router: &Router,
@@ -295,9 +288,8 @@ async fn loop_actions_handler(
                         }
                     }
                     Some(Action::Propose) => {
-                        // here i can plug mempool
                         if let Err(err) = consensus.propose(ID::from_str("test block")) {
-                            tracing::error!(error = ?err, "failed to propose block");
+                            tracing::error!(error = ?err, "propose block");
                         }
                     }
                     None => {
@@ -326,7 +318,7 @@ async fn initiate(
         }
     };
     let conn = match ctx.timeout_secs(10).select(conn).await {
-        Ok(Ok(conn)) => conn,
+        Ok(Ok(conn)) => Connection(conn),
         Ok(Err(err)) => {
             anyhow::bail!("establish connection: {}", err);
         }
@@ -339,7 +331,7 @@ async fn initiate(
     Ok(())
 }
 
-async fn loop_retriable_connect(
+async fn loop_connect(
     ctx: &Context,
     peer: SocketAddr,
     reconnect_interval: Duration,
@@ -367,8 +359,8 @@ async fn accept(
     let mut s = unsafe { TokioScope::create(Default::default()) };
     while let Some(conn) = endpoint.accept().await {
         s.spawn(async {
-            let conn = match ctx.timeout(Duration::from_secs(10)).select(conn).await {
-                Ok(Ok(conn)) => conn,
+            let conn = match ctx.timeout_secs(10).select(conn).await {
+                Ok(Ok(conn)) => Connection(conn),
                 Ok(Err(err)) => {
                     tracing::debug!(error = ?err, "failed to accept connection");
                     return;
@@ -379,9 +371,18 @@ async fn accept(
                 }
             };
             let mut s = unsafe { TokioScope::create(Default::default()) };
-            while let Ok(Ok((send, mut recv))) = ctx.select(conn.open_bi()).await {
-                s.spawn(gossip_accept(ctx, router, send));
-                // s.spawn(sync_accept(ctx, history, &mut send, &mut recv));
+            while let Ok(Ok(stream)) = ctx.select(conn.accept()).await {
+                match stream.protocol() {
+                    GOSSIP_PROTOCOL => {
+                        s.spawn(gossip_accept(ctx, router, stream));
+                    }
+                    SYNC_PROTOCOL => {
+                        s.spawn(sync_accept(ctx, history, stream));
+                    }
+                    default => {
+                        tracing::debug!(protocol = ?default, "unknown protocol");
+                    }
+                }
             }
             s.collect().await;
         });
@@ -427,24 +428,22 @@ impl Node {
     }
 
     pub async fn run(&mut self, ctx: Context) {
-        // TODO it will be better to get rid of scope and stuff Arc everywhere
+        // TODO it will be better to get rid of scope
         let mut s = unsafe { TokioScope::create(Default::default()) };
-        s.spawn(loop_delay(
+        s.spawn(notify_delays(
             &ctx,
             Duration::from_millis(100),
             &self.consensus,
         ));
-        s.spawn(loop_actions_handler(
+        s.spawn(process_actions(
             &ctx,
             &self.history,
             &self.router,
             &self.consensus,
             &mut self.receiver,
         ));
-        // TODO in accept and connect compare public keys identities
-        // public key with a lower value will be responsible for establishing a connection
         for peer in &self.peers {
-            s.spawn(loop_retriable_connect(
+            s.spawn(loop_connect(
                 &ctx,
                 *peer,
                 Duration::from_secs(1),
@@ -528,5 +527,57 @@ impl<'a> Timeout<'a> {
                 Ok(res)
             }
         }
+    }
+}
+
+struct Connection(quinn::Connection);
+
+impl Connection {
+    async fn open(&self, proto: Protocol) -> anyhow::Result<MsgStream> {
+        let (mut send, recv) = self.0.open_bi().await?;
+        proto.encode(&mut send).await?;
+        Ok(MsgStream {
+            protocol: proto,
+            remote: self.0.remote_address(),
+            send: BufWriter::new(send),
+            recv: BufReader::new(recv),
+        })
+    }
+
+    async fn accept(&self) -> anyhow::Result<MsgStream> {
+        let (send, mut recv) = self.0.accept_bi().await?;
+        let proto = Protocol::decode(&mut recv).await?;
+        Ok(MsgStream {
+            protocol: proto,
+            remote: self.0.remote_address(),
+            send: BufWriter::new(send),
+            recv: BufReader::new(recv),
+        })
+    }
+}
+
+struct MsgStream {
+    protocol: Protocol,
+    remote: SocketAddr,
+    send: BufWriter<quinn::SendStream>,
+    recv: BufReader<quinn::RecvStream>,
+}
+
+impl MsgStream {
+    fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
+    fn remote(&self) -> SocketAddr {
+        self.remote
+    }
+
+    async fn send_msg(&mut self, msg: &Message) -> anyhow::Result<()> {
+        msg.encode(&mut self.send).await?;
+        self.send.flush().await.map_err(|err| anyhow::anyhow!(err))
+    }
+
+    async fn recv_msg(&mut self) -> anyhow::Result<Message> {
+        Message::decode(&mut self.recv).await
     }
 }

@@ -293,3 +293,28 @@ impl AsyncDecode for Message {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Protocol(u16);
+
+impl Protocol {
+    pub(crate) const fn new(v: u16) -> Self {
+        Protocol(v)
+    }
+}
+
+#[async_trait]
+impl AsyncEncode for Protocol {
+    async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
+        w.write_u16(self.0).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AsyncDecode for Protocol {
+    async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self> {
+        let v = r.read_u16().await?;
+        Ok(Protocol(v))
+    }
+}
