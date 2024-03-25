@@ -56,6 +56,18 @@ pub enum Action {
     Propose,
 }
 
+pub trait OnMessage {
+    fn on_message(&self, message: Message) -> Result<()>;
+}
+
+pub trait OnDelay {
+    fn on_delay(&self);
+}
+
+pub trait Proposer {
+    fn propose(&self, block: ID) -> Result<()>;
+}
+
 pub trait Actions: Debug {
     fn send(&self, action: Action);
 }
@@ -121,79 +133,6 @@ impl<T: Actions> Consensus<T> {
         self.keys.get(&leader).is_some()
     }
 
-    pub fn on_delay(&self) {
-        let rst = {
-            let mut state = self.state.lock();
-            state.ticks += 1;
-            if state.ticks == TIMEOUT {
-                state.ticks = 0;
-                if state.is_epoch_boundary(self.participants.atleast_one_honest() as u64) {
-                    (
-                        None,
-                        Some(Wish {
-                            view: state.view + 1,
-                        }),
-                    )
-                } else {
-                    let next = state.view + 1;
-                    state.enter_view(next);
-                    state.wait_first_delay(next);
-                    self.actions.send(Action::Send(Message::Sync(Sync {
-                        locked: Some(state.locked.clone()),
-                        double: Some(state.double.clone()),
-                    })));
-                    (None, None)
-                }
-            } else if state.ticks == DELAY
-                && state.is_waiting(state.view)
-                && self.is_leader(state.view)
-            {
-                state.reset_delay();
-                // unlike in the paper, i want to obtain double certificate on every block.
-                // therefore i extend locked if it is equal to double, otherwise i retry locked block.
-                if state.locked.inner != state.double.inner {
-                    (
-                        Some(Propose {
-                            view: state.view,
-                            block: state.locked.inner.block.clone(),
-                            locked: state.locked.clone(),
-                            double: state.double.clone(),
-                        }),
-                        None,
-                    )
-                } else {
-                    state.proposal = Some(Propose {
-                        view: state.view,
-                        block: Block {
-                            height: state.double.inner.block.height + 1,
-                            id: ID::default(), // will be overwritten in propose method
-                        },
-                        locked: state.locked.clone(),
-                        double: state.double.clone(),
-                    });
-                    self.actions.send(Action::Propose);
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            }
-        };
-        match rst {
-            (Some(proposal), None) => self.send_proposal(proposal),
-            (None, Some(wish)) => {
-                for (signer, pk) in self.keys.iter() {
-                    let signature = pk.sign(Domain::Wish, &wish.to_bytes());
-                    self.actions.send(Action::Send(Message::Wish(Signed {
-                        inner: wish.clone(),
-                        signer: *signer,
-                        signature,
-                    })));
-                }
-            }
-            _ => (),
-        }
-    }
-
     fn send_proposal(&self, proposal: Propose) {
         let signer = self.participants.leader(proposal.view);
         let pk = self
@@ -206,28 +145,6 @@ impl<T: Actions> Consensus<T> {
             signer: signer,
             signature,
         })));
-    }
-
-    pub fn propose(&self, id: ID) -> Result<()> {
-        let proposal = {
-            let mut proposal = self.state.lock().take_proposal()?;
-            proposal.block.id = id;
-            Ok(proposal)
-        }?;
-        self.send_proposal(proposal);
-        Ok(())
-    }
-
-    pub fn on_message(&self, message: Message) -> Result<()> {
-        match message {
-            Message::Sync(sync) => self.on_sync(sync),
-            Message::Prepare(prepare) => self.on_prepare(prepare),
-            Message::Vote(vote) => self.on_vote(vote),
-            Message::Propose(propose) => self.on_propose(propose),
-            Message::Vote2(vote) => self.on_vote2(vote),
-            Message::Wish(wish) => self.on_wish(wish),
-            Message::Timeout(timeout) => self.on_timeout(timeout),
-        }
     }
 
     fn on_sync(&self, sync: Sync) -> Result<()> {
@@ -631,6 +548,107 @@ impl<T: Actions> Consensus<T> {
             });
             self.actions.send(Action::Propose);
         }
+        Ok(())
+    }
+}
+
+impl<T: Actions> OnDelay for Consensus<T> {
+    fn on_delay(&self) {
+        let rst = {
+            let mut state = self.state.lock();
+            state.ticks += 1;
+            if state.ticks == TIMEOUT {
+                state.ticks = 0;
+                if state.is_epoch_boundary(self.participants.atleast_one_honest() as u64) {
+                    (
+                        None,
+                        Some(Wish {
+                            view: state.view + 1,
+                        }),
+                    )
+                } else {
+                    let next = state.view + 1;
+                    state.enter_view(next);
+                    state.wait_first_delay(next);
+                    self.actions.send(Action::Send(Message::Sync(Sync {
+                        locked: Some(state.locked.clone()),
+                        double: Some(state.double.clone()),
+                    })));
+                    (None, None)
+                }
+            } else if state.ticks == DELAY
+                && state.is_waiting(state.view)
+                && self.is_leader(state.view)
+            {
+                state.reset_delay();
+                // unlike in the paper, i want to obtain double certificate on every block.
+                // therefore i extend locked if it is equal to double, otherwise i retry locked block.
+                if state.locked.inner != state.double.inner {
+                    (
+                        Some(Propose {
+                            view: state.view,
+                            block: state.locked.inner.block.clone(),
+                            locked: state.locked.clone(),
+                            double: state.double.clone(),
+                        }),
+                        None,
+                    )
+                } else {
+                    state.proposal = Some(Propose {
+                        view: state.view,
+                        block: Block {
+                            height: state.double.inner.block.height + 1,
+                            id: ID::default(), // will be overwritten in propose method
+                        },
+                        locked: state.locked.clone(),
+                        double: state.double.clone(),
+                    });
+                    self.actions.send(Action::Propose);
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        };
+        match rst {
+            (Some(proposal), None) => self.send_proposal(proposal),
+            (None, Some(wish)) => {
+                for (signer, pk) in self.keys.iter() {
+                    let signature = pk.sign(Domain::Wish, &wish.to_bytes());
+                    self.actions.send(Action::Send(Message::Wish(Signed {
+                        inner: wish.clone(),
+                        signer: *signer,
+                        signature,
+                    })));
+                }
+            }
+            _ => (),
+        }
+    }
+}
+
+impl<T: Actions> OnMessage for Consensus<T> {
+    fn on_message(&self, message: Message) -> Result<()> {
+        match message {
+            Message::Sync(sync) => self.on_sync(sync),
+            Message::Prepare(prepare) => self.on_prepare(prepare),
+            Message::Vote(vote) => self.on_vote(vote),
+            Message::Propose(propose) => self.on_propose(propose),
+            Message::Vote2(vote) => self.on_vote2(vote),
+            Message::Wish(wish) => self.on_wish(wish),
+            Message::Timeout(timeout) => self.on_timeout(timeout),
+        }
+    }
+}
+
+impl<T: Actions> Proposer for Consensus<T> {
+    fn propose(&self, id: ID) -> Result<()> {
+        let proposal = {
+            let mut proposal = self.state.lock().take_proposal()?;
+            proposal.block.id = id;
+            Ok(proposal)
+        }?;
+        self.send_proposal(proposal);
         Ok(())
     }
 }

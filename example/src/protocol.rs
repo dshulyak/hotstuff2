@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use bit_vec::BitVec;
-use hotstuff2::sequential::{Action, Actions, Consensus};
+use hotstuff2::sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer};
 use hotstuff2::types::{AggregateSignature, Block, Certificate, Message, View, Vote, ID};
 use parking_lot::Mutex;
 use tokio::select;
-use tokio::sync::mpsc::{self};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 use crate::codec::Protocol;
@@ -50,7 +50,7 @@ pub(crate) fn genesis() -> Certificate<Vote> {
 pub(crate) async fn sync_initiate(
     ctx: &Context,
     history: &Mutex<History>,
-    consensus: &Consensus<TokioSink>,
+    consensus: &impl OnMessage,
     mut stream: MsgStream,
 ) -> anyhow::Result<()> {
     let state = {
@@ -123,7 +123,7 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &Mutex<History>, mut str
 
 pub(crate) async fn gossip_initiate(
     ctx: &Context,
-    consensus: &Consensus<TokioSink>,
+    consensus: &impl OnMessage,
     mut stream: MsgStream,
 ) -> anyhow::Result<()> {
     while let Ok(Ok(msg)) = ctx.timeout_secs(10).select(stream.recv_msg()).await {
@@ -160,11 +160,7 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
     router.remove(&stream.remote());
 }
 
-pub(crate) async fn notify_delays(
-    ctx: &Context,
-    interval: Duration,
-    consensus: &Consensus<TokioSink>,
-) {
+pub(crate) async fn notify_delays(ctx: &Context, interval: Duration, consensus: &impl OnDelay) {
     loop {
         select! {
             _ = sleep(interval) => {
@@ -181,7 +177,7 @@ pub(crate) async fn process_actions(
     ctx: &Context,
     history: &Mutex<History>,
     router: &Router,
-    consensus: &Consensus<TokioSink>,
+    consensus: &impl Proposer,
     receiver: &mut mpsc::UnboundedReceiver<Action>,
 ) {
     loop {

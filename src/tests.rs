@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::sequential::{self as seq, Actions, StateChange};
+use crate::sequential::{self as seq, Actions, OnDelay, OnMessage, Proposer, StateChange};
 use crate::types::*;
 
 use bit_vec::BitVec;
