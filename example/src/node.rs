@@ -98,10 +98,10 @@ async fn accept(
             let mut s = unsafe { TokioScope::create(Default::default()) };
             while let Ok(Ok(stream)) = ctx.select(conn.accept()).await {
                 match stream.protocol() {
-                    GOSSIP_PROTOCOL => {
+                    protocol::GOSSIP_PROTOCOL => {
                         s.spawn(protocol::gossip_accept(ctx, router, stream));
                     }
-                    SYNC_PROTOCOL => {
+                    protocol::SYNC_PROTOCOL => {
                         s.spawn(protocol::sync_accept(ctx, history, stream));
                     }
                     default => {
