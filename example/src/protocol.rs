@@ -6,7 +6,7 @@ use hotstuff2::types::{AggregateSignature, Block, Certificate, Message, View, Vo
 use parking_lot::Mutex;
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{interval, sleep};
 
 use crate::codec::Protocol;
 use crate::context::Context;
@@ -160,10 +160,15 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
     router.remove(&stream.remote());
 }
 
-pub(crate) async fn notify_delays(ctx: &Context, interval: Duration, consensus: &impl OnDelay) {
+pub(crate) async fn notify_delays(
+    ctx: &Context,
+    network_delay: Duration,
+    consensus: &impl OnDelay,
+) {
+    let mut interval = interval(network_delay);
     loop {
         select! {
-            _ = sleep(interval) => {
+            _ = interval.tick() => {
                 consensus.on_delay();
             },
             _ = ctx.cancelled() => {
