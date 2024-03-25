@@ -196,16 +196,12 @@ pub(crate) async fn process_actions(
                 router.send_all(msg);
             }
             Action::StateChange(change) => {
-                let mut history = history.lock();
-                if let Some(commit) = change.commit {
-                    history.commits.insert(commit.view, commit);
-                }
-                if let Some(locked) = change.lock {
-                    history.locked = Some(locked);
-                }
-                if let Some(voted) = change.voted {
-                    history.voted = voted;
-                }
+                if let Err(err) = history
+                    .lock()
+                    .update(change.voted, change.lock, change.commit)
+                {
+                    tracing::error!(error = ?err, "state change");
+                };
             }
             Action::Propose => {
                 if let Err(err) = consensus.propose(ID::from_str("test block")) {

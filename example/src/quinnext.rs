@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use hotstuff2::types::Message;
-use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
 use crate::codec::{AsyncDecode, AsyncEncode, Protocol};
 
@@ -18,8 +18,8 @@ impl Connection {
         Ok(MsgStream {
             protocol: proto,
             remote: self.0.remote_address(),
-            send: BufWriter::new(send),
-            recv: BufReader::new(recv),
+            send: BufWriter::new(Box::new(send)),
+            recv: BufReader::new(Box::new(recv)),
         })
     }
 
@@ -29,8 +29,8 @@ impl Connection {
         Ok(MsgStream {
             protocol: proto,
             remote: self.0.remote_address(),
-            send: BufWriter::new(send),
-            recv: BufReader::new(recv),
+            send: BufWriter::new(Box::new(send)),
+            recv: BufReader::new(Box::new(recv)),
         })
     }
 }
@@ -38,16 +38,16 @@ impl Connection {
 pub(crate) struct MsgStream {
     protocol: Protocol,
     remote: SocketAddr,
-    send: BufWriter<quinn::SendStream>,
-    recv: BufReader<quinn::RecvStream>,
+    send: BufWriter<Box<dyn AsyncWrite + Unpin + Send>>,
+    recv: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
 }
 
 impl MsgStream {
     pub(crate) fn new(
         protocol: Protocol,
         remote: SocketAddr,
-        send: quinn::SendStream,
-        recv: quinn::RecvStream,
+        send: Box<dyn AsyncWrite + Unpin + Send>,
+        recv: Box<dyn AsyncRead + Unpin + Send>,
     ) -> Self {
         Self {
             protocol,

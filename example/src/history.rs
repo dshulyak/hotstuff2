@@ -57,4 +57,22 @@ impl History {
             }
         }
     }
+
+    pub(crate) fn update(
+        &mut self,
+        voted: Option<View>,
+        locked: Option<Certificate<Vote>>,
+        commit: Option<Certificate<Vote>>,
+    ) -> anyhow::Result<()> {
+        if let Some(voted) = voted {
+            self.voted = voted;
+        }
+        if let Some(locked) = locked {
+            self.locked = Some(locked);
+        }
+        if let Some(commit) = commit {
+            self.commits.insert(commit.inner.view, commit);
+        }
+        Ok(())
+    }
 }
