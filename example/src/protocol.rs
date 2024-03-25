@@ -6,7 +6,7 @@ use hotstuff2::types::{AggregateSignature, Block, Certificate, Message, View, Vo
 use parking_lot::Mutex;
 use tokio::select;
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep};
+use tokio::time::{interval, interval_at, sleep, timeout, Instant};
 
 use crate::codec::Protocol;
 use crate::context::Context;
@@ -165,10 +165,15 @@ pub(crate) async fn notify_delays(
     network_delay: Duration,
     consensus: &impl OnDelay,
 ) {
+    tracing::info!(delay = ?network_delay, "network delay notifications");
+    let start = Instant::now();
     let mut interval = interval(network_delay);
+    // it probably doesn't matter, but makes more sense not to fire immediately
+    interval.tick().await;
     loop {
         select! {
-            _ = interval.tick() => {
+            instant = interval.tick() => {
+                tracing::debug!(elapsed = ?start.elapsed(), "tick on network delay");
                 consensus.on_delay();
             },
             _ = ctx.cancelled() => {
@@ -185,38 +190,96 @@ pub(crate) async fn process_actions(
     consensus: &impl Proposer,
     receiver: &mut mpsc::UnboundedReceiver<Action>,
 ) {
-    loop {
-        select! {
-            action = receiver.recv() => {
-                match action {
-                    Some(Action::Send(msg)) => {
-                        router.send_all(msg);
-                    }
-                    Some(Action::StateChange(change)) => {
-                        let mut history = history.lock();
-                        if let Some(commit) = change.commit {
-                            history.commits.insert(commit.view, commit);
-                        }
-                        if let Some(locked) = change.lock {
-                            history.locked = Some(locked);
-                        }
-                        if let Some(voted) = change.voted {
-                            history.voted = voted;
-                        }
-                    }
-                    Some(Action::Propose) => {
-                        if let Err(err) = consensus.propose(ID::from_str("test block")) {
-                            tracing::error!(error = ?err, "propose block");
-                        }
-                    }
-                    None => {
-                        return;
-                    }
+    while let Ok(Some(action)) = ctx.select(receiver.recv()).await {
+        match action {
+            Action::Send(msg) => {
+                router.send_all(msg);
+            }
+            Action::StateChange(change) => {
+                let mut history = history.lock();
+                if let Some(commit) = change.commit {
+                    history.commits.insert(commit.view, commit);
                 }
-            },
-            _ = ctx.cancelled() => {
-                return;
-            },
+                if let Some(locked) = change.lock {
+                    history.locked = Some(locked);
+                }
+                if let Some(voted) = change.voted {
+                    history.voted = voted;
+                }
+            }
+            Action::Propose => {
+                if let Err(err) = consensus.propose(ID::from_str("test block")) {
+                    tracing::error!(error = ?err, "propose block");
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::{
+        spawn,
+        time::{self, timeout},
+    };
+
+    use super::*;
+
+    fn init_tracing() {
+        let rst = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        assert!(rst.is_ok());
+    }
+
+    struct Counter {
+        delays: AtomicUsize,
+        msgs: AtomicUsize,
+        propose: AtomicUsize,
+    }
+
+    impl Counter {
+        fn new() -> Self {
+            Self {
+                delays: AtomicUsize::new(0),
+                msgs: AtomicUsize::new(0),
+                propose: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl OnDelay for Counter {
+        fn on_delay(&self) {
+            self.delays.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl OnMessage for Counter {
+        fn on_message(&self, _: Message) -> anyhow::Result<()> {
+            self.msgs.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    impl Proposer for Counter {
+        fn propose(&self, _: ID) -> anyhow::Result<()> {
+            self.propose.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notify_delays() {
+        init_tracing();
+        time::pause();
+        let cnt = Counter::new();
+        let _ = timeout(
+            Duration::from_secs(10),
+            notify_delays(&Context::new(), Duration::from_secs(1), &cnt),
+        )
+        .await;
+        assert_eq!(cnt.delays.load(Ordering::Relaxed), 10);
     }
 }
