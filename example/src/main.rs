@@ -10,10 +10,9 @@ use rcgen;
 mod codec;
 mod context;
 mod history;
+mod net;
 mod node;
 mod protocol;
-mod quinnext;
-mod router;
 
 #[derive(Debug, Parser)]
 #[clap(name = "example")]

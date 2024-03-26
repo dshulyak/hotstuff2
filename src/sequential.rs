@@ -669,8 +669,8 @@ struct State {
     votes: BTreeMap<(View, Block), Votes<Vote>>,
     votes2: BTreeMap<(View, Block), Votes<Certificate<Vote>>>,
     timeouts: BTreeMap<View, Votes<Wish>>,
-    // after leader is ready to send a proposal it emulates asynchronous upcall
-    // and waits for a identifier of the payload
+    // after leader is ready to send a proposal it notifies caller to produce a block without blocking state machine.
+    // once block is ready the identifier is passed to `propose` method
     proposal: Option<Propose>,
 
     ticks: u8,

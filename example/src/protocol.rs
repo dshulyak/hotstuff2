@@ -11,8 +11,7 @@ use tokio::time::{interval, interval_at, sleep, timeout, Instant};
 use crate::codec::Protocol;
 use crate::context::Context;
 use crate::history::History;
-use crate::quinnext::MsgStream;
-use crate::router::Router;
+use crate::net::{MsgStream, Router};
 
 pub(crate) const GOSSIP_PROTOCOL: Protocol = Protocol::new(1);
 pub(crate) const SYNC_PROTOCOL: Protocol = Protocol::new(2);

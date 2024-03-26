@@ -11,9 +11,8 @@ use tokio::time::sleep;
 
 use crate::context::Context;
 use crate::history::History;
+use crate::net::{Connection, Router};
 use crate::protocol::{self, TokioConsensus, TokioSink};
-use crate::quinnext::Connection;
-use crate::router::Router;
 
 async fn initiate(
     ctx: &Context,
@@ -131,14 +130,18 @@ impl Node {
         peers: Vec<SocketAddr>,
         endpoint: quinn::Endpoint,
     ) -> anyhow::Result<Self> {
-        let history = History::new();
+        let mut history = History::new();
+        if history.empty() {
+            let genesis = protocol::genesis();
+            history.update(None, Some(genesis.clone()), Some(genesis))?
+        }
         let (sender, receiver) = unbounded_channel();
         let consensus = TokioConsensus::new(
             history.last_view(),
             participants,
             history.lock(),
             history.last_commit(),
-            history.voted,
+            history.voted(),
             &keys,
             TokioSink::new(sender),
         );

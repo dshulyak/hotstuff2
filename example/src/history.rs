@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use hotstuff2::types::{Certificate, Sync as SyncMsg, View, Vote};
 
 pub(crate) struct History {
-    pub(crate) voted: View,
-    pub(crate) locked: Option<Certificate<Vote>>,
-    pub(crate) commits: BTreeMap<View, Certificate<Vote>>,
+    voted: View,
+    locked: Option<Certificate<Vote>>,
+    commits: BTreeMap<View, Certificate<Vote>>,
 }
 
 impl History {
@@ -15,6 +15,14 @@ impl History {
             locked: None,
             commits: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn voted(&self) -> View {
+        self.voted
+    }
+
+    pub(crate) fn empty(&self) -> bool {
+        self.locked.is_none() && self.commits.is_empty()
     }
 
     pub(crate) fn last_view(&self) -> View {
