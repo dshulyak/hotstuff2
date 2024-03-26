@@ -1,12 +1,12 @@
-use crate::sync::Mutex;
-use crate::types::*;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Debug;
+use std::ops::Index;
 
 use anyhow::{anyhow, ensure, Ok, Result};
 use bit_vec::BitVec;
 
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::Debug;
-use std::ops::Index;
+use crate::sync::Mutex;
+use crate::types::*;
 
 // reset timers. single tick should be sufficient to finish consensus round.
 // - wait delay for leader to receive sync messages. during this delay leader needs to delive timeout certificate
