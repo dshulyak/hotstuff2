@@ -5,16 +5,28 @@ use hotstuff2::types::{
     Block, Certificate, Message, Prepare, Propose, Signature, Signed, Sync as SyncMsg, Timeout,
     ToBytes, View, Vote, Wish, SIGNATURE_SIZE,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 
 #[async_trait]
 pub(crate) trait AsyncEncode {
     async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()>;
+
+    async fn encode_to_bytes(&self) -> Result<Box<[u8]>> {
+        let mut buf = Vec::new();
+        let mut bw = BufWriter::new(&mut buf);
+        self.encode(&mut bw).await?;
+        bw.flush().await?;
+        Ok(buf.into())
+    }
 }
 
 #[async_trait]
 pub(crate) trait AsyncDecode: Sized {
     async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self>;
+
+    async fn decode_from_bytes(buf: &[u8]) -> Result<Self> {
+        Self::decode(&mut &buf[..]).await
+    }
 }
 
 #[async_trait]

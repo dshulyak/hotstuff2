@@ -52,18 +52,19 @@ impl History {
     }
 
     pub(crate) fn get(&self, view: View) -> SyncMsg {
-        let commit = self.commits.get(&view).cloned();
-        if commit.is_none() {
-            return SyncMsg {
-                locked: self.locked.clone(),
-                double: None,
-            };
-        } else {
-            SyncMsg {
-                locked: None,
-                double: commit,
+        let double = self.commits.get(&view).cloned();
+        let locked = {
+            if let Some(locked) = &self.locked {
+                if locked.inner.view > view {
+                    Some(locked.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-        }
+        };
+        SyncMsg { locked, double }
     }
 
     pub(crate) fn update(

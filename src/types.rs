@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use bit_vec::BitVec;
 use blst::min_pk as blst;
+use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, AddAssign, Deref, Rem};
 
@@ -167,6 +168,12 @@ impl ToBytes for Wish {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct View(pub u64);
+
+impl Display for View {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl ToBytes for View {
     fn to_bytes(&self) -> Vec<u8> {

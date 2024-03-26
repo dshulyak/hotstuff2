@@ -81,27 +81,33 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &Mutex<History>, mut str
             return;
         }
         Ok(Err(err)) => {
-            tracing::debug!(error = ?err, "failed to decode sync message");
+            tracing::debug!(error = ?err, "decode sync message");
             return;
         }
         Err(err) => {
-            tracing::debug!(error = ?err, "failed to receive sync message");
+            tracing::debug!(error = ?err, "receive sync message");
             return;
         }
     };
-    let mut end = false;
-    while !end {
-        let next = {
-            let history = history.lock();
-            history.get(
-                state
-                    .locked
-                    .as_ref()
-                    .map(|v| v.inner.view)
-                    .unwrap_or(View(1)),
-            )
-        };
-        end = next.double.is_none();
+    let mut last_known = state
+        .locked
+        .as_ref()
+        .map(|v| v.inner.view)
+        .unwrap_or(View(1));
+    last_known = last_known.max(
+        state
+            .double
+            .as_ref()
+            .map(|v| v.inner.view + 1)
+            .unwrap_or(View(1)),
+    );
+    tracing::debug!(from_view = %last_known, remote = %stream.remote(), "requested sync");
+    for last in last_known.0.. {
+        let next = history.lock().get(last.into());
+        if next.locked.is_none() && next.double.is_none() {
+            tracing::debug!(last = %last, remote = %stream.remote(), "nothing to sync. exiting sync protocol");
+            break;
+        }
         match ctx
             .timeout_secs(10)
             .select(stream.send_msg(&Message::Sync(next)))
@@ -213,12 +219,20 @@ pub(crate) async fn process_actions(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        net::SocketAddr,
+        str::FromStr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
+    use parking_lot::lock_api::Mutex;
     use tokio::{
         spawn,
         time::{self, timeout},
     };
+    use tokio_test::io::Builder;
+
+    use crate::codec::{AsyncDecode, AsyncEncode};
 
     use super::*;
 
@@ -265,6 +279,10 @@ mod tests {
         }
     }
 
+    fn sock(addr: &str) -> SocketAddr {
+        SocketAddr::from_str(addr).unwrap()
+    }
+
     #[tokio::test]
     async fn test_notify_delays() {
         init_tracing();
@@ -276,5 +294,31 @@ mod tests {
         )
         .await;
         assert_eq!(cnt.delays.load(Ordering::Relaxed), 10);
+    }
+
+    #[tokio::test]
+    async fn test_sync_accept_noop() {
+        init_tracing();
+
+        let ctx = Context::new();
+        let mut history = History::new();
+        history.update(None, None, Some(genesis()));
+
+        let msg = Message::Sync(history.sync_state());
+        let mut reader = Builder::new();
+        let encoded = msg.encode_to_bytes().await.unwrap();
+        let decoded = Message::decode_from_bytes(&encoded).await.unwrap();
+        assert_eq!(msg, decoded);
+        reader.read(&msg.encode_to_bytes().await.unwrap());
+        let mut writer = Builder::new();
+
+        let stream = MsgStream::new(
+            SYNC_PROTOCOL,
+            sock("127.0.0.1:3333"),
+            Box::new(writer.build()),
+            Box::new(reader.build()),
+        );
+
+        sync_accept(&ctx, &Mutex::new(history), stream).await
     }
 }
