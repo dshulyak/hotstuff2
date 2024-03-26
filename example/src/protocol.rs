@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use anyhow::anyhow;
 use bit_vec::BitVec;
 use hotstuff2::sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer};
 use hotstuff2::types::{AggregateSignature, Block, Certificate, Message, View, Vote, ID};
@@ -62,12 +63,30 @@ pub(crate) async fn sync_initiate(
         .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(err),
-        Err(err) => return Err(err),
+        Ok(Err(err)) => anyhow::bail!("encode sync message: {}", err),
+        Err(err) => anyhow::bail!("task to sync message: {}", err),
     }
-    while let Ok(Ok(msg)) = ctx.timeout_secs(10).select(stream.recv_msg()).await {
-        if let Err(err) = consensus.on_message(msg) {
-            tracing::debug!(error = ?err, remote = ?stream.remote(), "failed to process sync message");
+    loop {
+        match ctx.timeout_secs(10).select(stream.recv_msg()).await {
+            Ok(Ok(Message::Sync(state))) => {
+                if let Err(err) = consensus.on_message(Message::Sync(state)) {
+                    tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process sync message");
+                }
+            }
+            Ok(Ok(msg)) => {
+                anyhow::bail!("unexpected message type");
+            }
+            Ok(Err(err)) => {
+                // TODO i need to check that we are on the message boundary
+                if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    tracing::debug!(remote = ?stream.remote(), "read stream closed");
+                    break;
+                }
+                anyhow::bail!("decode sync message: {}", err);
+            }
+            Err(err) => {
+                anyhow::bail!("receive sync message: {}", err);
+            }
         }
     }
     Ok(())
@@ -225,16 +244,28 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
+    use hotstuff2::types::{Sync as SyncMsg, ToBytes};
     use parking_lot::lock_api::Mutex;
     use tokio::{
         spawn,
         time::{self, timeout},
     };
-    use tokio_test::io::Builder;
+    use tokio_test::{assert_ok, io::Builder};
 
     use crate::codec::{AsyncDecode, AsyncEncode};
 
     use super::*;
+
+    fn cert_from_view(view: View) -> Certificate<Vote> {
+        Certificate {
+            inner: Vote {
+                view: view,
+                block: Block::new(0, ID::from_str(&view.to_string())),
+            },
+            signature: AggregateSignature::empty(),
+            signers: BitVec::new(),
+        }
+    }
 
     fn init_tracing() {
         let rst = tracing_subscriber::fmt()
@@ -306,9 +337,6 @@ mod tests {
 
         let msg = Message::Sync(history.sync_state());
         let mut reader = Builder::new();
-        let encoded = msg.encode_to_bytes().await.unwrap();
-        let decoded = Message::decode_from_bytes(&encoded).await.unwrap();
-        assert_eq!(msg, decoded);
         reader.read(&msg.encode_to_bytes().await.unwrap());
         let mut writer = Builder::new();
 
@@ -320,5 +348,51 @@ mod tests {
         );
 
         sync_accept(&ctx, &Mutex::new(history), stream).await
+    }
+
+    #[tokio::test]
+    async fn test_sync_init() {
+        init_tracing();
+
+        let ctx = Context::new();
+        let mut history = History::new();
+        history.update(None, None, Some(genesis()));
+        let cnt = Counter::new();
+
+        let mut reader = Builder::new();
+        reader.read(
+            &Message::Sync(SyncMsg {
+                locked: None,
+                double: Some(cert_from_view(1.into())),
+            })
+            .encode_to_bytes()
+            .await
+            .unwrap(),
+        );
+        reader.read(
+            &Message::Sync(SyncMsg {
+                locked: None,
+                double: Some(cert_from_view(2.into())),
+            })
+            .encode_to_bytes()
+            .await
+            .unwrap(),
+        );
+        let mut writer = Builder::new();
+        writer.write(
+            &Message::Sync(history.sync_state())
+                .encode_to_bytes()
+                .await
+                .unwrap(),
+        );
+
+        let stream = MsgStream::new(
+            SYNC_PROTOCOL,
+            sock("127.0.0.1:3333"),
+            Box::new(writer.build()),
+            Box::new(reader.build()),
+        );
+        assert_ok!(sync_initiate(&ctx, &Mutex::new(history), &cnt, stream).await);
+        assert_eq!(cnt.msgs.load(Ordering::Relaxed), 2);
     }
 }

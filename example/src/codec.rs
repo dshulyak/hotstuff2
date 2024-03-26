@@ -1,11 +1,10 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use bit_vec::BitVec;
 use hotstuff2::types::{
     Block, Certificate, Message, Prepare, Propose, Signature, Signed, Sync as SyncMsg, Timeout,
     ToBytes, View, Vote, Wish, SIGNATURE_SIZE,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter, Error, ErrorKind, Result};
 
 #[async_trait]
 pub(crate) trait AsyncEncode {
@@ -105,7 +104,8 @@ impl<T: AsyncDecode + ToBytes + Send> AsyncDecode for Signed<T> {
         Ok(Signed {
             inner,
             signer,
-            signature: Signature::from_bytes(&signature)?,
+            signature: Signature::from_bytes(&signature)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "failed to parse signature"))?,
         })
     }
 }
@@ -150,7 +150,9 @@ impl<T: AsyncDecode + ToBytes + Send> AsyncDecode for Certificate<T> {
         r.read_exact(&mut signers).await?;
         Ok(Certificate {
             inner,
-            signature: Signature::from_bytes(&signature)?.into(),
+            signature: Signature::from_bytes(&signature)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "failed to parse signature"))?
+                .into(),
             signers: BitVec::from_bytes(&signers),
         })
     }
@@ -240,12 +242,22 @@ impl AsyncDecode for SyncMsg {
         let locked = match r.read_u8().await? {
             0 => None,
             1 => Some(Certificate::decode(r).await?),
-            tag => anyhow::bail!("invalid tag for locked {}", tag),
+            tag => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid tag for locked {}", tag),
+                ));
+            }
         };
         let double = match r.read_u8().await? {
             0 => None,
             1 => Some(Certificate::decode(r).await?),
-            tag => anyhow::bail!("invalid tag for double {}", tag),
+            tag => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid tag for double {}", tag),
+                ));
+            }
         };
         Ok(SyncMsg { locked, double })
     }
@@ -301,7 +313,12 @@ impl AsyncDecode for Message {
             4 => Ok(Message::Wish(Signed::<Wish>::decode(r).await?)),
             5 => Ok(Message::Timeout(Timeout::decode(r).await?)),
             6 => Ok(Message::Sync(SyncMsg::decode(r).await?)),
-            tag => anyhow::bail!("invalid tag for message {}", tag),
+            tag => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid tag {}", tag),
+                ))
+            }
         }
     }
 }

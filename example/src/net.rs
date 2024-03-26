@@ -2,7 +2,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use hotstuff2::types::Message;
 use parking_lot::Mutex;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Result};
 use tokio::sync::mpsc;
 
 use crate::codec::{AsyncDecode, AsyncEncode, Protocol};
@@ -14,7 +14,7 @@ impl Connection {
         Self(conn)
     }
 
-    pub(crate) async fn open(&self, proto: Protocol) -> anyhow::Result<MsgStream> {
+    pub(crate) async fn open(&self, proto: Protocol) -> Result<MsgStream> {
         let (mut send, recv) = self.0.open_bi().await?;
         proto.encode(&mut send).await?;
         Ok(MsgStream {
@@ -25,7 +25,7 @@ impl Connection {
         })
     }
 
-    pub(crate) async fn accept(&self) -> anyhow::Result<MsgStream> {
+    pub(crate) async fn accept(&self) -> Result<MsgStream> {
         let (send, mut recv) = self.0.accept_bi().await?;
         let proto = Protocol::decode(&mut recv).await?;
         Ok(MsgStream {
@@ -67,12 +67,12 @@ impl MsgStream {
         self.remote
     }
 
-    pub(crate) async fn send_msg(&mut self, msg: &Message) -> anyhow::Result<()> {
+    pub(crate) async fn send_msg(&mut self, msg: &Message) -> Result<()> {
         msg.encode(&mut self.send).await?;
-        self.send.flush().await.map_err(|err| anyhow::anyhow!(err))
+        self.send.flush().await
     }
 
-    pub(crate) async fn recv_msg(&mut self) -> anyhow::Result<Message> {
+    pub(crate) async fn recv_msg(&mut self) -> Result<Message> {
         Message::decode(&mut self.recv).await
     }
 }
