@@ -9,9 +9,11 @@
 
 
 TODO:
-- [ ] sufficient tracing for debug
 - [ ] e2e sanity test
 - [ ] introduce `prev` for block
+- [ ] playground testing
+- [ ] add short id for distributed tracinsg
+- [ ] twins model checker
 
 ## Tests
 
