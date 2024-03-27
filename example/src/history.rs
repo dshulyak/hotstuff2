@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use hotstuff2::types::{Certificate, Sync as SyncMsg, View, Vote};
+use hotstuff2::types::{Certificate, View, Vote};
 
 pub(crate) struct History {
     voted: View,
@@ -36,7 +36,7 @@ impl History {
         last
     }
 
-    pub(crate) fn lock(&self) -> Certificate<Vote> {
+    pub(crate) fn locked(&self) -> Certificate<Vote> {
         self.locked.as_ref().unwrap().clone()
     }
 
@@ -44,27 +44,8 @@ impl History {
         self.commits.last_key_value().unwrap().1.clone()
     }
 
-    pub(crate) fn sync_state(&self) -> SyncMsg {
-        SyncMsg {
-            locked: self.locked.clone(),
-            double: Some(self.last_commit()),
-        }
-    }
-
-    pub(crate) fn get(&self, view: View) -> SyncMsg {
-        let double = self.commits.get(&view).cloned();
-        let locked = {
-            if let Some(locked) = &self.locked {
-                if locked.inner.view > view {
-                    Some(locked.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        SyncMsg { locked, double }
+    pub(crate) fn first_after(&self, view: View) -> Option<Certificate<Vote>> {
+        self.commits.range(view..).next().map(|(_, c)| c.clone())
     }
 
     pub(crate) fn update(

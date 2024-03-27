@@ -3,7 +3,9 @@ use std::time::Duration;
 use anyhow::anyhow;
 use bit_vec::BitVec;
 use hotstuff2::sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer};
-use hotstuff2::types::{AggregateSignature, Block, Certificate, Message, View, Vote, ID};
+use hotstuff2::types::{
+    AggregateSignature, Block, Certificate, Message, Sync as SyncMsg, View, Vote, ID,
+};
 use parking_lot::Mutex;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -55,7 +57,10 @@ pub(crate) async fn sync_initiate(
 ) -> anyhow::Result<()> {
     let state = {
         let history = history.lock();
-        history.sync_state()
+        SyncMsg {
+            locked: None,
+            double: Some(history.last_commit()),
+        }
     };
     match ctx
         .timeout_secs(10)
@@ -108,28 +113,37 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &Mutex<History>, mut str
             return;
         }
     };
-    let mut last_known = state
-        .locked
+    let mut last = state
+        .double
         .as_ref()
-        .map(|v| v.inner.view)
+        .map(|v| v.inner.view + 1)
         .unwrap_or(View(1));
-    last_known = last_known.max(
-        state
-            .double
-            .as_ref()
-            .map(|v| v.inner.view + 1)
-            .unwrap_or(View(1)),
-    );
-    tracing::debug!(from_view = %last_known, remote = %stream.remote(), "requested sync");
-    for last in last_known.0.. {
-        let next = history.lock().get(last.into());
-        if next.locked.is_none() && next.double.is_none() {
-            tracing::debug!(last = %last, remote = %stream.remote(), "nothing to sync. exiting sync protocol");
-            break;
+    tracing::debug!(from_view = %last, remote = %stream.remote(), "requested sync");
+    loop {
+        let (sync_msg, next) = {
+            let history = history.lock();
+            let commit = history.first_after(last);
+            let next = commit.as_ref().map(|c| c.inner.view + 1);
+            (
+                Message::Sync(SyncMsg {
+                    double: commit,
+                    locked: None,
+                }),
+                next,
+            )
+        };
+        match next {
+            Some(next) => {
+                last = next;
+            }
+            None => {
+                tracing::debug!(last = %last, remote = %stream.remote(), "nothing to sync. exiting sync protocol");
+                break;
+            }
         }
         match ctx
             .timeout_secs(10)
-            .select(stream.send_msg(&Message::Sync(next)))
+            .select(stream.send_msg(&sync_msg))
             .await
         {
             Ok(Ok(())) => {}
@@ -333,9 +347,12 @@ mod tests {
 
         let ctx = Context::new();
         let mut history = History::new();
-        history.update(None, None, Some(genesis()));
+        history.update(None, Some(genesis()), Some(genesis()));
 
-        let msg = Message::Sync(history.sync_state());
+        let msg = Message::Sync(SyncMsg {
+            locked: None,
+            double: Some(history.last_commit()),
+        });
         let mut reader = Builder::new();
         reader.read(&msg.encode_to_bytes().await.unwrap());
         let mut writer = Builder::new();
@@ -356,7 +373,7 @@ mod tests {
 
         let ctx = Context::new();
         let mut history = History::new();
-        history.update(None, None, Some(genesis()));
+        history.update(None, Some(genesis()), Some(genesis()));
         let cnt = Counter::new();
 
         let mut reader = Builder::new();
@@ -372,7 +389,7 @@ mod tests {
         reader.read(
             &Message::Sync(SyncMsg {
                 locked: None,
-                double: Some(cert_from_view(2.into())),
+                double: Some(cert_from_view(3.into())),
             })
             .encode_to_bytes()
             .await
@@ -380,10 +397,13 @@ mod tests {
         );
         let mut writer = Builder::new();
         writer.write(
-            &Message::Sync(history.sync_state())
-                .encode_to_bytes()
-                .await
-                .unwrap(),
+            &Message::Sync(SyncMsg {
+                locked: None,
+                double: Some(history.last_commit()),
+            })
+            .encode_to_bytes()
+            .await
+            .unwrap(),
         );
 
         let stream = MsgStream::new(

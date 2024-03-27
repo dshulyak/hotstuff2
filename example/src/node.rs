@@ -132,13 +132,13 @@ impl Node {
     ) -> anyhow::Result<Self> {
         let mut history = History::new();
         if history.empty() {
-            history.update(None, None, Some(protocol::genesis()))?
+            history.update(None, Some(protocol::genesis()), Some(protocol::genesis()))?
         }
         let (sender, receiver) = unbounded_channel();
         let consensus = TokioConsensus::new(
             history.last_view(),
             participants,
-            history.lock(),
+            history.locked(),
             history.last_commit(),
             history.voted(),
             &keys,

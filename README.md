@@ -9,8 +9,10 @@
 
 
 TODO:
-- [ ] loom
-- [ ] example node with tokio
+- [ ] handle missing views in history
+- [ ] basic test coverage for protocols
+- [ ] sufficient tracing for debug
+- [ ] introduce `prev` for block
 
 ## Tests
 
