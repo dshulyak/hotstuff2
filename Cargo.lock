@@ -498,6 +498,7 @@ dependencies = [
  "async-trait",
  "bit-vec",
  "blst",
+ "hex",
  "loom",
  "parking_lot",
  "proptest",

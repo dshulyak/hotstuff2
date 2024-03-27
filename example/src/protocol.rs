@@ -180,8 +180,16 @@ async fn consume_messages(
 ) -> anyhow::Result<()> {
     loop {
         let msg = ctx.timeout_secs(10).select(stream.recv_msg()).await??;
-        if let Err(err) = consensus.on_message(msg) {
-            tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process gossip message");
+        let start = Instant::now();
+        tracing::debug!(remote = ?stream.remote(), msg = %msg, "on gossip message");
+        if let Err(err) = consensus.on_message(msg.clone()) {
+            anyhow::bail!("validation failed: {}", err);
+        }
+        let elapsed = start.elapsed();
+        if elapsed > Duration::from_millis(10) {
+            tracing::warn!(remote = ?stream.remote(), elapsed = ?elapsed, msg = %msg, "slow gossip message processing");
+        } else {
+            tracing::debug!(remote = ?stream.remote(), elapsed = ?elapsed, msg = %msg,  "processed gossip message");
         }
     }
 }
@@ -249,6 +257,7 @@ pub(crate) async fn process_actions(
     while let Ok(Some(action)) = ctx.select(receiver.recv()).await {
         match action {
             Action::Send(msg) => {
+                tracing::debug!(msg = %msg, "sent message");
                 router.send_all(msg);
             }
             Action::StateChange(change) => {

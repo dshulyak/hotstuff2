@@ -64,6 +64,16 @@ impl Block {
     pub fn new(height: u64, id: ID) -> Self {
         Block { height, id }
     }
+
+    pub fn short_id(&self) -> String {
+        hex::encode(&self.id.0)[..8].to_string()
+    }
+}
+
+impl fmt::Display for Block {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.height, self.short_id(),)
+    }
 }
 
 impl ToBytes for Block {
@@ -256,6 +266,40 @@ pub enum Message {
     Wish(Signed<Wish>),
     Timeout(Timeout),
     Sync(Sync),
+}
+
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Message::Propose(propose) => {
+                write!(
+                    f,
+                    "propose {} leader={} block={}",
+                    propose.view, propose.signer, propose.block
+                )
+            }
+            Message::Prepare(prepare) => {
+                write!(
+                    f,
+                    "prepare {} leader={} block={}",
+                    prepare.certificate.inner.view, prepare.signer, prepare.certificate.inner.block,
+                )
+            }
+            Message::Vote(vote) => write!(f, "vote signer={} block={}", vote.signer, vote.block),
+            Message::Vote2(vote2) => write!(
+                f,
+                "vote2 signer={} block={}",
+                vote2.signer, vote2.inner.block
+            ),
+            Message::Wish(wish) => {
+                write!(f, "wish signer={} view={}", wish.signer, wish.inner.view)
+            }
+            Message::Timeout(timeout) => {
+                write!(f, "timeout view={}", timeout.certificate.inner)
+            }
+            Message::Sync(_) => write!(f, "sync"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
