@@ -9,9 +9,8 @@
 
 
 TODO:
-- [ ] handle missing views in history
-- [ ] basic test coverage for protocols
 - [ ] sufficient tracing for debug
+- [ ] e2e sanity test
 - [ ] introduce `prev` for block
 
 ## Tests

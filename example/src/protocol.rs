@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -8,7 +9,7 @@ use hotstuff2::types::{
 };
 use parking_lot::Mutex;
 use tokio::select;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Receiver};
 use tokio::time::{interval, interval_at, sleep, timeout, Instant};
 
 use crate::codec::Protocol;
@@ -164,12 +165,25 @@ pub(crate) async fn gossip_initiate(
     consensus: &impl OnMessage,
     mut stream: MsgStream,
 ) -> anyhow::Result<()> {
-    while let Ok(Ok(msg)) = ctx.timeout_secs(10).select(stream.recv_msg()).await {
+    tracing::debug!(remote = ?stream.remote(), "gossip initiating stream");
+    if let Err(err) = consume_messages(ctx, &mut stream, consensus).await {
+        tracing::debug!(error = ?err, remote = ?stream.remote(), "failed to consume gossip messages");
+    }
+    tracing::debug!(remote = ?stream.remote(), "gossip init stream closed");
+    Ok(())
+}
+
+async fn consume_messages(
+    ctx: &Context,
+    stream: &mut MsgStream,
+    consensus: &impl OnMessage,
+) -> anyhow::Result<()> {
+    loop {
+        let msg = ctx.timeout_secs(10).select(stream.recv_msg()).await??;
         if let Err(err) = consensus.on_message(msg) {
-            tracing::debug!(error = ?err, remote = ?stream.remote(), "failed to process gossip message");
+            tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process gossip message");
         }
     }
-    Ok(())
 }
 
 pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: MsgStream) {
@@ -182,20 +196,24 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
             }
         }
     };
-    while let Ok(Some(msg)) = ctx.select(msgs.recv()).await {
-        match ctx.timeout_secs(10).select(stream.send_msg(&msg)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::debug!(error = ?err,  "failed to send gossip message");
-                break;
-            }
-            Err(err) => {
-                tracing::debug!(error = ?err,  "failed to send gossip message");
-                break;
-            }
-        }
+    tracing::debug!(remote = %stream.remote(), "accepted gossip stream");
+    if let Err(err) = gossip_messages(ctx, &mut msgs, &mut stream).await {
+        tracing::debug!(error = ?err, remote = %stream.remote(), "error in gossip stream");
     }
+    tracing::debug!(remote = %stream.remote(), "closing gossip stream");
     router.remove(&stream.remote());
+}
+
+async fn gossip_messages(
+    ctx: &Context,
+    msgs: &mut Receiver<Arc<Message>>,
+    stream: &mut MsgStream,
+) -> anyhow::Result<()> {
+    while let Some(msg) = ctx.select(msgs.recv()).await? {
+        tracing::debug!(remote = %stream.remote(), "sending gossip message");
+        ctx.timeout_secs(10).select(stream.send_msg(&msg)).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn notify_delays(
@@ -254,11 +272,15 @@ pub(crate) async fn process_actions(
 mod tests {
     use std::{
         net::SocketAddr,
+        pin::Pin,
         str::FromStr,
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use hotstuff2::types::{Sync as SyncMsg, ToBytes};
+    use futures::prelude::*;
+    use futures::{Future, FutureExt, Stream};
+
+    use hotstuff2::types::{Signature, Signed, Sync as SyncMsg, Wish, SIGNATURE_SIZE};
     use parking_lot::lock_api::Mutex;
     use tokio::{
         spawn,
@@ -326,6 +348,14 @@ mod tests {
 
     fn sock(addr: &str) -> SocketAddr {
         SocketAddr::from_str(addr).unwrap()
+    }
+
+    fn wish(view: View, signer: u16) -> Signed<Wish> {
+        Signed::<Wish> {
+            inner: Wish { view: view },
+            signer: signer,
+            signature: Signature::new([0u8; SIGNATURE_SIZE]),
+        }
     }
 
     #[tokio::test]
@@ -414,5 +444,73 @@ mod tests {
         );
         assert_ok!(sync_initiate(&ctx, &Mutex::new(history), &cnt, stream).await);
         assert_eq!(cnt.msgs.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_gossip_init() {
+        init_tracing();
+        let ctx = Context::new();
+        let cnt = Counter::new();
+
+        let mut reader = Builder::new();
+        let mut writer = Builder::new();
+
+        reader.read(
+            &Message::Wish(wish(1.into(), 1))
+                .encode_to_bytes()
+                .await
+                .unwrap(),
+        );
+        reader.read(
+            &Message::Wish(wish(1.into(), 2))
+                .encode_to_bytes()
+                .await
+                .unwrap(),
+        );
+
+        let stream = MsgStream::new(
+            GOSSIP_PROTOCOL,
+            sock("127.0.0.1:3333"),
+            Box::new(writer.build()),
+            Box::new(reader.build()),
+        );
+        gossip_initiate(&ctx, &cnt, stream).await;
+        assert_eq!(cnt.msgs.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_gossip_accept() {
+        init_tracing();
+        let ctx = Context::new();
+
+        let mut reader = Builder::new();
+        let mut writer = Builder::new();
+
+        let mut to_send = (1..=3)
+            .into_iter()
+            .map(|i| Message::Wish(wish(1.into(), i)))
+            .collect::<Vec<_>>();
+        for msg in to_send.iter() {
+            writer.write(&msg.encode_to_bytes().await.unwrap());
+        }
+
+        let router = Router::new(100);
+        let sock = sock("127.0.0.1:8888");
+        let stream = MsgStream::new(
+            GOSSIP_PROTOCOL,
+            sock.clone(),
+            Box::new(writer.build()),
+            Box::new(reader.build()),
+        );
+
+        let fut = gossip_accept(&ctx, &router, stream);
+        let mut stream = Box::pin(fut.into_stream());
+        futures::poll!(stream.next());
+        for msg in to_send.iter() {
+            router.send_all(msg.clone());
+        }
+        for _ in to_send.iter() {
+            futures::poll!(stream.next());
+        }
     }
 }
