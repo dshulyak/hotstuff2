@@ -43,7 +43,7 @@ pub(crate) fn genesis() -> Certificate<Vote> {
     Certificate {
         inner: Vote {
             view: View(0),
-            block: Block::new(0, ID::from_str("genesis")),
+            block: Block::new(ID::default(), ID::from_str("genesis")),
         },
         signature: AggregateSignature::empty(),
         signers: BitVec::new(),
@@ -60,7 +60,7 @@ pub(crate) async fn sync_initiate(
         let history = history.lock();
         SyncMsg {
             locked: None,
-            double: Some(history.last_commit()),
+            commit: Some(history.last_commit()),
         }
     };
     match ctx
@@ -115,7 +115,7 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &Mutex<History>, mut str
         }
     };
     let mut last = state
-        .double
+        .commit
         .as_ref()
         .map(|v| v.inner.view + 1)
         .unwrap_or(View(1));
@@ -127,7 +127,7 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &Mutex<History>, mut str
             let next = commit.as_ref().map(|c| c.inner.view + 1);
             (
                 Message::Sync(SyncMsg {
-                    double: commit,
+                    commit,
                     locked: None,
                 }),
                 next,
@@ -306,7 +306,7 @@ mod tests {
         Certificate {
             inner: Vote {
                 view: view,
-                block: Block::new(0, ID::from_str(&view.to_string())),
+                block: Block::new(ID::default(), ID::from_str(&view.to_string())),
             },
             signature: AggregateSignature::empty(),
             signers: BitVec::new(),
@@ -391,7 +391,7 @@ mod tests {
 
         let msg = Message::Sync(SyncMsg {
             locked: None,
-            double: Some(history.last_commit()),
+            commit: Some(history.last_commit()),
         });
         let mut reader = Builder::new();
         reader.read(&msg.encode_to_bytes().await.unwrap());
@@ -420,7 +420,7 @@ mod tests {
         reader.read(
             &Message::Sync(SyncMsg {
                 locked: None,
-                double: Some(cert_from_view(1.into())),
+                commit: Some(cert_from_view(1.into())),
             })
             .encode_to_bytes()
             .await
@@ -429,7 +429,7 @@ mod tests {
         reader.read(
             &Message::Sync(SyncMsg {
                 locked: None,
-                double: Some(cert_from_view(3.into())),
+                commit: Some(cert_from_view(3.into())),
             })
             .encode_to_bytes()
             .await
@@ -439,7 +439,7 @@ mod tests {
         writer.write(
             &Message::Sync(SyncMsg {
                 locked: None,
-                double: Some(history.last_commit()),
+                commit: Some(history.last_commit()),
             })
             .encode_to_bytes()
             .await

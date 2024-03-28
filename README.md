@@ -9,7 +9,6 @@
 
 
 TODO:
-- [ ] introduce `prev` for block
 - [ ] e2e sanity test
 - [ ] playground testing
 - [ ] twins model checker

@@ -28,6 +28,22 @@ impl ID {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    pub fn short_id(&self) -> String {
+        hex::encode(&self.0)[..8].to_string()
+    }
+}
+
+impl Display for ID {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.short_id())
+    }
+}
+
+impl From<&str> for ID {
+    fn from(id: &str) -> Self {
+        ID::from_str(id)
+    }
 }
 
 impl From<[u8; 32]> for ID {
@@ -56,30 +72,26 @@ impl Ord for ID {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Block {
-    pub height: u64,
+    pub prev: ID,
     pub id: ID,
 }
 
 impl Block {
-    pub fn new(height: u64, id: ID) -> Self {
-        Block { height, id }
-    }
-
-    pub fn short_id(&self) -> String {
-        hex::encode(&self.id.0)[..8].to_string()
+    pub fn new(prev: ID, id: ID) -> Self {
+        Block { prev, id }
     }
 }
 
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.height, self.short_id(),)
+        write!(f, "{}/{}", self.prev.short_id(), self.id.short_id(),)
     }
 }
 
 impl ToBytes for Block {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&self.height.to_le_bytes());
+        bytes.extend_from_slice(self.prev.as_bytes());
         bytes.extend_from_slice(self.id.as_bytes());
         bytes
     }
@@ -254,7 +266,7 @@ impl<T: ToBytes> Deref for Signed<T> {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Sync {
     pub locked: Option<Certificate<Vote>>,
-    pub double: Option<Certificate<Vote>>,
+    pub commit: Option<Certificate<Vote>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

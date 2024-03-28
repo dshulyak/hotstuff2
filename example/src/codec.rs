@@ -36,7 +36,7 @@ pub(crate) trait AsyncDecode: Sized {
 #[async_trait]
 impl AsyncEncode for Block {
     async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
-        w.write_u64(self.height).await?;
+        w.write_all(self.prev.as_bytes()).await?;
         w.write_all(self.id.as_bytes()).await?;
         Ok(())
     }
@@ -45,10 +45,11 @@ impl AsyncEncode for Block {
 #[async_trait]
 impl AsyncDecode for Block {
     async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self> {
-        let height = r.read_u64().await?;
+        let mut prev = [0; 32];
+        r.read_exact(&mut prev).await?;
         let mut id = [0; 32];
         r.read_exact(&mut id).await?;
-        Ok(Block::new(height, id.into()))
+        Ok(Block::new(prev.into(), id.into()))
     }
 }
 
@@ -231,7 +232,7 @@ impl AsyncEncode for SyncMsg {
         } else {
             w.write_u8(0).await?;
         }
-        if let Some(double) = &self.double {
+        if let Some(double) = &self.commit {
             w.write_u8(1).await?;
             double.encode(w).await?;
         } else {
@@ -254,7 +255,7 @@ impl AsyncDecode for SyncMsg {
                 ));
             }
         };
-        let double = match r.read_u8().await? {
+        let commit = match r.read_u8().await? {
             0 => None,
             1 => Some(Certificate::decode(r).await?),
             tag => {
@@ -264,7 +265,7 @@ impl AsyncDecode for SyncMsg {
                 ));
             }
         };
-        Ok(SyncMsg { locked, double })
+        Ok(SyncMsg { locked, commit })
     }
 }
 

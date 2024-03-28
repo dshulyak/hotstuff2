@@ -109,7 +109,7 @@ impl<T: Actions> Consensus<T> {
                 view,
                 voted,
                 locked: lock,
-                double: commit,
+                commit,
                 proposal: None,
                 votes: BTreeMap::new(),
                 votes2: BTreeMap::new(),
@@ -148,7 +148,7 @@ impl<T: Actions> Consensus<T> {
     }
 
     fn on_sync(&self, sync: Sync) -> Result<()> {
-        if let Some(double) = &sync.double {
+        if let Some(double) = &sync.commit {
             ensure!(double.signers.len() <= self.participants.len());
             if double.inner.view > View(0) {
                 double.signature.verify(
@@ -177,12 +177,12 @@ impl<T: Actions> Consensus<T> {
                 change.lock = Some(state.locked.clone());
             }
         }
-        if let Some(double) = sync.double {
-            if double.inner.block.height == state.double.inner.block.height + 1 {
-                state.double = double;
-                let next = state.double.inner.view + 1;
+        if let Some(commit) = sync.commit {
+            if commit.inner.block.id == state.commit.inner.block.prev {
+                state.commit = commit;
+                let next = state.commit.inner.view + 1;
                 state.enter_view(next);
-                change.commit = Some(state.double.clone());
+                change.commit = Some(state.commit.clone());
             }
         }
         if !change.is_none() {
@@ -257,7 +257,7 @@ impl<T: Actions> Consensus<T> {
         state.wait_first_delay(timeout.certificate.inner);
         self.actions.send(Action::Send(Message::Sync(Sync {
             locked: Some(state.locked.clone()),
-            double: Some(state.double.clone()),
+            commit: Some(state.commit.clone()),
         })));
         Ok(())
     }
@@ -311,14 +311,14 @@ impl<T: Actions> Consensus<T> {
                 "proposed block must use cert no lower then locally locked block"
             );
 
-            if propose.inner.double.inner.view > state.double.inner.view {
-                state.double = propose.inner.double.clone();
-                change.commit = Some(state.double.clone());
-                let next = state.double.inner.view + 1;
+            if propose.inner.double.inner.view > state.commit.inner.view {
+                state.commit = propose.inner.double.clone();
+                change.commit = Some(state.commit.clone());
+                let next = state.commit.inner.view + 1;
                 state.enter_view(next);
             }
             ensure!(
-                propose.inner.double.inner == state.double.inner,
+                propose.inner.double.inner == state.commit.inner,
                 "propose must extend known highest doubly certified block"
             );
 
@@ -331,10 +331,11 @@ impl<T: Actions> Consensus<T> {
                 "should not vote more than once in the same view"
             );
             ensure!(
-                propose.inner.block.height == state.double.inner.block.height + 1,
-                "proposed block height {:?} must be one after the commited block {:?}",
-                propose.inner.block.height,
-                state.double.inner.block.height,
+                propose.inner.block.prev == state.commit.inner.block.id,
+                "proposed block {}/{} must extend commited block {}",
+                propose.inner.block.id,
+                propose.inner.block.prev,
+                state.commit.inner.block.id,
             );
 
             state.voted = propose.inner.view;
@@ -540,7 +541,7 @@ impl<T: Actions> Consensus<T> {
             self.state.lock().proposal = Some(Propose {
                 view: cert.view + 1,
                 block: Block {
-                    height: cert.height + 1,
+                    prev: cert.id,
                     id: ID::default(),
                 },
                 locked: votes.message().clone(),
@@ -572,7 +573,7 @@ impl<T: Actions> OnDelay for Consensus<T> {
                     state.wait_first_delay(next);
                     self.actions.send(Action::Send(Message::Sync(Sync {
                         locked: Some(state.locked.clone()),
-                        double: Some(state.double.clone()),
+                        commit: Some(state.commit.clone()),
                     })));
                     (None, None)
                 }
@@ -583,13 +584,13 @@ impl<T: Actions> OnDelay for Consensus<T> {
                 state.reset_delay();
                 // unlike in the paper, i want to obtain double certificate on every block.
                 // therefore i extend locked if it is equal to double, otherwise i retry locked block.
-                if state.locked.inner != state.double.inner {
+                if state.locked.inner != state.commit.inner {
                     (
                         Some(Propose {
                             view: state.view,
                             block: state.locked.inner.block.clone(),
                             locked: state.locked.clone(),
-                            double: state.double.clone(),
+                            double: state.commit.clone(),
                         }),
                         None,
                     )
@@ -597,11 +598,11 @@ impl<T: Actions> OnDelay for Consensus<T> {
                     state.proposal = Some(Propose {
                         view: state.view,
                         block: Block {
-                            height: state.double.inner.block.height + 1,
+                            prev: state.commit.inner.block.id,
                             id: ID::default(), // will be overwritten in propose method
                         },
                         locked: state.locked.clone(),
-                        double: state.double.clone(),
+                        double: state.commit.clone(),
                     });
                     self.actions.send(Action::Propose);
                     (None, None)
@@ -662,7 +663,7 @@ struct State {
     // single certificate from 2/3*f+1 Vote. initialized to genesis
     locked: Certificate<Vote>,
     // double certificate from 2/3*f+1 Vote2. initialized to genesis
-    double: Certificate<Vote>,
+    commit: Certificate<Vote>,
     // to aggregate propose and prepare votes
     // key is view, type of the vote, signer
     // TODO this structs do not allow to easily spot equivocation
