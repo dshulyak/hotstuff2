@@ -12,7 +12,7 @@ use tokio::select;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::time::{interval, interval_at, sleep, timeout, Instant};
 
-use crate::codec::Protocol;
+use crate::codec::{AsyncEncode, Protocol};
 use crate::context::Context;
 use crate::history::History;
 use crate::net::{MsgStream, Router};
@@ -181,7 +181,7 @@ async fn consume_messages(
     loop {
         let msg = ctx.timeout_secs(10).select(stream.recv_msg()).await??;
         let start = Instant::now();
-        tracing::debug!(remote = ?stream.remote(), msg = %msg, "on gossip message");
+        tracing::debug!(id = %msg.short_id().await.unwrap(), remote = ?stream.remote(), msg = %msg, "on gossip message");
         if let Err(err) = consensus.on_message(msg.clone()) {
             anyhow::bail!("validation failed: {}", err);
         }
@@ -257,7 +257,8 @@ pub(crate) async fn process_actions(
     while let Ok(Some(action)) = ctx.select(receiver.recv()).await {
         match action {
             Action::Send(msg) => {
-                tracing::debug!(msg = %msg, "sent message");
+                let id = msg.short_id().await.unwrap();
+                tracing::debug!(id = %id, msg = %msg, "sent message");
                 router.send_all(msg);
             }
             Action::StateChange(change) => {

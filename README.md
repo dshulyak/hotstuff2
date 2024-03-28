@@ -10,7 +10,6 @@
 
 TODO:
 - [ ] introduce `prev` for block
-- [ ] add short id for distributed tracing
 - [ ] e2e sanity test
 - [ ] playground testing
 - [ ] twins model checker

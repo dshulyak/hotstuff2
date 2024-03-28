@@ -17,6 +17,11 @@ pub(crate) trait AsyncEncode {
         bw.flush().await?;
         Ok(buf.into())
     }
+
+    // short_id returns the first 8 chars of the hexary enncoding for blake3 hash of the encoded bytes.
+    async fn short_id(&self) -> Result<String> {
+        Ok(blake3::hash(&self.encode_to_bytes().await?).to_hex()[..8].to_string())
+    }
 }
 
 #[async_trait]

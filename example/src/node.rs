@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,7 +57,7 @@ async fn initiate(
     Ok(())
 }
 
-async fn loop_connect(
+async fn connect(
     ctx: &Context,
     peer: SocketAddr,
     reconnect_interval: Duration,
@@ -115,20 +116,22 @@ async fn accept(
 }
 
 pub struct Node {
+    dir: PathBuf,
+    listen: SocketAddr,
     peers: Vec<SocketAddr>,
     history: Mutex<History>,
     router: Router,
     consensus: TokioConsensus,
-    endpoint: quinn::Endpoint,
     receiver: mpsc::UnboundedReceiver<Action>,
 }
 
 impl Node {
     pub fn init(
+        dir: PathBuf,
+        listen: SocketAddr,
         participants: Box<[PublicKey]>,
         keys: Box<[PrivateKey]>,
         peers: Vec<SocketAddr>,
-        endpoint: quinn::Endpoint,
     ) -> anyhow::Result<Self> {
         let mut history = History::new();
         if history.empty() {
@@ -145,11 +148,12 @@ impl Node {
             TokioSink::new(sender),
         );
         Ok(Self {
+            dir,
+            listen,
             peers,
             history: Mutex::new(history),
             router: Router::new(1_000),
             consensus: consensus,
-            endpoint,
             receiver: receiver,
         })
     }
@@ -168,17 +172,17 @@ impl Node {
                 &self.consensus,
                 &mut self.receiver,
             ));
-            for peer in &self.peers {
-                s.spawn(loop_connect(
-                    &ctx,
-                    *peer,
-                    Duration::from_secs(10),
-                    &self.endpoint,
-                    &self.history,
-                    &self.consensus,
-                ));
-            }
-            s.spawn(accept(&ctx, &self.endpoint, &self.history, &self.router));
+            // for peer in &self.peers {
+            //     s.spawn(connect(
+            //         &ctx,
+            //         *peer,
+            //         Duration::from_secs(10),
+            //         &self.endpoint,
+            //         &self.history,
+            //         &self.consensus,
+            //     ));
+            // }
+            // s.spawn(accept(&ctx, &self.endpoint, &self.history, &self.router));
         });
     }
 }
