@@ -9,10 +9,10 @@
 
 
 TODO:
-- [ ] e2e sanity test
 - [ ] introduce `prev` for block
+- [ ] add short id for distributed tracing
+- [ ] e2e sanity test
 - [ ] playground testing
-- [ ] add short id for distributed tracinsg
 - [ ] twins model checker
 
 ## Tests

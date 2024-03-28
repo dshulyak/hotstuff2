@@ -4,8 +4,8 @@ use std::ops::Index;
 
 use anyhow::{anyhow, ensure, Ok, Result};
 use bit_vec::BitVec;
+use parking_lot::Mutex;
 
-use crate::sync::Mutex;
 use crate::types::*;
 
 // reset timers. single tick should be sufficient to finish consensus round.
