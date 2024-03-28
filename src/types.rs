@@ -382,22 +382,14 @@ impl AggregateSignature {
         message: &[u8],
         public_keys: impl IntoIterator<Item = &'a PublicKey>,
     ) -> Result<()> {
-        let public = blst::AggregatePublicKey::aggregate(
-            &public_keys
-                .into_iter()
-                .map(|key| &key.0)
-                .collect::<Vec<_>>(),
-            false,
-        )
-        .expect("failed to aggregate public key");
-        match self.to_signature()?.verify(
-            true,
-            message,
-            domain.into(),
-            &[],
-            &public.to_public_key(),
-            false,
-        ) {
+        let pks = public_keys
+            .into_iter()
+            .map(|key| &key.0)
+            .collect::<Vec<_>>();
+        match self
+            .to_signature()?
+            .fast_aggregate_verify(true, message, domain.into(), &pks)
+        {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
             err => Err(anyhow!("failed to verify signature: {:?}", err)),
         }

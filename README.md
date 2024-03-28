@@ -12,6 +12,7 @@ TODO:
 - [ ] e2e sanity test
 - [ ] playground testing
 - [ ] twins model checker
+- [ ] madsim simulation
 
 ## Tests
 
