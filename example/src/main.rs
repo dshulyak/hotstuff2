@@ -93,11 +93,13 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let mut participants = opt.participants.clone();
+    participants.sort();
     let mut node = match node::Node::init(
-        opt.directory,
+        opt.directory.as_path(),
         opt.listen,
         "example",
-        opt.participants.into_boxed_slice(),
+        participants.into_boxed_slice(),
         privates.into_boxed_slice(),
         opt.connect,
     ) {

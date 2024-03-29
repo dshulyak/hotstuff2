@@ -31,7 +31,9 @@ impl History {
             last = last.max(locked.inner.view);
         }
         if let Some(commit) = self.commits.last_key_value() {
-            last = last.max(*commit.0 + 1);
+            if *commit.0 != View(0) {
+                last = last.max(*commit.0 + 1);
+            }
         }
         last
     }

@@ -35,6 +35,10 @@ impl Connection {
             recv: BufReader::new(Box::new(recv)),
         })
     }
+
+    pub(crate) fn remote(&self) -> SocketAddr {
+        self.0.remote_address()
+    }
 }
 
 pub(crate) struct MsgStream {

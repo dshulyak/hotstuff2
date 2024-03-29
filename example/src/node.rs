@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ async fn initiate(
     let conn = match endpoint.connect(peer, "localhost") {
         Ok(conn) => conn,
         Err(err) => {
-            anyhow::bail!("failed to connect to peer: {}", err);
+            anyhow::bail!("failed to connect to peer {}: {}", peer, err);
         }
     };
     let conn = match ctx.timeout_secs(10).select(conn).await {
@@ -38,6 +38,7 @@ async fn initiate(
             anyhow::bail!("task to establish connection: {}", err);
         }
     };
+    tracing::debug!(remote = %conn.remote(),"established connection");
     protocol::sync_initiate(
         ctx,
         history,
@@ -70,7 +71,8 @@ async fn connect(
         if let Err(err) = initiate(ctx, endpoint, peer, history, consensus).await {
             tracing::warn!(error = ?err, "failed to connect to peer");
         }
-        if let Err(_) = ctx.select(sleep(reconnect_interval)).await {
+        if let Err(err) = ctx.select(sleep(reconnect_interval)).await {
+            tracing::debug!(error = ?err, "task to reconnect to peer is cancelled");
             return;
         }
     }
@@ -82,8 +84,9 @@ async fn accept(
     history: &Mutex<History>,
     router: &Router,
 ) {
+    tracing::info!(local = %endpoint.local_addr().unwrap(), "accepting connections");
     let mut s = unsafe { TokioScope::create(Default::default()) };
-    while let Some(conn) = endpoint.accept().await {
+    while let Ok(Some(conn)) = ctx.select(endpoint.accept()).await {
         s.spawn(async {
             let conn = match ctx.timeout_secs(10).select(conn).await {
                 Ok(Ok(conn)) => Connection::new(conn),
@@ -116,7 +119,7 @@ async fn accept(
     s.collect().await;
 }
 
-fn ensure_cert(dir: &PathBuf) -> Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
+fn ensure_cert(dir: &Path) -> Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
     let cert_path = dir.join("cert.der");
     let key_path = dir.join("key.der");
     if cert_path.exists() && key_path.exists() {
@@ -134,7 +137,6 @@ fn ensure_cert(dir: &PathBuf) -> Result<(Vec<rustls::Certificate>, rustls::Priva
 }
 
 pub struct Node {
-    dir: PathBuf,
     listen: SocketAddr,
     peers: Vec<SocketAddr>,
     history: Mutex<History>,
@@ -146,7 +148,7 @@ pub struct Node {
 
 impl Node {
     pub fn init(
-        dir: PathBuf,
+        dir: &Path,
         listen: SocketAddr,
         genesis: &str,
         participants: Box<[PublicKey]>,
@@ -177,7 +179,6 @@ impl Node {
             .with_no_client_auth()
             .with_single_cert(cert, key)?;
         Ok(Self {
-            dir,
             listen,
             peers,
             history: Mutex::new(history),
@@ -192,30 +193,110 @@ impl Node {
     }
 
     pub async fn run(&mut self, ctx: Context) {
-        TokioScope::scope_and_block(|s| {
-            s.spawn(protocol::notify_delays(
+        let mut s = unsafe { TokioScope::create(Default::default()) };
+
+        s.spawn(protocol::notify_delays(
+            &ctx,
+            Duration::from_millis(100),
+            &self.consensus,
+        ));
+        s.spawn(protocol::process_actions(
+            &ctx,
+            &self.history,
+            &self.router,
+            &self.consensus,
+            &mut self.receiver,
+        ));
+        for peer in &self.peers {
+            s.spawn(connect(
                 &ctx,
-                Duration::from_millis(100),
-                &self.consensus,
-            ));
-            s.spawn(protocol::process_actions(
-                &ctx,
+                *peer,
+                Duration::from_secs(1),
+                &self.endpoint,
                 &self.history,
-                &self.router,
                 &self.consensus,
-                &mut self.receiver,
             ));
-            for peer in &self.peers {
-                s.spawn(connect(
-                    &ctx,
-                    *peer,
-                    Duration::from_secs(10),
-                    &self.endpoint,
-                    &self.history,
-                    &self.consensus,
-                ));
-            }
-            s.spawn(accept(&ctx, &self.endpoint, &self.history, &self.router));
+        }
+        s.spawn(accept(&ctx, &self.endpoint, &self.history, &self.router));
+        s.collect().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, net::SocketAddr, time::Duration};
+
+    use async_scoped::TokioScope;
+    use futures::join;
+    use hotstuff2::types::PrivateKey;
+    use tokio::time::sleep;
+
+    use crate::{context, node};
+
+    fn init_tracing() {
+        let rst = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        assert!(rst.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sanity() {
+        init_tracing();
+
+        let range = (1..=4);
+        let pks = range
+            .clone()
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0] = i as u8;
+                PrivateKey::from_seed(&mut seed)
+            })
+            .collect::<Vec<_>>();
+        let mut participants = pks.iter().map(|pk| pk.public()).collect::<Vec<_>>();
+        participants.sort();
+
+        let listeners = range
+            .clone()
+            .map(|i| format!("127.0.0.1:{}", 10000 + i).parse().unwrap())
+            .collect::<Vec<SocketAddr>>();
+        let tempdirs = range
+            .clone()
+            .map(|_| tempfile::TempDir::with_prefix("test_sanity").unwrap())
+            .collect::<Vec<_>>();
+
+        let mut nodes = range
+            .clone()
+            .map(|i| {
+                let listener = listeners[i - 1];
+                let pk = [pks[i - 1].clone()];
+                node::Node::init(
+                    tempdirs[i - 1].path(),
+                    listener,
+                    "test_sanity",
+                    participants.clone().into(),
+                    Box::new(pk),
+                    listeners
+                        .iter()
+                        .filter(|sock| listener != **sock)
+                        .copied()
+                        .collect(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let ctx = context::Context::new();
+        let mut s = unsafe { TokioScope::create(Default::default()) };
+        for (i, node) in nodes.iter_mut().enumerate() {
+            s.spawn(async {
+                node.run(ctx.clone()).await;
+            });
+        }
+        s.spawn(async {
+            sleep(Duration::from_secs(2)).await;
+            ctx.cancel();
         });
+        s.collect().await;
     }
 }

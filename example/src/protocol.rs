@@ -252,7 +252,7 @@ pub(crate) async fn process_actions(
     ctx: &Context,
     history: &Mutex<History>,
     router: &Router,
-    consensus: &impl Proposer,
+    consensus: &(impl Proposer + OnMessage),
     receiver: &mut mpsc::UnboundedReceiver<Action>,
 ) {
     while let Ok(Some(action)) = ctx.select(receiver.recv()).await {
@@ -260,6 +260,9 @@ pub(crate) async fn process_actions(
             Action::Send(msg) => {
                 let id = msg.short_id().await.unwrap();
                 tracing::debug!(id = %id, msg = %msg, "sent message");
+                if let Err(err) = consensus.on_message(msg.clone()) {
+                    tracing::error!(error = ?err, "failed to validate own message")
+                };
                 router.send_all(msg);
             }
             Action::StateChange(change) => {
@@ -290,7 +293,6 @@ mod tests {
 
     use futures::prelude::*;
     use futures::{Future, FutureExt, Stream};
-
     use hotstuff2::types::{Signature, Signed, Sync as SyncMsg, Wish, SIGNATURE_SIZE};
     use parking_lot::lock_api::Mutex;
     use tokio::{
