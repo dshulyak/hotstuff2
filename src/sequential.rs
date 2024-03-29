@@ -149,7 +149,9 @@ impl<T: Actions> Consensus<T> {
 
     fn on_sync(&self, sync: Sync) -> Result<()> {
         if let Some(double) = &sync.commit {
-            ensure!(double.signers.len() <= self.participants.len());
+            ensure!(
+                double.signers.iter().filter(|b| *b).count() == self.participants.honest_majority()
+            );
             if double.inner.view > View(0) {
                 double.signature.verify(
                     Domain::Vote2,
@@ -159,7 +161,9 @@ impl<T: Actions> Consensus<T> {
             }
         }
         if let Some(locked) = &sync.locked {
-            ensure!(locked.signers.len() <= self.participants.len());
+            ensure!(
+                locked.signers.iter().filter(|b| *b).count() == self.participants.honest_majority()
+            );
             if locked.inner.view > View(0) {
                 locked.signature.verify(
                     Domain::Vote,
@@ -238,7 +242,6 @@ impl<T: Actions> Consensus<T> {
     }
 
     fn on_timeout(&self, timeout: Timeout) -> Result<()> {
-        ensure!(timeout.certificate.signers.len() <= self.participants.len());
         ensure!(
             timeout.certificate.signers.iter().filter(|b| *b).count()
                 == self.participants.honest_majority(),
@@ -274,7 +277,10 @@ impl<T: Actions> Consensus<T> {
             &self.participants[propose.signer],
         )?;
         if propose.inner.locked.inner.view > View(0) {
-            ensure!(propose.inner.locked.signers.len() <= self.participants.len());
+            ensure!(
+                propose.inner.locked.signers.iter().filter(|b| *b).count()
+                    == self.participants.honest_majority()
+            );
             ensure!(
                 propose.inner.locked.signers.iter().filter(|b| *b).count()
                     == self.participants.honest_majority(),
@@ -287,7 +293,10 @@ impl<T: Actions> Consensus<T> {
             )?;
         }
         if propose.inner.double.inner.view > View(0) {
-            ensure!(propose.inner.double.signers.len() <= self.participants.len());
+            ensure!(
+                propose.inner.double.signers.iter().filter(|b| *b).count()
+                    == self.participants.honest_majority()
+            );
             ensure!(
                 propose.inner.double.signers.iter().filter(|b| *b).count()
                     == self.participants.honest_majority(),
@@ -306,10 +315,7 @@ impl<T: Actions> Consensus<T> {
                 state.locked = propose.inner.locked.clone();
                 change.lock = Some(state.locked.clone());
             }
-            ensure!(
-                propose.inner.locked.inner.view == state.locked.inner.view,
-                "proposed block must use cert no lower then locally locked block"
-            );
+            ensure!(propose.inner.locked.inner.view == state.locked.inner.view);
 
             if propose.inner.double.inner.view > state.commit.inner.view {
                 state.commit = propose.inner.double.clone();
@@ -371,7 +377,16 @@ impl<T: Actions> Consensus<T> {
             &self.participants[prepare.signer],
         )?;
 
-        ensure!(prepare.inner.certificate.signers.len() <= self.participants.len());
+        ensure!(
+            prepare
+                .inner
+                .certificate
+                .signers
+                .iter()
+                .filter(|b| *b)
+                .count()
+                == self.participants.honest_majority()
+        );
         ensure!(
             prepare
                 .inner
@@ -780,7 +795,7 @@ impl<T: ToBytes + Clone + Debug> Votes<T> {
     }
 
     fn count(&self) -> usize {
-        self.signers.iter().filter(|b| *b).count()
+        self.signers().iter().filter(|b| *b).count()
     }
 
     fn signers(&self) -> BitVec {

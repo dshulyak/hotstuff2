@@ -184,7 +184,7 @@ async fn consume_messages(
         let id = msg.short_id().await.unwrap();
         tracing::debug!(id = %id, remote = ?stream.remote(), msg = %msg, "on gossip message");
         if let Err(err) = consensus.on_message(msg) {
-            anyhow::bail!("validation failed: {}", err);
+            tracing::warn!(id = %id, error = ?err, remote = ?stream.remote(), "failed to process gossip message");
         }
         let elapsed = start.elapsed();
         if elapsed > Duration::from_millis(10) {
@@ -266,6 +266,9 @@ pub(crate) async fn process_actions(
                 router.send_all(msg);
             }
             Action::StateChange(change) => {
+                if let Some(commit) = &change.commit {
+                    tracing::info!(view = %commit.inner.view, block = %commit.inner.block.id, "committing new block");
+                }
                 if let Err(err) = history
                     .lock()
                     .update(change.voted, change.lock, change.commit)
