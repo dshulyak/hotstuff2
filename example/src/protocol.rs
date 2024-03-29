@@ -39,11 +39,11 @@ impl Actions for TokioSink {
     }
 }
 
-pub(crate) fn genesis() -> Certificate<Vote> {
+pub(crate) fn genesis(genesis: &str) -> Certificate<Vote> {
     Certificate {
         inner: Vote {
             view: View(0),
-            block: Block::new(ID::default(), ID::from_str("genesis")),
+            block: Block::new(ID::default(), genesis.into()),
         },
         signature: AggregateSignature::empty(),
         signers: BitVec::new(),
@@ -181,15 +181,16 @@ async fn consume_messages(
     loop {
         let msg = ctx.timeout_secs(10).select(stream.recv_msg()).await??;
         let start = Instant::now();
-        tracing::debug!(id = %msg.short_id().await.unwrap(), remote = ?stream.remote(), msg = %msg, "on gossip message");
-        if let Err(err) = consensus.on_message(msg.clone()) {
+        let id = msg.short_id().await.unwrap();
+        tracing::debug!(id = %id, remote = ?stream.remote(), msg = %msg, "on gossip message");
+        if let Err(err) = consensus.on_message(msg) {
             anyhow::bail!("validation failed: {}", err);
         }
         let elapsed = start.elapsed();
         if elapsed > Duration::from_millis(10) {
-            tracing::warn!(remote = ?stream.remote(), elapsed = ?elapsed, msg = %msg, "slow gossip message processing");
+            tracing::warn!(id = %id, remote = ?stream.remote(), elapsed = ?elapsed, "slow gossip message processing");
         } else {
-            tracing::debug!(remote = ?stream.remote(), elapsed = ?elapsed, msg = %msg,  "processed gossip message");
+            tracing::debug!(id = %id, remote = ?stream.remote(), elapsed = ?elapsed, "processed gossip message");
         }
     }
 }
@@ -302,6 +303,10 @@ mod tests {
 
     use super::*;
 
+    fn genesis_test() -> Certificate<Vote> {
+        genesis("test")
+    }
+
     fn cert_from_view(view: View) -> Certificate<Vote> {
         Certificate {
             inner: Vote {
@@ -387,7 +392,7 @@ mod tests {
 
         let ctx = Context::new();
         let mut history = History::new();
-        history.update(None, Some(genesis()), Some(genesis()));
+        history.update(None, Some(genesis_test()), Some(genesis_test()));
 
         let msg = Message::Sync(SyncMsg {
             locked: None,
@@ -413,7 +418,7 @@ mod tests {
 
         let ctx = Context::new();
         let mut history = History::new();
-        history.update(None, Some(genesis()), Some(genesis()));
+        history.update(None, Some(genesis_test()), Some(genesis_test()));
         let cnt = Counter::new();
 
         let mut reader = Builder::new();

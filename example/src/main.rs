@@ -5,7 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use clap::Parser;
 use hotstuff2::types::{PrivateKey, PublicKey};
-use rcgen;
+use tokio::signal::ctrl_c;
 
 mod codec;
 mod context;
@@ -33,7 +33,7 @@ struct Opt {
     )]
     directory: PathBuf,
 
-    #[clap(long, short = 'c', help = "list of sockets")]
+    #[clap(long, short = 'c', help = "list of peers to connect with")]
     connect: Vec<SocketAddr>,
 
     #[clap(
@@ -46,14 +46,10 @@ struct Opt {
 
     #[clap(long = "key", short = 'k', help = "list of pathes to private keys")]
     keys: Vec<PathBuf>,
-
-    #[clap(long, help = "maximal network delay", default_value = "100ms")]
-    delay: humantime::Duration,
 }
 
 fn try_from_hex(s: &str) -> Result<PublicKey> {
-    let bytes = hex::decode(s)?;
-    Ok(PublicKey::from_bytes(&bytes)?)
+    Ok(PublicKey::from_bytes(&hex::decode(s)?)?)
 }
 
 impl Opt {
@@ -86,49 +82,43 @@ fn main() {
 
     let opt = Opt::parse();
     tracing::debug!(opt=?opt, "running with options");
-    if let Err(err) = run(opt) {
-        tracing::error!(error = %err, "failed");
+    if let Err(err) = opt.ensure_data_dir() {
+        tracing::error!(error = %err, "failed to create data directory");
         std::process::exit(1);
     }
-    tracing::info!("exited");
+    let privates = match opt.privates() {
+        Ok(privates) => privates,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load private keys");
+            std::process::exit(1);
+        }
+    };
+    let mut node = match node::Node::init(
+        opt.directory,
+        opt.listen,
+        "example",
+        opt.participants.into_boxed_slice(),
+        privates.into_boxed_slice(),
+        opt.connect,
+    ) {
+        Ok(node) => node,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to initialize node");
+            std::process::exit(1);
+        }
+    };
+    let ctx = context::Context::new();
+    let ctrc_ctx = ctx.clone();
+    ctrlc::set_handler(move || {
+        tracing::info!("received interrupt signal");
+        ctrc_ctx.cancel();
+    });
+    // pass error up the stack
+    node.run(ctx);
+    tracing::info!("node exited");
 }
 
 #[tokio::main]
 async fn run(opts: Opt) -> Result<()> {
-    opts.ensure_data_dir()?;
-    let (cert, key) = ensure_cert(&opts)?;
-    let crypto = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(cert, key)?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    let server = quinn::Endpoint::server(server_config, opts.listen)?;
-    let local_addr = server.local_addr()?;
-    tracing::info!(address = %local_addr, "started listener");
-    let _ = opts.privates();
-    while let Some(conn) = server.accept().await {
-        tokio::spawn(async move {
-            if let Ok(conn) = conn.await {
-                if let Ok(_) = conn.open_bi().await {}
-            }
-        });
-    }
     Ok(())
-}
-
-fn ensure_cert(opts: &Opt) -> Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
-    let cert_path = opts.directory.join("cert.der");
-    let key_path = opts.directory.join("key.der");
-    if cert_path.exists() && key_path.exists() {
-        let cert = std::fs::read(cert_path)?;
-        let key = std::fs::read(key_path)?;
-        Ok((vec![rustls::Certificate(cert)], rustls::PrivateKey(key)))
-    } else {
-        let selfsigned = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        let key = selfsigned.serialize_private_key_der();
-        let cert = selfsigned.serialize_der()?;
-        std::fs::write(&cert_path, &cert)?;
-        std::fs::write(&key_path, &key)?;
-        Ok((vec![rustls::Certificate(cert)], rustls::PrivateKey(key)))
-    }
 }

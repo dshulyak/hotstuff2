@@ -44,6 +44,14 @@ impl Context {
     }
 }
 
+impl Clone for Context {
+    fn clone(&self) -> Self {
+        Self {
+            cancel: self.cancel.clone(),
+        }
+    }
+}
+
 pub(crate) struct Timeout<'a> {
     ctx: &'a Context,
     timeout: Duration,

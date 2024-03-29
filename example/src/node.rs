@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use async_scoped::TokioScope;
 use hotstuff2::sequential::Action;
 use hotstuff2::types::{PrivateKey, PublicKey};
@@ -115,6 +116,23 @@ async fn accept(
     s.collect().await;
 }
 
+fn ensure_cert(dir: &PathBuf) -> Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
+    let cert_path = dir.join("cert.der");
+    let key_path = dir.join("key.der");
+    if cert_path.exists() && key_path.exists() {
+        let cert = std::fs::read(cert_path)?;
+        let key = std::fs::read(key_path)?;
+        Ok((vec![rustls::Certificate(cert)], rustls::PrivateKey(key)))
+    } else {
+        let selfsigned = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        let key = selfsigned.serialize_private_key_der();
+        let cert = selfsigned.serialize_der()?;
+        std::fs::write(&cert_path, &cert)?;
+        std::fs::write(&key_path, &key)?;
+        Ok((vec![rustls::Certificate(cert)], rustls::PrivateKey(key)))
+    }
+}
+
 pub struct Node {
     dir: PathBuf,
     listen: SocketAddr,
@@ -123,19 +141,25 @@ pub struct Node {
     router: Router,
     consensus: TokioConsensus,
     receiver: mpsc::UnboundedReceiver<Action>,
+    endpoint: quinn::Endpoint,
 }
 
 impl Node {
     pub fn init(
         dir: PathBuf,
         listen: SocketAddr,
+        genesis: &str,
         participants: Box<[PublicKey]>,
         keys: Box<[PrivateKey]>,
         peers: Vec<SocketAddr>,
     ) -> anyhow::Result<Self> {
         let mut history = History::new();
         if history.empty() {
-            history.update(None, Some(protocol::genesis()), Some(protocol::genesis()))?
+            history.update(
+                None,
+                Some(protocol::genesis(genesis)),
+                Some(protocol::genesis(genesis)),
+            )?
         }
         let (sender, receiver) = unbounded_channel();
         let consensus = TokioConsensus::new(
@@ -147,6 +171,11 @@ impl Node {
             &keys,
             TokioSink::new(sender),
         );
+        let (cert, key) = ensure_cert(&dir)?;
+        let crypto = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(cert, key)?;
         Ok(Self {
             dir,
             listen,
@@ -155,6 +184,10 @@ impl Node {
             router: Router::new(1_000),
             consensus: consensus,
             receiver: receiver,
+            endpoint: quinn::Endpoint::server(
+                quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+                listen,
+            )?,
         })
     }
 
@@ -172,17 +205,17 @@ impl Node {
                 &self.consensus,
                 &mut self.receiver,
             ));
-            // for peer in &self.peers {
-            //     s.spawn(connect(
-            //         &ctx,
-            //         *peer,
-            //         Duration::from_secs(10),
-            //         &self.endpoint,
-            //         &self.history,
-            //         &self.consensus,
-            //     ));
-            // }
-            // s.spawn(accept(&ctx, &self.endpoint, &self.history, &self.router));
+            for peer in &self.peers {
+                s.spawn(connect(
+                    &ctx,
+                    *peer,
+                    Duration::from_secs(10),
+                    &self.endpoint,
+                    &self.history,
+                    &self.consensus,
+                ));
+            }
+            s.spawn(accept(&ctx, &self.endpoint, &self.history, &self.router));
         });
     }
 }
