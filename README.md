@@ -9,7 +9,11 @@
 
 
 TODO:
-- [ ] e2e sanity test
+- [ ] implement send_to
+  in state machine select expected leader for target round and create Action::SendTo with that leader.
+  in node advertise PublicKey before starting sync protocol. key should be advertised together with proof of possesion.
+  the proof of possesion is just a signature with the same domain over public key.
+  router should be able to match public key to an opened gossip channel when called with send_to.
 - [ ] playground testing
 - [ ] twins model checker
 - [ ] madsim simulation

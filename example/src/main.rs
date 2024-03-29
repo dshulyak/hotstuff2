@@ -5,6 +5,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use clap::Parser;
 use hotstuff2::types::{PrivateKey, PublicKey};
+use humantime::Duration;
 use tokio::signal::ctrl_c;
 
 mod codec;
@@ -46,6 +47,13 @@ struct Opt {
 
     #[clap(long = "key", short = 'k', help = "list of pathes to private keys")]
     keys: Vec<PathBuf>,
+
+    #[clap(
+        long = "network-delay",
+        default_value = "50ms",
+        help = "expected maximula delay for network messages"
+    )]
+    network_delay: Duration,
 }
 
 fn try_from_hex(s: &str) -> Result<PublicKey> {
@@ -102,6 +110,7 @@ fn main() {
         participants.into_boxed_slice(),
         privates.into_boxed_slice(),
         opt.connect,
+        opt.network_delay.into(),
     ) {
         Ok(node) => node,
         Err(err) => {

@@ -261,7 +261,7 @@ pub(crate) async fn process_actions(
                 let id = msg.short_id().await.unwrap();
                 tracing::debug!(id = %id, msg = %msg, "sent message");
                 if let Err(err) = consensus.on_message(msg.clone()) {
-                    tracing::error!(error = ?err, "failed to validate own message")
+                    tracing::warn!(error = ?err, "failed to validate own message")
                 };
                 router.send_all(msg);
             }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_scoped::TokioScope;
 use hotstuff2::sequential::Action;
-use hotstuff2::types::{PrivateKey, PublicKey};
+use hotstuff2::types::{Certificate, PrivateKey, PublicKey, Vote};
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
@@ -147,6 +147,7 @@ pub struct Node {
     consensus: TokioConsensus,
     receiver: mpsc::UnboundedReceiver<Action>,
     endpoint: quinn::Endpoint,
+    network_delay: Duration,
 }
 
 impl Node {
@@ -157,6 +158,7 @@ impl Node {
         participants: Box<[PublicKey]>,
         keys: Box<[PrivateKey]>,
         peers: Vec<SocketAddr>,
+        network_delay: Duration,
     ) -> anyhow::Result<Self> {
         let mut history = History::new();
         if history.empty() {
@@ -199,7 +201,12 @@ impl Node {
             consensus: consensus,
             receiver: receiver,
             endpoint: endpoint,
+            network_delay: network_delay,
         })
+    }
+
+    pub(crate) fn last_commit(&self) -> Certificate<Vote> {
+        self.history.lock().last_commit()
     }
 
     pub async fn run(&mut self, ctx: Context) {
@@ -207,7 +214,7 @@ impl Node {
 
         s.spawn(protocol::notify_delays(
             &ctx,
-            Duration::from_millis(100),
+            self.network_delay,
             &self.consensus,
         ));
         s.spawn(protocol::process_actions(
@@ -229,6 +236,28 @@ impl Node {
         }
         s.spawn(accept(&ctx, &self.endpoint, &self.history, &self.router));
         s.collect().await;
+    }
+}
+
+struct SkipServerVerification;
+
+impl SkipServerVerification {
+    fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+}
+
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
     }
 }
 
@@ -291,45 +320,36 @@ mod tests {
                         .filter(|sock| listener != **sock)
                         .copied()
                         .collect(),
+                    Duration::from_millis(50),
                 )
                 .unwrap()
             })
             .collect::<Vec<_>>();
 
-        let ctx = context::Context::new();
-        let mut s = unsafe { TokioScope::create(Default::default()) };
-        for (i, node) in nodes.iter_mut().enumerate() {
+        {
+            let ctx = context::Context::new();
+            let mut s = unsafe { TokioScope::create(Default::default()) };
+            for (i, node) in nodes.iter_mut().enumerate() {
+                s.spawn(async {
+                    node.run(ctx.clone()).await;
+                });
+            }
+            // TODO change test to run until expected number of blocks were comitted
             s.spawn(async {
-                node.run(ctx.clone()).await;
+                sleep(Duration::from_secs(2)).await;
+                ctx.cancel();
             });
+            s.collect().await;
         }
-        s.spawn(async {
-            sleep(Duration::from_secs(2)).await;
-            ctx.cancel();
-        });
-        s.collect().await;
-    }
-}
-
-// Implementation of `ServerCertVerifier` that verifies everything as trustworthy.
-struct SkipServerVerification;
-
-impl SkipServerVerification {
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
-    }
-}
-
-impl rustls::client::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        let max = nodes
+            .iter_mut()
+            .map(|node| node.history.lock().last_commit().inner.view)
+            .max()
+            .unwrap();
+        assert!(max > 0.into());
+        for node in nodes.iter_mut() {
+            let commit = node.history.lock().last_commit().inner.view;
+            assert!(commit == max || commit == (max.0 - 1).into());
+        }
     }
 }
