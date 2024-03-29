@@ -32,13 +32,13 @@ impl Context {
         self.timeout(Duration::from_secs(secs))
     }
 
-    pub(crate) async fn select<T, F: Future<Output = T>>(&self, f: F) -> anyhow::Result<T> {
+    pub(crate) async fn select<T, F: Future<Output = T>>(&self, f: F) -> Option<T> {
         select! {
             _ = self.cancel.cancelled() => {
-                anyhow::bail!("cancelled");
+                None
             },
             res = f => {
-                Ok(res)
+                Some(res)
             }
         }
     }

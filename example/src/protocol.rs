@@ -218,7 +218,7 @@ async fn gossip_messages(
     msgs: &mut Receiver<Arc<Message>>,
     stream: &mut MsgStream,
 ) -> anyhow::Result<()> {
-    while let Some(msg) = ctx.select(msgs.recv()).await? {
+    while let Some(Some(msg)) = ctx.select(msgs.recv()).await {
         tracing::debug!(remote = %stream.remote(), "sending gossip message");
         ctx.timeout_secs(10).select(stream.send_msg(&msg)).await?;
     }
@@ -255,7 +255,7 @@ pub(crate) async fn process_actions(
     consensus: &(impl Proposer + OnMessage),
     receiver: &mut mpsc::UnboundedReceiver<Action>,
 ) {
-    while let Ok(Some(action)) = ctx.select(receiver.recv()).await {
+    while let Some(Some(action)) = ctx.select(receiver.recv()).await {
         match action {
             Action::Send(msg) => {
                 let id = msg.short_id().await.unwrap();

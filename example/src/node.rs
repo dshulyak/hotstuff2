@@ -71,9 +71,12 @@ async fn connect(
         if let Err(err) = initiate(ctx, endpoint, peer, history, consensus).await {
             tracing::warn!(error = ?err, "failed to connect to peer");
         }
-        if let Err(err) = ctx.select(sleep(reconnect_interval)).await {
-            tracing::debug!(error = ?err, "task to reconnect to peer is cancelled");
-            return;
+        match ctx.select(sleep(reconnect_interval)).await {
+            Some(_) => {}
+            None => {
+                tracing::debug!("task to reconnect to peer is cancelled");
+                return;
+            }
         }
     }
 }
@@ -86,7 +89,7 @@ async fn accept(
 ) {
     tracing::info!(local = %endpoint.local_addr().unwrap(), "accepting connections");
     let mut s = unsafe { TokioScope::create(Default::default()) };
-    while let Ok(Some(conn)) = ctx.select(endpoint.accept()).await {
+    while let Some(Some(conn)) = ctx.select(endpoint.accept()).await {
         s.spawn(async {
             let conn = match ctx.timeout_secs(10).select(conn).await {
                 Ok(Ok(conn)) => Connection::new(conn),
@@ -100,7 +103,7 @@ async fn accept(
                 }
             };
             let mut s = unsafe { TokioScope::create(Default::default()) };
-            while let Ok(Ok(stream)) = ctx.select(conn.accept()).await {
+            while let Some(Ok(stream)) = ctx.select(conn.accept()).await {
                 match stream.protocol() {
                     protocol::GOSSIP_PROTOCOL => {
                         s.spawn(protocol::gossip_accept(ctx, router, stream));

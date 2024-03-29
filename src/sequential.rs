@@ -149,10 +149,11 @@ impl<T: Actions> Consensus<T> {
 
     fn on_sync(&self, sync: Sync) -> Result<()> {
         if let Some(double) = &sync.commit {
-            ensure!(
-                double.signers.iter().filter(|b| *b).count() == self.participants.honest_majority()
-            );
             if double.inner.view > View(0) {
+                ensure!(
+                    double.signers.iter().filter(|b| *b).count()
+                        == self.participants.honest_majority()
+                );
                 double.signature.verify(
                     Domain::Vote2,
                     &double.inner.to_bytes(),
@@ -161,15 +162,18 @@ impl<T: Actions> Consensus<T> {
             }
         }
         if let Some(locked) = &sync.locked {
-            ensure!(
-                locked.signers.iter().filter(|b| *b).count() == self.participants.honest_majority()
-            );
             if locked.inner.view > View(0) {
-                locked.signature.verify(
-                    Domain::Vote,
-                    &locked.inner.to_bytes(),
-                    self.participants.decode(&locked.signers),
-                )?;
+                ensure!(
+                    locked.signers.iter().filter(|b| *b).count()
+                        == self.participants.honest_majority()
+                );
+                if locked.inner.view > View(0) {
+                    locked.signature.verify(
+                        Domain::Vote,
+                        &locked.inner.to_bytes(),
+                        self.participants.decode(&locked.signers),
+                    )?;
+                }
             }
         }
 
@@ -208,7 +212,7 @@ impl<T: Actions> Consensus<T> {
 
         let wishes = {
             let mut state = self.state.lock();
-            ensure!(wish.inner.view > state.view, "old view");
+            ensure!(wish.inner.view > state.view);
 
             let wishes = state
                 .timeouts
@@ -255,7 +259,7 @@ impl<T: Actions> Consensus<T> {
         )?;
 
         let mut state = self.state.lock();
-        ensure!(timeout.certificate.inner > state.view, "old view");
+        ensure!(timeout.certificate.inner > state.view);
         state.enter_view(timeout.certificate.inner);
         state.wait_first_delay(timeout.certificate.inner);
         self.actions.send(Action::Send(Message::Sync(Sync {
@@ -296,11 +300,6 @@ impl<T: Actions> Consensus<T> {
             ensure!(
                 propose.inner.double.signers.iter().filter(|b| *b).count()
                     == self.participants.honest_majority()
-            );
-            ensure!(
-                propose.inner.double.signers.iter().filter(|b| *b).count()
-                    == self.participants.honest_majority(),
-                "double signed by more than 2/3 participants"
             );
             propose.inner.double.signature.verify(
                 Domain::Vote2,
