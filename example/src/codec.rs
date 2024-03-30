@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use bit_vec::BitVec;
 use hotstuff2::types::{
-    Block, Certificate, Message, Prepare, Propose, Signature, Signed, Sync as SyncMsg, Timeout,
-    ToBytes, View, Vote, Wish, SIGNATURE_SIZE,
+    Block, Certificate, Message, Prepare, Propose, PublicKey, Signature, Signed, Sync as SyncMsg,
+    Timeout, ToBytes, View, Vote, Wish, PUBLIC_KEY_SIZE, SIGNATURE_SIZE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter, Error, ErrorKind, Result};
 
@@ -95,7 +95,7 @@ impl<T: AsyncEncode + ToBytes + Sync> AsyncEncode for Signed<T> {
     async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
         self.inner.encode(w).await?;
         w.write_u16(self.signer).await?;
-        w.write_all(&self.signature.to_bytes()).await?;
+        w.write_all(self.signature.to_bytes()).await?;
         Ok(())
     }
 }
@@ -351,5 +351,43 @@ impl AsyncDecode for Protocol {
     async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self> {
         let v = r.read_u16().await?;
         Ok(Protocol(v))
+    }
+}
+
+pub(crate) struct ProofOfPossesion {
+    pub(crate) key: PublicKey,
+    pub(crate) signature: Signature,
+}
+
+#[async_trait]
+impl AsyncEncode for ProofOfPossesion {
+    async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
+        let pubk = self.key.to_bytes();
+        w.write_all(&pubk).await?;
+        w.write_all(self.signature.to_bytes()).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AsyncDecode for ProofOfPossesion {
+    async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self> {
+        let mut pubk = [0u8; PUBLIC_KEY_SIZE];
+        r.read_exact(&mut pubk).await?;
+        let key = PublicKey::from_bytes(&pubk).map_err(|err| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid public key: {}", err),
+            )
+        })?;
+        let mut sig = [0u8; SIGNATURE_SIZE];
+        r.read_exact(&mut sig).await?;
+        let signature = Signature::from_bytes(&sig).map_err(|err| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid signature: {}", err),
+            )
+        })?;
+        Ok(ProofOfPossesion { key, signature })
     }
 }

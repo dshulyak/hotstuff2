@@ -1,6 +1,7 @@
+use std::rc::Rc;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use hotstuff2::types::Message;
+use hotstuff2::types::{Message, PublicKey};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Result};
 use tokio::sync::mpsc;
@@ -81,44 +82,80 @@ impl MsgStream {
     }
 }
 
+struct Table {
+    sockets: HashMap<SocketAddr, mpsc::Sender<Arc<Message>>>,
+    public_keys: HashMap<PublicKey, mpsc::Sender<Arc<Message>>>,
+}
+
+impl Table {
+    fn new() -> Self {
+        Self {
+            sockets: HashMap::new(),
+            public_keys: HashMap::new(),
+        }
+    }
+}
+
 pub(crate) struct Router {
     per_channel_buffer_size: usize,
-    gossip: Mutex<HashMap<SocketAddr, mpsc::Sender<Arc<Message>>>>,
+    table: Mutex<Table>,
 }
 
 impl Router {
     pub(crate) fn new(per_channel_buffer_size: usize) -> Self {
         Self {
             per_channel_buffer_size: per_channel_buffer_size,
-            gossip: Mutex::new(HashMap::new()),
+            table: Mutex::new(Table::new()),
         }
     }
 
     pub(crate) fn register(
         &self,
         addr: SocketAddr,
+        publics: impl Iterator<Item = PublicKey>,
     ) -> anyhow::Result<mpsc::Receiver<Arc<Message>>> {
         let (sender, receiver) = mpsc::channel(self.per_channel_buffer_size);
-        let mut gossip = self.gossip.lock();
-        if gossip.contains_key(&addr) {
+        let mut table = self.table.lock();
+        if table.sockets.contains_key(&addr) {
             anyhow::bail!("peer with address is already registered");
         }
-        gossip.insert(addr, sender);
+        for pubk in publics {
+            table.public_keys.insert(pubk, sender.clone());
+        }
+        table.sockets.insert(addr, sender);
         Ok(receiver)
     }
 
-    pub(crate) fn remove(&self, addr: &SocketAddr) {
-        self.gossip.lock().remove(addr);
+    pub(crate) fn remove<'a>(
+        &self,
+        addr: &SocketAddr,
+        publics: impl Iterator<Item = &'a PublicKey>,
+    ) {
+        let mut table = self.table.lock();
+        for pubk in publics {
+            table.public_keys.remove(&pubk);
+        }
+        table.sockets.remove(addr);
     }
 
     pub(crate) fn send_all(&self, msg: Message) {
         let msg = Arc::new(msg);
-        self.gossip.lock().retain(|_, sender| {
+        self.table.lock().sockets.retain(|_, sender| {
             if let Err(err) = sender.try_send(msg.clone()) {
                 tracing::debug!(error = ?err, "failed to send message");
                 return false;
             }
             return true;
         });
+    }
+
+    pub(crate) fn send_to(&self, pubk: &PublicKey, msg: Message) -> anyhow::Result<()> {
+        let msg = Arc::new(msg);
+        if let Some(sender) = self.table.lock().public_keys.get(pubk) {
+            sender.try_send(msg.clone())?;
+        } else {
+            anyhow::bail!("peer with public key {:?} is not registered", pubk);
+        }
+        Ok(())
     }
 }

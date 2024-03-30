@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,7 +6,7 @@ use anyhow::anyhow;
 use bit_vec::BitVec;
 use hotstuff2::sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer};
 use hotstuff2::types::{
-    AggregateSignature, Block, Certificate, Message, Sync as SyncMsg, View, Vote, ID,
+    AggregateSignature, Block, Certificate, Message, PublicKey, Sync as SyncMsg, View, Vote, ID,
 };
 use parking_lot::Mutex;
 use tokio::select;
@@ -197,7 +198,7 @@ async fn consume_messages(
 
 pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: MsgStream) {
     let mut msgs = {
-        match router.register(stream.remote()) {
+        match router.register(stream.remote(), vec![].into_iter()) {
             Ok(msgs) => msgs,
             Err(err) => {
                 tracing::warn!(error = ?err, "failed to register peer");
@@ -210,7 +211,7 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
         tracing::debug!(error = ?err, remote = %stream.remote(), "error in gossip stream");
     }
     tracing::debug!(remote = %stream.remote(), "closing gossip stream");
-    router.remove(&stream.remote());
+    router.remove(&stream.remote(), vec![].iter());
 }
 
 async fn gossip_messages(
@@ -252,18 +253,35 @@ pub(crate) async fn process_actions(
     ctx: &Context,
     history: &Mutex<History>,
     router: &Router,
+    local: HashSet<PublicKey>,
     consensus: &(impl Proposer + OnMessage),
     receiver: &mut mpsc::UnboundedReceiver<Action>,
 ) {
     while let Some(Some(action)) = ctx.select(receiver.recv()).await {
         match action {
-            Action::Send(msg) => {
+            Action::Send(msg, to) => {
                 let id = msg.short_id().await.unwrap();
-                tracing::debug!(id = %id, msg = %msg, "sent message");
-                if let Err(err) = consensus.on_message(msg.clone()) {
-                    tracing::warn!(error = ?err, "failed to validate own message")
-                };
-                router.send_all(msg);
+
+                tracing::debug!(id = %id, msg = %msg, to=?to, "sent message");
+                match to {
+                    None => {
+                        if let Err(err) = consensus.on_message(msg.clone()) {
+                            tracing::warn!(error = ?err, "failed to validate own message")
+                        };
+                        router.send_all(msg);
+                    }
+                    Some(public) => {
+                        if local.contains(&public) {
+                            if let Err(err) = consensus.on_message(msg.clone()) {
+                                tracing::warn!(error = ?err, "failed to validate own message")
+                            };
+                        } else {
+                            if let Err(err) = router.send_to(&public, msg) {
+                                tracing::warn!(error = ?err, "failed to send message");
+                            }
+                        }
+                    }
+                }
             }
             Action::StateChange(change) => {
                 if let Some(commit) = &change.commit {

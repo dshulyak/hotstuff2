@@ -121,8 +121,8 @@ impl<T: Actions> Consensus<T> {
         self.state.lock().view
     }
 
-    pub fn sink(&self) -> &T {
-        &self.actions
+    pub fn local_keys(&self) -> impl IntoIterator<Item = PublicKey> + '_ {
+        self.keys.values().map(|key| key.public())
     }
 
     pub(crate) fn is_leader(&self, view: View) -> bool {

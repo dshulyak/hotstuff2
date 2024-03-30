@@ -489,8 +489,8 @@ impl Signature {
         blst::Signature::from_bytes(&self.0).map_err(|_| anyhow!("invalid signature"))
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.0.to_vec()
+    pub fn to_bytes(&self) -> &[u8; SIGNATURE_SIZE] {
+        &self.0
     }
 
     pub fn from_bytes(bytes: &[u8; SIGNATURE_SIZE]) -> Result<Self> {

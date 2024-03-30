@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -217,10 +218,17 @@ impl Node {
             self.network_delay,
             &self.consensus,
         ));
+
+        let local_public_keys = self
+            .consensus
+            .local_keys()
+            .into_iter()
+            .collect::<HashSet<_>>();
         s.spawn(protocol::process_actions(
             &ctx,
             &self.history,
             &self.router,
+            local_public_keys,
             &self.consensus,
             &mut self.receiver,
         ));
