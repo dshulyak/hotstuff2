@@ -297,13 +297,16 @@ impl Instance {
     // bootstrap enter specified view and generates lock verificate in that view for block with id
     fn bootstrap(&mut self, tester: &Tester, view: View, id: &str) {
         self.on_message(tester.timeout(view, vec![0, 1, 2]));
-        self.send(tester.sync_genesis());
+        self.send_one(tester.sync_genesis(), 1);
         self.on_message(tester.propose_first(view, id));
         self.voted(view);
-        self.send(tester.vote(view, GENESIS, id, self.signer));
+        self.send_one(tester.vote(view, GENESIS, id, self.signer), 1);
         self.on_message(tester.prepare(view, GENESIS, id, vec![0, 1, 2]));
         self.lock(tester.certify_vote(view, GENESIS, id, vec![0, 1, 2]));
-        self.send(tester.vote2(view, GENESIS, id, self.signer, vec![0, 1, 2]));
+        self.send_one(
+            tester.vote2(view, GENESIS, id, self.signer, vec![0, 1, 2]),
+            1,
+        );
         self.no_actions();
     }
 
@@ -334,8 +337,13 @@ impl Instance {
         self.consensus.c.propose(ID::from_str(id)).expect("ERROR");
     }
 
-    fn send(&mut self, message: Message) {
-        self.action(seq::Action::Send(message));
+    fn send_all(&mut self, message: Message) {
+        self.action(seq::Action::Send(message, None));
+    }
+
+    fn send_one(&mut self, message: Message, to: Signer) {
+        let public = self.consensus.c.public_key_by_index(to);
+        self.action(seq::Action::Send(message, Some(public)));
     }
 
     fn state_change(
@@ -435,8 +443,16 @@ impl Instances {
         self.0.iter_mut().for_each(|instance| instance.voted(view));
     }
 
-    fn send(&mut self, message: Message) {
-        self.action(seq::Action::Send(message));
+    fn send_all(&mut self, message: Message) {
+        self.0
+            .iter_mut()
+            .for_each(|instance| instance.send_all(message.clone()));
+    }
+
+    fn send_one(&mut self, message: Message, to: Signer) {
+        self.0
+            .iter_mut()
+            .for_each(|instance| instance.send_one(message.clone(), to));
     }
 
     fn no_actions(&mut self) {
@@ -495,7 +511,7 @@ fn test_commit_one() {
             Some(tester.certify_vote2(1.into(), GENESIS, "a", vec![0, 1, 2])),
             Some(2.into()),
         );
-        inst.send(tester.vote(2.into(), "a", "b", inst.signer));
+        inst.send_one(tester.vote(2.into(), "a", "b", inst.signer), 2);
     });
 }
 
@@ -523,16 +539,19 @@ fn test_tick_on_epoch_boundary() {
 
         inst.on_tick();
         inst.consume_actions();
-        inst.send(tester.wish(3.into(), inst.signer));
+        inst.send_one(tester.wish(3.into(), inst.signer), 3);
         inst.on_message(tester.timeout(3.into(), vec![0, 1, 2]));
         let locked_b = tester.certify_vote(2.into(), "a", "b", vec![1, 2, 3]);
         let double_a = tester.certify_vote2(1.into(), GENESIS, "a", vec![0, 1, 2]);
-        inst.send(tester.sync(Some(locked_b.clone()), Some(double_a.clone())));
+        inst.send_one(
+            tester.sync(Some(locked_b.clone()), Some(double_a.clone())),
+            3,
+        );
         inst.on_delay();
-        inst.send(tester.propose(3.into(), "a", "b", locked_b.clone(), double_a.clone()));
+        inst.send_all(tester.propose(3.into(), "a", "b", locked_b.clone(), double_a.clone()));
         inst.on_message(tester.propose(3.into(), "a", "b", locked_b.clone(), double_a.clone()));
         inst.voted(3.into());
-        inst.send(tester.vote(3.into(), "a", "b", inst.signer));
+        inst.send_one(tester.vote(3.into(), "a", "b", inst.signer), 3);
     });
 }
 
@@ -543,11 +562,14 @@ fn test_propose_after_delay() {
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
         let locked_a = tester.certify_vote(1.into(), GENESIS, "a", vec![0, 1, 2]);
-        inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
+        inst.send_one(
+            tester.sync(Some(locked_a.clone()), Some(tester.genesis())),
+            2,
+        );
 
         inst.no_actions();
         inst.on_delay();
-        inst.send(tester.propose(2.into(), GENESIS, "a", locked_a.clone(), tester.genesis()));
+        inst.send_all(tester.propose(2.into(), GENESIS, "a", locked_a.clone(), tester.genesis()));
     })
 }
 
@@ -559,7 +581,10 @@ fn test_nonleader_on_delay() {
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
         let locked_a = tester.certify_vote(1.into(), GENESIS, "a", vec![0, 1, 2]);
-        inst.send(tester.sync(Some(locked_a.clone()), Some(tester.genesis())));
+        inst.send_one(
+            tester.sync(Some(locked_a.clone()), Some(tester.genesis())),
+            2,
+        );
         inst.on_delay();
         inst.no_actions();
     })
@@ -607,7 +632,7 @@ fn test_aggregate_timeout() {
         (0..4)
             .map(|i| tester.wish(1.into(), i as Signer))
             .for_each(|w| inst.on_message(w));
-        inst.send(tester.timeout(1.into(), vec![0, 1, 2]))
+        inst.send_all(tester.timeout(1.into(), vec![0, 1, 2]))
     })
 }
 
@@ -628,9 +653,9 @@ fn test_repetetive_messages() {
 fn test_multi_bootstrap() {
     gentest(4, |tester, instances: &mut Instances| {
         instances.on_tick();
-        instances.for_each(|i| i.send(tester.wish(1.into(), i.signer)));
+        instances.for_each(|i| i.send_one(tester.wish(1.into(), i.signer), 1));
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
-        instances.send(tester.sync_genesis());
+        instances.send_one(tester.sync_genesis(), 1);
         instances.on_delay();
         instances.leader(1.into()).propose();
 
@@ -639,7 +664,7 @@ fn test_multi_bootstrap() {
         instances.leader(1.into()).on_propose("a");
         instances
             .leader(1.into())
-            .send(tester.propose_first(1.into(), "a"));
+            .send_all(tester.propose_first(1.into(), "a"));
         instances.on_message(tester.propose_first(1.into(), "a"));
         instances.voted(1.into());
 
@@ -648,7 +673,7 @@ fn test_multi_bootstrap() {
             .iter_mut()
             .map(|i| {
                 let vote = tester.vote(1.into(), GENESIS, "a", i.signer);
-                i.send(vote.clone());
+                i.send_one(vote.clone(), 1);
                 vote
             })
             .collect::<Vec<_>>();
@@ -660,13 +685,13 @@ fn test_multi_bootstrap() {
         });
         instances
             .leader(1.into())
-            .send(tester.prepare(1.into(), GENESIS, "a", vec![0, 1, 2]));
+            .send_all(tester.prepare(1.into(), GENESIS, "a", vec![0, 1, 2]));
         instances.on_message(tester.prepare(1.into(), GENESIS, "a", vec![0, 1, 2]));
         instances.lock(tester.certify_vote(1.into(), GENESIS, "a", vec![0, 1, 2]));
         instances
             .map(|i| {
                 let vote = tester.vote2(1.into(), GENESIS, "a", i.signer, vec![0, 1, 2]);
-                i.send(vote.clone());
+                i.send_one(vote.clone(), 1);
                 vote
             })
             .into_iter()
@@ -675,7 +700,7 @@ fn test_multi_bootstrap() {
         let leader2 = instances.leader(2.into());
         leader2.propose();
         leader2.on_propose("b");
-        leader2.send(tester.propose(
+        leader2.send_all(tester.propose(
             2.into(),
             "a",
             "b",
@@ -716,7 +741,7 @@ impl SimState {
         for a in inst.actions() {
             acted = false;
             match a {
-                seq::Action::Send(m) => {
+                seq::Action::Send(m, _) => {
                     send_random_messages(m, tester, i as Signer, &mut self.inputs, runner)
                 }
                 // seq::Action::WaitDelay => self.wait_delay[i] = true,
@@ -739,7 +764,7 @@ impl SimState {
         for a in inst.actions() {
             acted = false;
             match a {
-                seq::Action::Send(m) => self
+                seq::Action::Send(m, _) => self
                     .inputs
                     .iter_mut()
                     .for_each(|input| input.push(m.clone())),

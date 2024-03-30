@@ -45,11 +45,8 @@ impl StateChange {
 pub enum Action {
     StateChange(StateChange),
 
-    // send message to all participants
-    Send(Message),
-    // TODO
-    // // send message to a specific participant. some messages may be delievered directly for aggregation purposes.
-    // SendTo(Message, PublicKey),
+    // send message, optionally include participant that should receive this message.
+    Send(Message, Option<PublicKey>),
 
     // node is a leader and ready to propose.
     // leader will not finish a round on time if it does not call `propose` method within short delay.
@@ -128,9 +125,25 @@ impl<T: Actions> Consensus<T> {
         &self.actions
     }
 
-    pub fn is_leader(&self, view: View) -> bool {
+    pub(crate) fn is_leader(&self, view: View) -> bool {
         let leader = self.participants.leader(view);
         self.keys.get(&leader).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn public_key_by_index(&self, index: Signer) -> PublicKey {
+        self.participants[index].clone()
+    }
+
+    fn send_all(&self, msg: Message) {
+        self.actions.send(Action::Send(msg, None));
+    }
+
+    fn send_leader(&self, msg: Message, view: View) {
+        self.actions.send(Action::Send(
+            msg,
+            Some(self.participants.leader_pub_key(view)),
+        ));
     }
 
     fn send_proposal(&self, proposal: Propose) {
@@ -140,11 +153,11 @@ impl<T: Actions> Consensus<T> {
             .get(&signer)
             .expect("propose shouldn't be called if node is not a leader");
         let signature = pk.sign(Domain::Propose, &proposal.to_bytes());
-        self.actions.send(Action::Send(Message::Propose(Signed {
+        self.send_all(Message::Propose(Signed {
             inner: proposal,
             signer: signer,
             signature,
-        })));
+        }));
     }
 
     fn on_sync(&self, sync: Sync) -> Result<()> {
@@ -233,14 +246,14 @@ impl<T: Actions> Consensus<T> {
         };
 
         if let Some(wishes) = wishes {
-            self.actions.send(Action::Send(Message::Timeout(Timeout {
+            self.send_all(Message::Timeout(Timeout {
                 certificate: Certificate {
                     inner: wishes.message().view,
                     signature: AggregateSignature::aggregate(wishes.signatures())
                         .expect("failed to aggregate signatures"),
                     signers: wishes.signers(),
                 },
-            })));
+            }));
         }
         Ok(())
     }
@@ -262,10 +275,13 @@ impl<T: Actions> Consensus<T> {
         ensure!(timeout.certificate.inner > state.view);
         state.enter_view(timeout.certificate.inner);
         state.wait_first_delay(timeout.certificate.inner);
-        self.actions.send(Action::Send(Message::Sync(Sync {
-            locked: Some(state.locked.clone()),
-            commit: Some(state.commit.clone()),
-        })));
+        self.send_leader(
+            Message::Sync(Sync {
+                locked: Some(state.locked.clone()),
+                commit: Some(state.commit.clone()),
+            }),
+            state.view,
+        );
         Ok(())
     }
 
@@ -351,15 +367,18 @@ impl<T: Actions> Consensus<T> {
         }
         self.keys.iter().for_each(|(signer, pk)| {
             let vote = Vote {
-                view: propose.inner.view.clone(),
+                view: propose.inner.view,
                 block: propose.inner.block.clone(),
             };
             let signature = pk.sign(Domain::Vote, &vote.to_bytes());
-            self.actions.send(Action::Send(Message::Vote(Signed {
-                inner: vote,
-                signer: *signer,
-                signature,
-            })));
+            self.send_leader(
+                Message::Vote(Signed {
+                    inner: vote,
+                    signer: *signer,
+                    signature,
+                }),
+                propose.inner.view,
+            );
         });
         Ok(())
     }
@@ -426,11 +445,14 @@ impl<T: Actions> Consensus<T> {
         self.keys.iter().for_each(|(signer, pk)| {
             let vote = locked.inner.to_bytes();
             let signature = pk.sign(Domain::Vote2, &vote);
-            self.actions.send(Action::Send(Message::Vote2(Signed {
-                inner: locked.clone(),
-                signer: *signer,
-                signature,
-            })));
+            self.send_leader(
+                Message::Vote2(Signed {
+                    inner: locked.clone(),
+                    signer: *signer,
+                    signature,
+                }),
+                locked.inner.view,
+            );
         });
         Ok(())
     }
@@ -483,11 +505,11 @@ impl<T: Actions> Consensus<T> {
                 },
             };
             let signature = pk.sign(Domain::Prepare, &cert.to_bytes());
-            self.actions.send(Action::Send(Message::Prepare(Signed {
+            self.send_all(Message::Prepare(Signed {
                 inner: cert,
                 signer: signer,
                 signature,
-            })));
+            }));
         }
         Ok(())
     }
@@ -585,10 +607,13 @@ impl<T: Actions> OnDelay for Consensus<T> {
                     let next = state.view + 1;
                     state.enter_view(next);
                     state.wait_first_delay(next);
-                    self.actions.send(Action::Send(Message::Sync(Sync {
-                        locked: Some(state.locked.clone()),
-                        commit: Some(state.commit.clone()),
-                    })));
+                    self.send_leader(
+                        Message::Sync(Sync {
+                            locked: Some(state.locked.clone()),
+                            commit: Some(state.commit.clone()),
+                        }),
+                        next,
+                    );
                     (None, None)
                 }
             } else if state.ticks == DELAY
@@ -630,11 +655,14 @@ impl<T: Actions> OnDelay for Consensus<T> {
             (None, Some(wish)) => {
                 for (signer, pk) in self.keys.iter() {
                     let signature = pk.sign(Domain::Wish, &wish.to_bytes());
-                    self.actions.send(Action::Send(Message::Wish(Signed {
-                        inner: wish.clone(),
-                        signer: *signer,
-                        signature,
-                    })));
+                    self.send_leader(
+                        Message::Wish(Signed {
+                            inner: wish.clone(),
+                            signer: *signer,
+                            signature,
+                        }),
+                        wish.view,
+                    );
                 }
             }
             _ => (),
@@ -760,6 +788,10 @@ impl Signers {
     fn leader(&self, view: View) -> Signer {
         let i = view % self.0.len() as u64;
         i as Signer
+    }
+
+    fn leader_pub_key(&self, view: View) -> PublicKey {
+        self[self.leader(view)].clone()
     }
 }
 
