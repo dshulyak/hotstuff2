@@ -7,11 +7,12 @@ use std::time::Duration;
 use anyhow::Result;
 use async_scoped::TokioScope;
 use hotstuff2::sequential::Action;
-use hotstuff2::types::{Certificate, PrivateKey, PublicKey, Vote};
+use hotstuff2::types::{Certificate, Domain, PrivateKey, PublicKey, Vote};
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
 
+use crate::codec::ProofOfPossesion;
 use crate::context::Context;
 use crate::history::History;
 use crate::net::{Connection, Router};
@@ -22,6 +23,7 @@ async fn initiate(
     endpoint: &quinn::Endpoint,
     peer: SocketAddr,
     history: &Mutex<History>,
+    proofs: &Box<[ProofOfPossesion]>,
     consensus: &protocol::TokioConsensus,
 ) -> anyhow::Result<()> {
     let conn = match endpoint.connect(peer, "localhost") {
@@ -66,10 +68,11 @@ async fn connect(
     reconnect_interval: Duration,
     endpoint: &quinn::Endpoint,
     history: &Mutex<History>,
+    proofs: &Box<[ProofOfPossesion]>,
     consensus: &protocol::TokioConsensus,
 ) {
     loop {
-        if let Err(err) = initiate(ctx, endpoint, peer, history, consensus).await {
+        if let Err(err) = initiate(ctx, endpoint, peer, history, proofs, consensus).await {
             tracing::warn!(error = ?err, "failed to connect to peer");
         }
         match ctx.select(sleep(reconnect_interval)).await {
@@ -145,6 +148,7 @@ pub struct Node {
     peers: Vec<SocketAddr>,
     history: Mutex<History>,
     router: Router,
+    proofs: Box<[ProofOfPossesion]>,
     consensus: TokioConsensus,
     receiver: mpsc::UnboundedReceiver<Action>,
     endpoint: quinn::Endpoint,
@@ -194,6 +198,14 @@ impl Node {
             listen,
         )?;
         endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(client_crypto)));
+        let proofs = keys
+            .iter()
+            .map(|key| ProofOfPossesion {
+                key: key.public(),
+                signature: key.sign(Domain::Possesion, &key.public().to_bytes()),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Ok(Self {
             listen,
             peers,
@@ -203,6 +215,7 @@ impl Node {
             receiver: receiver,
             endpoint: endpoint,
             network_delay: network_delay,
+            proofs: proofs,
         })
     }
 
@@ -239,6 +252,7 @@ impl Node {
                 Duration::from_secs(1),
                 &self.endpoint,
                 &self.history,
+                &self.proofs,
                 &self.consensus,
             ));
         }
