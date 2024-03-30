@@ -354,6 +354,7 @@ impl AsyncDecode for Protocol {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProofOfPossesion {
     pub(crate) key: PublicKey,
     pub(crate) signature: Signature,
@@ -389,5 +390,51 @@ impl AsyncDecode for ProofOfPossesion {
             )
         })?;
         Ok(ProofOfPossesion { key, signature })
+    }
+}
+
+pub(crate) struct Hello<'a> {
+    pub(crate) proofs: &'a [ProofOfPossesion],
+}
+
+#[async_trait]
+impl<'a> AsyncEncode for Hello<'a> {
+    async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
+        Len(self.proofs.len() as u16).encode(w).await?;
+        for proof in self.proofs {
+            proof.encode(w).await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Len(u16);
+
+impl Len {
+    pub(crate) const fn new(v: u16) -> Self {
+        Len(v)
+    }
+}
+
+#[async_trait]
+impl AsyncEncode for Len {
+    async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
+        w.write_u16(self.0).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AsyncDecode for Len {
+    async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self> {
+        let v = r.read_u16().await?;
+        Ok(Len(v))
+    }
+}
+
+impl From<Len> for usize {
+    fn from(len: Len) -> Self {
+        len.0 as usize
     }
 }

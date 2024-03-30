@@ -466,12 +466,8 @@ impl Signature {
         Signature(bytes)
     }
 
-    pub(crate) fn verify(
-        &self,
-        domain: Domain,
-        message: &[u8],
-        public_key: &PublicKey,
-    ) -> Result<()> {
+    // verify expects public keys to be checked for subgroup and infinity when added to the participants set
+    pub fn verify(&self, domain: Domain, message: &[u8], public_key: &PublicKey) -> Result<()> {
         match self
             .to_blst()?
             .verify(true, message, domain.into(), &[], &public_key.0, false)

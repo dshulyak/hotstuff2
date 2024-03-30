@@ -451,7 +451,7 @@ impl<T: Actions> Consensus<T> {
                     signer: *signer,
                     signature,
                 }),
-                locked.inner.view,
+                locked.inner.view + 1,
             );
         });
         Ok(())

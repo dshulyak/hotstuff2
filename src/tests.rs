@@ -305,7 +305,7 @@ impl Instance {
         self.lock(tester.certify_vote(view, GENESIS, id, vec![0, 1, 2]));
         self.send_one(
             tester.vote2(view, GENESIS, id, self.signer, vec![0, 1, 2]),
-            1,
+            2,
         );
         self.no_actions();
     }
@@ -691,7 +691,7 @@ fn test_multi_bootstrap() {
         instances
             .map(|i| {
                 let vote = tester.vote2(1.into(), GENESIS, "a", i.signer, vec![0, 1, 2]);
-                i.send_one(vote.clone(), 1);
+                i.send_one(vote.clone(), 2);
                 vote
             })
             .into_iter()

@@ -23,7 +23,7 @@ async fn initiate(
     endpoint: &quinn::Endpoint,
     peer: SocketAddr,
     history: &Mutex<History>,
-    proofs: &Box<[ProofOfPossesion]>,
+    proofs: &[ProofOfPossesion],
     consensus: &protocol::TokioConsensus,
 ) -> anyhow::Result<()> {
     let conn = match endpoint.connect(peer, "localhost") {
@@ -54,6 +54,7 @@ async fn initiate(
     protocol::gossip_initiate(
         ctx,
         consensus,
+        proofs,
         ctx.timeout_secs(10)
             .select(conn.open(protocol::GOSSIP_PROTOCOL))
             .await??,
@@ -198,14 +199,6 @@ impl Node {
             listen,
         )?;
         endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(client_crypto)));
-        let proofs = keys
-            .iter()
-            .map(|key| ProofOfPossesion {
-                key: key.public(),
-                signature: key.sign(Domain::Possesion, &key.public().to_bytes()),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
         Ok(Self {
             listen,
             peers,
@@ -215,7 +208,7 @@ impl Node {
             receiver: receiver,
             endpoint: endpoint,
             network_delay: network_delay,
-            proofs: proofs,
+            proofs: protocol::generate_proofs(&keys),
         })
     }
 

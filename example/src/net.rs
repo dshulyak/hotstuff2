@@ -72,13 +72,21 @@ impl MsgStream {
         self.remote
     }
 
-    pub(crate) async fn send_msg(&mut self, msg: &Message) -> Result<()> {
+    pub(crate) async fn send<T: AsyncEncode>(&mut self, msg: &T) -> Result<()> {
         msg.encode(&mut self.send).await?;
         self.send.flush().await
     }
 
+    pub(crate) async fn recv<T: AsyncDecode>(&mut self) -> Result<T> {
+        T::decode(&mut self.recv).await
+    }
+
+    pub(crate) async fn send_msg(&mut self, msg: &Message) -> Result<()> {
+        self.send(msg).await
+    }
+
     pub(crate) async fn recv_msg(&mut self) -> Result<Message> {
-        Message::decode(&mut self.recv).await
+        self.recv().await
     }
 }
 

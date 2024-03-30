@@ -6,14 +6,15 @@ use anyhow::anyhow;
 use bit_vec::BitVec;
 use hotstuff2::sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer};
 use hotstuff2::types::{
-    AggregateSignature, Block, Certificate, Message, PublicKey, Sync as SyncMsg, View, Vote, ID,
+    AggregateSignature, Block, Certificate, Domain, Message, PrivateKey, PublicKey,
+    Sync as SyncMsg, View, Vote, ID,
 };
 use parking_lot::Mutex;
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::time::{interval, interval_at, sleep, timeout, Instant};
 
-use crate::codec::{AsyncEncode, Protocol};
+use crate::codec::{AsyncEncode, Hello, Len, ProofOfPossesion, Protocol};
 use crate::context::Context;
 use crate::history::History;
 use crate::net::{MsgStream, Router};
@@ -164,8 +165,12 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &Mutex<History>, mut str
 pub(crate) async fn gossip_initiate(
     ctx: &Context,
     consensus: &impl OnMessage,
+    proofs: &[ProofOfPossesion],
     mut stream: MsgStream,
 ) -> anyhow::Result<()> {
+    ctx.timeout_secs(10)
+        .select(stream.send(&Hello { proofs: proofs }))
+        .await??;
     tracing::debug!(remote = ?stream.remote(), "gossip initiating stream");
     if let Err(err) = consume_messages(ctx, &mut stream, consensus).await {
         tracing::debug!(error = ?err, remote = ?stream.remote(), "failed to consume gossip messages");
@@ -197,8 +202,45 @@ async fn consume_messages(
 }
 
 pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: MsgStream) {
+    let proofs_count = match ctx.timeout_secs(10).select(stream.recv::<Len>()).await {
+        Ok(Ok(count)) => count,
+        Ok(Err(err)) => {
+            tracing::warn!(error = ?err, remote = %stream.remote(), "failed to read proofs count");
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(error = ?err, remote = %stream.remote(), "failed to read proofs count");
+            return;
+        }
+    };
+
+    let mut proofs = Vec::with_capacity(proofs_count.into());
+    for _ in 0..proofs_count.into() {
+        match ctx
+            .timeout_secs(10)
+            .select(stream.recv::<ProofOfPossesion>())
+            .await
+        {
+            Ok(Ok(proof)) => {
+                if let Err(err) = proof.signature.verify_possesion(&proof.key) {
+                    tracing::warn!(error = ?err, remote = %stream.remote(), "invalid proof of possesion");
+                    return;
+                };
+                proofs.push(proof.key);
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(error = ?err, remote = %stream.remote(), "failed to read proof");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, remote = %stream.remote(), "failed to read proof");
+                return;
+            }
+        }
+    }
+
     let mut msgs = {
-        match router.register(stream.remote(), vec![].into_iter()) {
+        match router.register(stream.remote(), proofs.clone().into_iter()) {
             Ok(msgs) => msgs,
             Err(err) => {
                 tracing::warn!(error = ?err, "failed to register peer");
@@ -211,7 +253,7 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
         tracing::debug!(error = ?err, remote = %stream.remote(), "error in gossip stream");
     }
     tracing::debug!(remote = %stream.remote(), "closing gossip stream");
-    router.remove(&stream.remote(), vec![].iter());
+    router.remove(&stream.remote(), proofs.iter());
 }
 
 async fn gossip_messages(
@@ -301,6 +343,16 @@ pub(crate) async fn process_actions(
             }
         }
     }
+}
+
+pub(crate) fn generate_proofs(keys: &[PrivateKey]) -> Box<[ProofOfPossesion]> {
+    keys.iter()
+        .map(|key| ProofOfPossesion {
+            key: key.public(),
+            signature: key.prove_possession(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
 }
 
 #[cfg(test)]
@@ -490,8 +542,20 @@ mod tests {
         let ctx = Context::new();
         let cnt = Counter::new();
 
+        let pks = (0..2)
+            .into_iter()
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0] = i as u8;
+                PrivateKey::from_seed(&seed)
+            })
+            .collect::<Vec<_>>();
+        let proofs = generate_proofs(&pks);
+
         let mut reader = Builder::new();
         let mut writer = Builder::new();
+
+        writer.write(&Hello { proofs: &proofs }.encode_to_bytes().await.unwrap());
 
         reader.read(
             &Message::Wish(wish(1.into(), 1))
@@ -512,7 +576,7 @@ mod tests {
             Box::new(writer.build()),
             Box::new(reader.build()),
         );
-        gossip_initiate(&ctx, &cnt, stream).await;
+        gossip_initiate(&ctx, &cnt, &proofs, stream).await;
         assert_eq!(cnt.msgs.load(Ordering::Relaxed), 2);
     }
 
@@ -523,6 +587,8 @@ mod tests {
 
         let mut reader = Builder::new();
         let mut writer = Builder::new();
+
+        reader.read(&Len::new(0).encode_to_bytes().await.unwrap());
 
         let mut to_send = (1..=3)
             .into_iter()
