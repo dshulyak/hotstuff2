@@ -8,12 +8,6 @@
 - [bls12-381 overview](https://hackmd.io/@benjaminion/bls12-381)
 
 
-TODO:
-- [ ] integrate playground
-- [ ] persist state with sqlx
-- [ ] twins model checker
-- [ ] pipelined execution
-
 ## Tests
 
 1. `cargo install cargo-nextest --locked`
