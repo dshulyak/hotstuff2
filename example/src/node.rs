@@ -41,7 +41,7 @@ async fn initiate(
             anyhow::bail!("task to establish connection: {}", err);
         }
     };
-    tracing::debug!(remote = %conn.remote(),"established connection");
+    tracing::debug!(remote = %conn.remote(), "established connection");
     protocol::sync_initiate(
         ctx,
         history,

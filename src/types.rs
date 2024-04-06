@@ -339,6 +339,12 @@ impl PublicKey {
     }
 }
 
+impl Display for PublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", &hex::encode(self.to_bytes())[..8])
+    }
+}
+
 impl Hash for PublicKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.to_bytes().hash(state);

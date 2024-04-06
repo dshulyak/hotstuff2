@@ -302,8 +302,11 @@ pub(crate) async fn process_actions(
         match action {
             Action::Send(msg, to) => {
                 let id = msg.short_id().await.unwrap();
-
-                tracing::debug!(id = %id, msg = %msg, to=?to, "sent message");
+                if let Some(to) = &to {
+                    tracing::debug!(id = %id, msg = %msg, to=%to, "sent direct message");
+                } else {
+                    tracing::debug!(id = %id, msg = %msg, "sent message");
+                }
                 match to {
                     None => {
                         if let Err(err) = consensus.on_message(msg.clone()) {
