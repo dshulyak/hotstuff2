@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use async_scoped::TokioScope;
 use hotstuff2::sequential::Action;
-use hotstuff2::types::{Certificate, Domain, PrivateKey, PublicKey, Vote};
+use hotstuff2::types::{PrivateKey, PublicKey};
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
@@ -145,7 +145,6 @@ fn ensure_cert(dir: &Path) -> Result<(Vec<rustls::Certificate>, rustls::PrivateK
 }
 
 pub struct Node {
-    listen: SocketAddr,
     peers: Vec<SocketAddr>,
     history: Mutex<History>,
     router: Router,
@@ -200,7 +199,6 @@ impl Node {
         )?;
         endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(client_crypto)));
         Ok(Self {
-            listen,
             peers,
             history: Mutex::new(history),
             router: Router::new(1_000),
@@ -210,10 +208,6 @@ impl Node {
             network_delay: network_delay,
             proofs: protocol::generate_proofs(&keys),
         })
-    }
-
-    pub(crate) fn last_commit(&self) -> Certificate<Vote> {
-        self.history.lock().last_commit()
     }
 
     pub async fn run(&mut self, ctx: Context) {
@@ -278,10 +272,9 @@ impl rustls::client::ServerCertVerifier for SkipServerVerification {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, net::SocketAddr, time::Duration};
+    use std::{net::SocketAddr, time::Duration};
 
     use async_scoped::TokioScope;
-    use futures::join;
     use hotstuff2::types::PrivateKey;
     use tokio::time::sleep;
 
@@ -298,7 +291,7 @@ mod tests {
     async fn test_sanity() {
         init_tracing();
 
-        let range = (1..=4);
+        let range = 1..=4;
         let pks = range
             .clone()
             .map(|i| {
@@ -344,7 +337,7 @@ mod tests {
         {
             let ctx = context::Context::new();
             let mut s = unsafe { TokioScope::create(Default::default()) };
-            for (i, node) in nodes.iter_mut().enumerate() {
+            for node in nodes.iter_mut() {
                 s.spawn(async {
                     node.run(ctx.clone()).await;
                 });

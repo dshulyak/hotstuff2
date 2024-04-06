@@ -1,18 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use bit_vec::BitVec;
 use hotstuff2::sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer};
 use hotstuff2::types::{
-    AggregateSignature, Block, Certificate, Domain, Message, PrivateKey, PublicKey,
-    Sync as SyncMsg, View, Vote, ID,
+    AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg, View,
+    Vote, ID,
 };
 use parking_lot::Mutex;
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver};
-use tokio::time::{interval, interval_at, sleep, timeout, Instant};
+use tokio::time::{interval, Instant};
 
 use crate::codec::{AsyncEncode, Hello, Len, ProofOfPossesion, Protocol};
 use crate::context::Context;
@@ -81,7 +80,7 @@ pub(crate) async fn sync_initiate(
                     tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process sync message");
                 }
             }
-            Ok(Ok(msg)) => {
+            Ok(Ok(_msg)) => {
                 anyhow::bail!("unexpected message type");
             }
             Ok(Err(err)) => {
@@ -263,7 +262,7 @@ async fn gossip_messages(
 ) -> anyhow::Result<()> {
     while let Some(Some(msg)) = ctx.select(msgs.recv()).await {
         tracing::debug!(remote = %stream.remote(), "sending gossip message");
-        ctx.timeout_secs(10).select(stream.send_msg(&msg)).await?;
+        ctx.timeout_secs(10).select(stream.send_msg(&msg)).await??;
     }
     Ok(())
 }
@@ -280,7 +279,7 @@ pub(crate) async fn notify_delays(
     interval.tick().await;
     loop {
         select! {
-            instant = interval.tick() => {
+            _ = interval.tick() => {
                 tracing::debug!(elapsed = ?start.elapsed(), "tick on network delay");
                 consensus.on_delay();
             },
@@ -359,22 +358,18 @@ pub(crate) fn generate_proofs(keys: &[PrivateKey]) -> Box<[ProofOfPossesion]> {
 mod tests {
     use std::{
         net::SocketAddr,
-        pin::Pin,
         str::FromStr,
         sync::atomic::{AtomicUsize, Ordering},
     };
 
     use futures::prelude::*;
-    use futures::{Future, FutureExt, Stream};
+    use futures::FutureExt;
     use hotstuff2::types::{Signature, Signed, Sync as SyncMsg, Wish, SIGNATURE_SIZE};
     use parking_lot::lock_api::Mutex;
-    use tokio::{
-        spawn,
-        time::{self, timeout},
-    };
+    use tokio::time::{self, timeout};
     use tokio_test::{assert_ok, io::Builder};
 
-    use crate::codec::{AsyncDecode, AsyncEncode};
+    use crate::codec::AsyncEncode;
 
     use super::*;
 
@@ -467,7 +462,7 @@ mod tests {
 
         let ctx = Context::new();
         let mut history = History::new();
-        history.update(None, Some(genesis_test()), Some(genesis_test()));
+        history.update(None, Some(genesis_test()), Some(genesis_test())).unwrap();
 
         let msg = Message::Sync(SyncMsg {
             locked: None,
@@ -493,7 +488,7 @@ mod tests {
 
         let ctx = Context::new();
         let mut history = History::new();
-        history.update(None, Some(genesis_test()), Some(genesis_test()));
+        history.update(None, Some(genesis_test()), Some(genesis_test())).unwrap();
         let cnt = Counter::new();
 
         let mut reader = Builder::new();
@@ -576,7 +571,7 @@ mod tests {
             Box::new(writer.build()),
             Box::new(reader.build()),
         );
-        gossip_initiate(&ctx, &cnt, &proofs, stream).await;
+        gossip_initiate(&ctx, &cnt, &proofs, stream).await.unwrap();
         assert_eq!(cnt.msgs.load(Ordering::Relaxed), 2);
     }
 
@@ -590,7 +585,7 @@ mod tests {
 
         reader.read(&Len::new(0).encode_to_bytes().await.unwrap());
 
-        let mut to_send = (1..=3)
+        let to_send = (1..=3)
             .into_iter()
             .map(|i| Message::Wish(wish(1.into(), i)))
             .collect::<Vec<_>>();

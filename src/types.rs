@@ -327,6 +327,16 @@ impl PublicKey {
     pub fn to_bytes(&self) -> [u8; PUBLIC_KEY_SIZE] {
         self.0.to_bytes()
     }
+
+    pub fn to_hex(&self) -> String {
+        format!("0x{}", hex::encode(self.to_bytes()))
+    }
+
+    pub fn from_hex(value: &str) -> Result<Self> {
+        let value = value.trim_start_matches("0x");
+        let bytes = hex::decode(value)?;
+        Ok(PublicKey::from_bytes(&bytes)?)
+    }
 }
 
 impl Hash for PublicKey {
@@ -434,6 +444,18 @@ impl PrivateKey {
 
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
+    }
+
+    // to_hex encodes to hex with 0x prefix
+    pub fn to_hex(&self) -> String {
+        format!("0x{}", hex::encode(self.to_bytes()))
+    }
+
+    // from_hex decodes from hex with 0x prefix
+    pub fn from_hex(value: &str) -> Result<Self> {
+        let value = value.trim_start_matches("0x");
+        let bytes = hex::decode(value)?;
+        Ok(PrivateKey::from_bytes(&bytes)?)
     }
 
     pub fn prove_possession(&self) -> Signature {

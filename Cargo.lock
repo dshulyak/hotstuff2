@@ -375,6 +375,7 @@ dependencies = [
  "metrics",
  "parking_lot",
  "quinn",
+ "rand",
  "rcgen",
  "rustls",
  "tempfile",
