@@ -298,6 +298,8 @@ pub(crate) async fn process_actions(
     consensus: &(impl Proposer + OnMessage),
     receiver: &mut mpsc::UnboundedReceiver<Action>,
 ) {
+    let mut average_latency: f64 = 0.0;
+    let mut last = Instant::now();
     while let Some(Some(action)) = ctx.select(receiver.recv()).await {
         match action {
             Action::Send(msg, to) => {
@@ -329,7 +331,18 @@ pub(crate) async fn process_actions(
             }
             Action::StateChange(change) => {
                 if let Some(commit) = &change.commit {
-                    tracing::info!(view = %commit.inner.view, block = %commit.inner.block.id, "committing new block");
+                    tracing::info!(view = %commit.inner.view, 
+                        block = %commit.inner.block.id, 
+                        latency = %humantime::Duration::from(Duration::from_secs_f64(average_latency)), 
+                        "committing new block");
+                    let latency = Instant::now() - last;
+                    if average_latency == 0.0 {
+                        average_latency = latency.as_secs_f64();
+                    } else {
+                        // 86% of the value is the last 49
+                        average_latency += (latency.as_secs_f64() - average_latency) / 25.0; 
+                    }
+                    last = Instant::now();
                 }
                 if let Err(err) = history
                     .lock()
@@ -465,7 +478,9 @@ mod tests {
 
         let ctx = Context::new();
         let mut history = History::new();
-        history.update(None, Some(genesis_test()), Some(genesis_test())).unwrap();
+        history
+            .update(None, Some(genesis_test()), Some(genesis_test()))
+            .unwrap();
 
         let msg = Message::Sync(SyncMsg {
             locked: None,
@@ -491,7 +506,9 @@ mod tests {
 
         let ctx = Context::new();
         let mut history = History::new();
-        history.update(None, Some(genesis_test()), Some(genesis_test())).unwrap();
+        history
+            .update(None, Some(genesis_test()), Some(genesis_test()))
+            .unwrap();
         let cnt = Counter::new();
 
         let mut reader = Builder::new();
