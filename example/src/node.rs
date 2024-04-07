@@ -9,6 +9,7 @@ use async_scoped::TokioScope;
 use hotstuff2::sequential::Action;
 use hotstuff2::types::{PrivateKey, PublicKey};
 use parking_lot::Mutex;
+use sqlx::{Sqlite, SqlitePool};
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
 
@@ -158,6 +159,7 @@ pub struct Node {
 impl Node {
     pub fn init(
         dir: &Path,
+        db: SqlitePool,
         listen: SocketAddr,
         genesis: &str,
         participants: Box<[PublicKey]>,
@@ -165,14 +167,7 @@ impl Node {
         peers: Vec<SocketAddr>,
         network_delay: Duration,
     ) -> anyhow::Result<Self> {
-        let mut history = History::new();
-        if history.empty() {
-            history.update(
-                None,
-                Some(protocol::genesis(genesis)),
-                Some(protocol::genesis(genesis)),
-            )?
-        }
+        let history = History::new(db);
         let (sender, receiver) = unbounded_channel();
         let consensus = TokioConsensus::new(
             history.last_view(),

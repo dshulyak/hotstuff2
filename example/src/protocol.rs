@@ -16,7 +16,6 @@ use tokio::time::{interval, Instant};
 
 use crate::codec::{AsyncEncode, Hello, Len, ProofOfPossesion, Protocol};
 use crate::context::Context;
-use crate::history::History;
 use crate::net::{MsgStream, Router};
 
 pub(crate) const GOSSIP_PROTOCOL: Protocol = Protocol::new(1);
