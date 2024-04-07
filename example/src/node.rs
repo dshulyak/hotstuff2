@@ -8,14 +8,13 @@ use anyhow::Result;
 use async_scoped::TokioScope;
 use hotstuff2::sequential::Action;
 use hotstuff2::types::{PrivateKey, PublicKey};
-use parking_lot::Mutex;
-use sqlx::{Sqlite, SqlitePool};
+use sqlx::SqlitePool;
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
 
 use crate::codec::ProofOfPossesion;
 use crate::context::Context;
-use crate::history::History;
+use crate::history::{self, History};
 use crate::net::{Connection, Router};
 use crate::protocol::{self, TokioConsensus, TokioSink};
 
@@ -23,7 +22,7 @@ async fn initiate(
     ctx: &Context,
     endpoint: &quinn::Endpoint,
     peer: SocketAddr,
-    history: &Mutex<History>,
+    history: &History,
     proofs: &[ProofOfPossesion],
     consensus: &protocol::TokioConsensus,
 ) -> anyhow::Result<()> {
@@ -69,7 +68,7 @@ async fn connect(
     peer: SocketAddr,
     reconnect_interval: Duration,
     endpoint: &quinn::Endpoint,
-    history: &Mutex<History>,
+    history: &History,
     proofs: &Box<[ProofOfPossesion]>,
     consensus: &protocol::TokioConsensus,
 ) {
@@ -90,7 +89,7 @@ async fn connect(
 async fn accept(
     ctx: &Context,
     endpoint: &quinn::Endpoint,
-    history: &Mutex<History>,
+    history: &History,
     router: &Router,
 ) {
     tracing::info!(local = %endpoint.local_addr().unwrap(), "accepting connections");
@@ -147,7 +146,7 @@ fn ensure_cert(dir: &Path) -> Result<(Vec<rustls::Certificate>, rustls::PrivateK
 
 pub struct Node {
     peers: Vec<SocketAddr>,
-    history: Mutex<History>,
+    history: History,
     router: Router,
     proofs: Box<[ProofOfPossesion]>,
     consensus: TokioConsensus,
@@ -157,7 +156,7 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn init(
+    pub async fn init(
         dir: &Path,
         db: SqlitePool,
         listen: SocketAddr,
@@ -167,7 +166,18 @@ impl Node {
         peers: Vec<SocketAddr>,
         network_delay: Duration,
     ) -> anyhow::Result<Self> {
-        let history = History::new(db);
+        let genesis = protocol::genesis(genesis);
+        history::insert_genesis(&db, &genesis).await?;
+        let history = History::from_db(db).await?;
+        tracing::info!(
+            last_view = %history.last_view(),
+            voted = %history.voted(),
+            locked_view = %history.locked().inner.view,
+            locked_block = %history.locked().inner.block,
+            committed_view = %history.last_commit().inner.view,
+            committed_block = %history.last_commit().inner.block,
+            "loaded history"
+        );
         let (sender, receiver) = unbounded_channel();
         let consensus = TokioConsensus::new(
             history.last_view(),
@@ -195,7 +205,7 @@ impl Node {
         endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(client_crypto)));
         Ok(Self {
             peers,
-            history: Mutex::new(history),
+            history: history,
             router: Router::new(1_000),
             consensus: consensus,
             receiver: receiver,
@@ -273,7 +283,7 @@ mod tests {
     use hotstuff2::types::PrivateKey;
     use tokio::time::sleep;
 
-    use crate::{context, node};
+    use crate::{context, history::inmemory, node};
 
     fn init_tracing() {
         let rst = tracing_subscriber::fmt()
@@ -306,14 +316,13 @@ mod tests {
             .clone()
             .map(|_| tempfile::TempDir::with_prefix("test_sanity").unwrap())
             .collect::<Vec<_>>();
-
-        let mut nodes = range
-            .clone()
-            .map(|i| {
+        let mut nodes = vec![];
+        for i in range { 
                 let listener = listeners[i - 1];
                 let pk = [pks[i - 1].clone()];
-                node::Node::init(
+                let node = node::Node::init(
                     tempdirs[i - 1].path(),
+                    inmemory().await.unwrap(),
                     listener,
                     "test_sanity",
                     participants.clone().into(),
@@ -324,10 +333,9 @@ mod tests {
                         .copied()
                         .collect(),
                     Duration::from_millis(50),
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
+                ).await.unwrap();
+                nodes.push(node);
+            };
 
         {
             let ctx = context::Context::new();
@@ -346,12 +354,12 @@ mod tests {
         }
         let max = nodes
             .iter_mut()
-            .map(|node| node.history.lock().last_commit().inner.view)
+            .map(|node| node.history.last_commit().inner.view)
             .max()
             .unwrap();
         assert!(max > 0.into());
         for node in nodes.iter_mut() {
-            let commit = node.history.lock().last_commit().inner.view;
+            let commit = node.history.last_commit().inner.view;
             assert!(commit == max || commit == (max.0 - 1).into());
         }
     }

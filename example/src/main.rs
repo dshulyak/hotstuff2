@@ -182,15 +182,19 @@ async fn run(opt: Run) {
         }
     };
     participants.sort();
+    let pool = history::open(opt.directory.join("history.db").as_os_str().to_str().unwrap())
+        .await
+        .unwrap();
     let mut node = match node::Node::init(
         opt.directory.as_path(),
+        pool,
         opt.listen,
         "example",
         participants.into_boxed_slice(),
         privates.into_boxed_slice(),
         opt.connect,
         opt.network_delay.into(),
-    ) {
+    ).await {
         Ok(node) => node,
         Err(err) => {
             tracing::error!(error = %err, "failed to initialize node");

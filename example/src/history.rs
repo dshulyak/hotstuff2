@@ -3,11 +3,20 @@ use hotstuff2::{
     sequential::StateChange,
     types::{Certificate, ToBytes, View, Vote},
 };
+use parking_lot::Mutex;
 use sqlx::{migrate::MigrateDatabase, Row, Sqlite, SqlitePool};
 
 use crate::codec::{AsyncDecode, AsyncEncode};
 
-pub async fn open(url: &str) -> Result<SqlitePool> {
+pub(crate) async fn inmemory() -> Result<SqlitePool> {
+    sqlite("sqlite::memory:").await
+}
+
+pub async fn open(path: &str) -> Result<SqlitePool> {
+    sqlite(&format!("sqlite:{}", path)).await
+}
+
+pub async fn sqlite(url: &str) -> Result<SqlitePool> {
     if !Sqlite::database_exists(url).await.context("db exists")? {
         Sqlite::create_database(url).await.context("create db")?;
     }
@@ -33,12 +42,12 @@ fn schema() -> &'static str {
         view integer primary key not null,
         height integer not null,
         block char(32) not null,
-        commit blob not null
+        certificate blob not null
     );
     "#
 }
 
-async fn insert_genesis(pool: &SqlitePool, genesis: &Certificate<Vote>) -> Result<()> {
+pub(crate) async fn insert_genesis(pool: &SqlitePool, genesis: &Certificate<Vote>) -> Result<()> {
     let count: i64 = sqlx::query_scalar("select count(*) from safety")
         .fetch_one(pool)
         .await?;
@@ -55,7 +64,7 @@ async fn insert_genesis(pool: &SqlitePool, genesis: &Certificate<Vote>) -> Resul
     Ok(())
 }
 
-async fn get_voted_locked(pool: &SqlitePool) -> Result<(View, Certificate<Vote>)> {
+pub(crate) async fn get_voted_locked(pool: &SqlitePool) -> Result<(View, Certificate<Vote>)> {
     let row = sqlx::query("select voted, locked from safety where tag = ?")
         .bind(SAFETY_TAG)
         .fetch_one(pool)
@@ -68,19 +77,23 @@ async fn get_voted_locked(pool: &SqlitePool) -> Result<(View, Certificate<Vote>)
     Ok((View(voted as u64), locked))
 }
 
-async fn last_commit_view(pool: &SqlitePool) -> Result<Option<View>> {
-    let view: Option<i64> = sqlx::query_scalar("select max(view) from history")
-        .fetch_one(pool)
-        .await
-        .context("fetch last commit view")?;
-    Ok(view.map(|v| View(v as u64)))
+pub(crate) async fn get_last_commit(pool: &SqlitePool) -> Result<Option<Certificate<Vote>>> {
+    let rst = sqlx::query("select certificate from history order by view desc limit 1")
+        .fetch_optional(pool).await
+        .context("fetch last commit")?;
+    if let Some(row) = rst {
+        let buf: &[u8] = row.get(0);
+        Ok(Some(Certificate::decode_from_bytes(buf).await?))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn first_commit_after_view(
     pool: &SqlitePool,
     view: View,
 ) -> Result<Option<Certificate<Vote>>> {
-    let rst = sqlx::query("select commit from history where view >= ? order by view asc limit 1")
+    let rst = sqlx::query("select certificate from history where view >= ? order by view asc limit 1")
         .bind(view.0 as i64)
         .fetch_optional(pool)
         .await
@@ -112,7 +125,7 @@ async fn update_state_change(pool: &SqlitePool, change: &StateChange) -> Result<
             .context("update locked")?;
     }
     if let Some(commit) = &change.commit {
-        sqlx::query("insert into history (view, height, block, commit) values (?, ?, ?, ?)")
+        sqlx::query("insert into history (view, height, block, certificate) values (?, ?, ?, ?)")
             .bind(commit.inner.view.0 as i64)
             .bind(commit.inner.height as i64)
             .bind(commit.inner.block.to_bytes())
@@ -125,23 +138,14 @@ async fn update_state_change(pool: &SqlitePool, change: &StateChange) -> Result<
     Ok(())
 }
 
-pub(crate) struct History {
-    db: SqlitePool,
+struct State {
     voted: View,
     locked: Option<Certificate<Vote>>,
     committed: Option<Certificate<Vote>>,
 }
 
-impl History {
-    pub(crate) fn new(db: SqlitePool) -> Self {
-        Self {
-            db,
-            voted: View(0),
-            locked: None,
-            committed: None,
-        }
-    }
 
+impl State {
     pub(crate) fn voted(&self) -> View {
         self.voted
     }
@@ -151,10 +155,8 @@ impl History {
         if let Some(locked) = &self.locked {
             last = last.max(locked.inner.view);
         }
-        if let Some(commit) = self.commits.last_key_value() {
-            if *commit.0 != View(0) {
-                last = last.max(*commit.0 + 1);
-            }
+        if let Some(committed) = &self.committed {
+            last = last.max(committed.inner.view);
         }
         last
     }
@@ -164,28 +166,80 @@ impl History {
     }
 
     pub(crate) fn last_commit(&self) -> Certificate<Vote> {
-        self.commits.last_key_value().unwrap().1.clone()
+        self.committed.as_ref().unwrap().clone()
     }
 
-    pub(crate) fn first_after(&self, view: View) -> Option<Certificate<Vote>> {
-        self.commits.range(view..).next().map(|(_, c)| c.clone())
+    pub(crate) fn update(&mut self, change: &StateChange) {
+        if let Some(voted) = &change.voted {
+            self.voted = voted.clone();
+        }
+        if let Some(locked) = &change.lock {
+            self.locked = Some(locked.clone());
+        }
+        if let Some(commit) = &change.commit {
+            self.committed = Some(commit.clone());
+        }
+    }
+}
+
+pub(crate) struct History {
+    db: SqlitePool,
+    state: Mutex<State>
+}
+
+impl History {
+    pub(crate) fn new(db: SqlitePool) -> Self {
+        Self {
+            db,
+            state: Mutex::new(State {
+                voted: View(0),
+                locked: None,
+                committed: None,
+            }),
+        }
     }
 
-    pub(crate) fn update(
-        &mut self,
-        voted: Option<View>,
-        locked: Option<Certificate<Vote>>,
-        commit: Option<Certificate<Vote>>,
-    ) -> anyhow::Result<()> {
-        if let Some(voted) = voted {
-            self.voted = voted;
+    pub(crate) async fn from_db(db: SqlitePool) -> Result<Self> {
+        let (voted, locked) = get_voted_locked(&db).await?;
+        let mut committed = get_last_commit(&db).await?;
+        if committed.is_none() {
+            committed = Some(locked.clone());
         }
-        if let Some(locked) = locked {
-            self.locked = Some(locked);
-        }
-        if let Some(commit) = commit {
-            self.commits.insert(commit.inner.view, commit);
-        }
+        Ok(Self {
+            db,
+            state: Mutex::new(State {
+                voted,
+                locked: Some(locked),
+                committed,
+            }),
+        })
+    }
+
+    pub(crate) fn voted(&self) -> View {
+        self.state.lock().voted()
+    }
+
+    pub(crate) fn last_view(&self) -> View {
+        self.state.lock().last_view()
+    }
+
+    pub(crate) fn locked(&self) -> Certificate<Vote> {
+        self.state.lock().locked()
+    }
+
+    pub(crate) fn last_commit(&self) -> Certificate<Vote> {
+        self.state.lock().last_commit()
+    }
+
+    pub(crate) async fn first_after(&self, view: View) -> Option<Certificate<Vote>> {
+        first_commit_after_view(&self.db, view)
+            .await
+            .expect("first after view")
+    }
+
+    pub(crate) async fn update(&self, state_change: &StateChange) -> anyhow::Result<()> {
+        update_state_change(&self.db, state_change).await?;
+        self.state.lock().update(state_change);
         Ok(())
     }
 }

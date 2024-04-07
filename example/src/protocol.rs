@@ -8,7 +8,6 @@ use hotstuff2::types::{
     AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg, View,
     Vote, ID,
 };
-use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver};
@@ -16,6 +15,7 @@ use tokio::time::{interval, Instant};
 
 use crate::codec::{AsyncEncode, Hello, Len, ProofOfPossesion, Protocol};
 use crate::context::Context;
+use crate::history::History;
 use crate::net::{MsgStream, Router};
 
 pub(crate) const GOSSIP_PROTOCOL: Protocol = Protocol::new(1);
@@ -53,12 +53,11 @@ pub(crate) fn genesis(genesis: &str) -> Certificate<Vote> {
 
 pub(crate) async fn sync_initiate(
     ctx: &Context,
-    history: &Mutex<History>,
+    history: &History,
     consensus: &impl OnMessage,
     mut stream: MsgStream,
 ) -> anyhow::Result<()> {
     let state = {
-        let history = history.lock();
         SyncMsg {
             locked: None,
             commit: Some(history.last_commit()),
@@ -99,7 +98,7 @@ pub(crate) async fn sync_initiate(
     Ok(())
 }
 
-pub(crate) async fn sync_accept(ctx: &Context, history: &Mutex<History>, mut stream: MsgStream) {
+pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: MsgStream) {
     let state = match ctx.timeout_secs(10).select(stream.recv_msg()).await {
         Ok(Ok(Message::Sync(state))) => state,
         Ok(Ok(msg)) => {
@@ -123,8 +122,7 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &Mutex<History>, mut str
     tracing::debug!(from_view = %last, remote = %stream.remote(), "requested sync");
     loop {
         let (sync_msg, next) = {
-            let history = history.lock();
-            let commit = history.first_after(last);
+            let commit = history.first_after(last).await;
             let next = commit.as_ref().map(|c| c.inner.view + 1);
             (
                 Message::Sync(SyncMsg {
@@ -292,7 +290,7 @@ pub(crate) async fn notify_delays(
 
 pub(crate) async fn process_actions(
     ctx: &Context,
-    history: &Mutex<History>,
+    history: &History,
     router: &Router,
     local: HashSet<PublicKey>,
     consensus: &(impl Proposer + OnMessage),
@@ -342,14 +340,11 @@ pub(crate) async fn process_actions(
                         average_latency = latency.as_secs_f64();
                     } else {
                         // 86% of the value is the last 49
-                        average_latency += (latency.as_secs_f64() - average_latency) / 25.0; 
+                        average_latency += (latency.as_secs_f64() - average_latency) / 25.0;
                     }
                     last = Instant::now();
                 }
-                if let Err(err) = history
-                    .lock()
-                    .update(change.voted, change.lock, change.commit)
-                {
+                if let Err(err) = history.update(&change).await {
                     tracing::error!(error = ?err, "state change");
                 };
             }
@@ -383,12 +378,14 @@ mod tests {
 
     use futures::prelude::*;
     use futures::FutureExt;
-    use hotstuff2::types::{Signature, Signed, Sync as SyncMsg, Wish, SIGNATURE_SIZE};
-    use parking_lot::lock_api::Mutex;
+    use hotstuff2::{
+        sequential::StateChange,
+        types::{Signature, Signed, Sync as SyncMsg, Wish, SIGNATURE_SIZE},
+    };
     use tokio::time::{self, timeout};
     use tokio_test::{assert_ok, io::Builder};
 
-    use crate::codec::AsyncEncode;
+    use crate::{codec::AsyncEncode, history::inmemory};
 
     use super::*;
 
@@ -480,10 +477,13 @@ mod tests {
         init_tracing();
 
         let ctx = Context::new();
-        let mut history = History::new();
-        history
-            .update(None, Some(genesis_test()), Some(genesis_test()))
-            .unwrap();
+        let history = History::new(inmemory().await.unwrap());
+        let change = StateChange {
+            voted: None,
+            lock: Some(genesis_test()),
+            commit: Some(genesis_test()),
+        };
+        history.update(&change).await.unwrap();
 
         let msg = Message::Sync(SyncMsg {
             locked: None,
@@ -500,7 +500,7 @@ mod tests {
             Box::new(reader.build()),
         );
 
-        sync_accept(&ctx, &Mutex::new(history), stream).await
+        sync_accept(&ctx, &history, stream).await
     }
 
     #[tokio::test]
@@ -508,10 +508,13 @@ mod tests {
         init_tracing();
 
         let ctx = Context::new();
-        let mut history = History::new();
-        history
-            .update(None, Some(genesis_test()), Some(genesis_test()))
-            .unwrap();
+        let history = History::new(inmemory().await.unwrap());
+        let change = StateChange {
+            voted: None,
+            lock: Some(genesis_test()),
+            commit: Some(genesis_test()),
+        };
+        history.update(&change).await.unwrap();
         let cnt = Counter::new();
 
         let mut reader = Builder::new();
@@ -550,7 +553,7 @@ mod tests {
             Box::new(writer.build()),
             Box::new(reader.build()),
         );
-        assert_ok!(sync_initiate(&ctx, &Mutex::new(history), &cnt, stream).await);
+        assert_ok!(sync_initiate(&ctx, &history, &cnt, stream).await);
         assert_eq!(cnt.msgs.load(Ordering::Relaxed), 2);
     }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-RUST_LOG=${RUST_LOG:-info}
+RUST_LOG=${RUST_LOG:-debug}
 RELEASE=${RELEASE:-debug}
 BINARY_PATH=${BINARY_PATH:-$(pwd)/target/$RELEASE}
 
