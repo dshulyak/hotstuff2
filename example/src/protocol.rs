@@ -9,6 +9,7 @@ use hotstuff2::types::{
     Vote, ID,
 };
 use parking_lot::Mutex;
+use rand::{thread_rng, Rng};
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::time::{interval, Instant};
@@ -44,7 +45,7 @@ pub(crate) fn genesis(genesis: &str) -> Certificate<Vote> {
     Certificate {
         inner: Vote {
             view: View(0),
-            block: Block::new(ID::default(), genesis.into()),
+            block: Block::new(0, ID::default(), genesis.into()),
         },
         signature: AggregateSignature::empty(),
         signers: BitVec::new(),
@@ -331,7 +332,9 @@ pub(crate) async fn process_actions(
             }
             Action::StateChange(change) => {
                 if let Some(commit) = &change.commit {
-                    tracing::info!(view = %commit.inner.view, 
+                    tracing::info!(
+                        view = %commit.inner.view,
+                        height = %commit.inner.block.height, 
                         block = %commit.inner.block.id, 
                         latency = %humantime::Duration::from(Duration::from_secs_f64(average_latency)), 
                         "committing new block");
@@ -352,7 +355,8 @@ pub(crate) async fn process_actions(
                 };
             }
             Action::Propose => {
-                if let Err(err) = consensus.propose(ID::from_str("test block")) {
+                let id = ID::new(thread_rng().gen::<[u8; 32]>());
+                if let Err(err) = consensus.propose(id) {
                     tracing::error!(error = ?err, "propose block");
                 }
             }
@@ -397,7 +401,7 @@ mod tests {
         Certificate {
             inner: Vote {
                 view: view,
-                block: Block::new(ID::default(), ID::from_str(&view.to_string())),
+                block: Block::new(view.into(), ID::default(), ID::from_str(&view.to_string())),
             },
             signature: AggregateSignature::empty(),
             signers: BitVec::new(),

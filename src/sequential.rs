@@ -577,6 +577,7 @@ impl<T: Actions> Consensus<T> {
             self.state.lock().proposal = Some(Propose {
                 view: cert.view + 1,
                 block: Block {
+                    height: cert.height + 1,
                     prev: cert.id,
                     id: ID::default(),
                 },
@@ -621,7 +622,7 @@ impl<T: Actions> OnDelay for Consensus<T> {
                 && self.is_leader(state.view)
             {
                 state.reset_delay();
-                // unlike in the paper, i want to obtain double certificate on every block.
+                // i want to obtain double certificate on every block.
                 // therefore i extend locked if it is equal to double, otherwise i retry locked block.
                 if state.locked.inner != state.commit.inner {
                     (
@@ -637,6 +638,7 @@ impl<T: Actions> OnDelay for Consensus<T> {
                     state.proposal = Some(Propose {
                         view: state.view,
                         block: Block {
+                            height: state.commit.inner.block.height + 1,
                             prev: state.commit.inner.block.id,
                             id: ID::default(), // will be overwritten in propose method
                         },

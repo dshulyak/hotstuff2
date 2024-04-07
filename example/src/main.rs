@@ -75,8 +75,8 @@ struct Run {
 
     #[clap(
         long = "network-delay",
-        default_value = "50ms",
-        help = "expected maximula delay for network messages"
+        default_value = "200ms",
+        help = "expected maximul delay for network messages"
     )]
     network_delay: Duration,
 }

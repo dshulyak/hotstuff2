@@ -72,25 +72,27 @@ impl Ord for ID {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Block {
+    pub height: u64,
     pub prev: ID,
     pub id: ID,
 }
 
 impl Block {
-    pub fn new(prev: ID, id: ID) -> Self {
-        Block { prev, id }
+    pub fn new(height: u64, prev: ID, id: ID) -> Self {
+        Block { height, prev, id }
     }
 }
 
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.prev.short_id(), self.id.short_id(),)
+        write!(f, "{} {}/{}", self.height, self.prev.short_id(), self.id.short_id(),)
     }
 }
 
 impl ToBytes for Block {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.height.to_le_bytes());
         bytes.extend_from_slice(self.prev.as_bytes());
         bytes.extend_from_slice(self.id.as_bytes());
         bytes
