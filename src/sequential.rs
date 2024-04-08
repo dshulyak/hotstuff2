@@ -212,6 +212,10 @@ impl<T: Actions> Consensus<T> {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip(self, wish), 
+        fields(view = %wish.view),
+    )]
     fn on_wish(&self, wish: Signed<Wish>) -> Result<()> {
         ensure!(
             wish.signer < self.participants.len() as u16,
@@ -258,6 +262,10 @@ impl<T: Actions> Consensus<T> {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip(self, timeout), 
+        fields(view = %timeout.certificate.inner),
+    )]
     fn on_timeout(&self, timeout: Timeout) -> Result<()> {
         ensure!(
             timeout.certificate.signers.iter().filter(|b| *b).count()
@@ -285,6 +293,10 @@ impl<T: Actions> Consensus<T> {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip(self, propose), 
+        fields(view = %propose.view, height = propose.block.height, id = %propose.block.id),
+    )]
     fn on_propose(&self, propose: Signed<Propose>) -> Result<()> {
         // signature checks. should be executed before acquiring locks on state.
         ensure!(
@@ -383,6 +395,10 @@ impl<T: Actions> Consensus<T> {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip(self, prepare), 
+        fields(view = %prepare.certificate.view, height = prepare.certificate.height, id = %prepare.certificate.id),
+    )]
     fn on_prepare(&self, prepare: Signed<Prepare>) -> Result<()> {
         ensure!(
             prepare.signer < self.participants.len() as u16,
@@ -457,6 +473,10 @@ impl<T: Actions> Consensus<T> {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip(self, vote), 
+        fields(view = %vote.inner.view, height = vote.inner.block.height, id = %vote.inner.block.id),
+    )]
     fn on_vote(&self, vote: Signed<Vote>) -> Result<()> {
         ensure!(
             vote.signer < self.participants.len() as u16,
@@ -514,6 +534,10 @@ impl<T: Actions> Consensus<T> {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip(self, vote), 
+        fields(view = %vote.inner.view, height = vote.inner.block.height, id = %vote.inner.block.id),
+    )]
     fn on_vote2(&self, vote: Signed<Certificate<Vote>>) -> Result<()> {
         ensure!(
             vote.signer < self.participants.len() as u16,
@@ -687,6 +711,10 @@ impl<T: Actions> OnMessage for Consensus<T> {
 }
 
 impl<T: Actions> Proposer for Consensus<T> {
+    #[tracing::instrument(
+        skip(self), 
+        fields(id = %id),
+    )]
     fn propose(&self, id: ID) -> Result<()> {
         let proposal = {
             let mut proposal = self.state.lock().take_proposal()?;

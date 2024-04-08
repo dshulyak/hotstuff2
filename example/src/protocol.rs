@@ -329,20 +329,22 @@ pub(crate) async fn process_actions(
             }
             Action::StateChange(change) => {
                 if let Some(commit) = &change.commit {
-                    tracing::info!(
-                        view = %commit.inner.view,
-                        height = %commit.inner.block.height, 
-                        block = %commit.inner.block.id, 
-                        latency = %humantime::Duration::from(Duration::from_secs_f64(average_latency)), 
-                        "committing new block");
-                    let latency = Instant::now() - last;
-                    if average_latency == 0.0 {
-                        average_latency = latency.as_secs_f64();
-                    } else {
-                        // 86% of the value is the last 49
-                        average_latency += (latency.as_secs_f64() - average_latency) / 25.0;
-                    }
-                    last = Instant::now();
+                    tracing::info_span!("on block", 
+                        view = %commit.inner.view, 
+                        height = commit.inner.block.height, 
+                        id = %commit.inner.block.id).in_scope(|| {
+                            tracing::info!(
+                                latency = %humantime::Duration::from(Duration::from_secs_f64(average_latency)), 
+                                "committing new block");
+                            let latency = Instant::now() - last;
+                            if average_latency == 0.0 {
+                                average_latency = latency.as_secs_f64();
+                            } else {
+                                // 86% of the value is the last 49
+                                average_latency += (latency.as_secs_f64() - average_latency) / 25.0;
+                            }
+                            last = Instant::now();
+                        });
                 }
                 if let Err(err) = history.update(&change).await {
                     tracing::error!(error = ?err, "state change");

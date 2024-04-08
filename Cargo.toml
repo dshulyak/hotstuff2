@@ -16,6 +16,7 @@ anyhow = "1.0"
 parking_lot = "0.12.1"
 hex = "0.4.3"
 ctrlc = "3.4.4"
+tracing = "0.1.40"
 
 [dev-dependencies]
 rand = "0.8.0"

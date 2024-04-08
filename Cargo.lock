@@ -877,6 +877,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rand",
+ "tracing",
 ]
 
 [[package]]
