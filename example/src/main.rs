@@ -3,10 +3,15 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use hotstuff2::types::{PrivateKey, PublicKey};
 use humantime::Duration;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{self as sdk};
 use rand::{rngs::OsRng, RngCore};
+use sdk::Resource;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod codec;
 mod context;
@@ -17,7 +22,23 @@ mod protocol;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
-enum Cli {
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+
+    #[clap(long, short = 't', help = "endpoint to collect opentelemetry traces")]
+    tracer: Option<String>,
+    #[clap(
+        long,
+        short = 'i',
+        default_value = "undefined",
+        help = "unique identifier for the node"
+    )]
+    id: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
     Generate(Generate),
     Run(Run),
 }
@@ -102,16 +123,41 @@ impl Run {
 
 #[tokio::main]
 async fn main() {
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::FmtSubscriber::builder()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .finish(),
-    )
-    .unwrap();
+    let opts = Cli::parse();
+    if let Some(endpoint) = opts.tracer {
+        let tracer = opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_exporter(
+                opentelemetry_otlp::new_exporter()
+                    .tonic()
+                    .with_endpoint(&endpoint),
+            )
+            .with_trace_config(
+                sdk::trace::config()
+                    .with_sampler(sdk::trace::Sampler::AlwaysOn)
+                    .with_resource(Resource::new(vec![KeyValue::new("service.name", opts.id.clone())])),
+            )
+            .install_batch(sdk::runtime::Tokio)
+            .expect("install simple");
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(fmt::Layer::default())
+            .with(tracing_opentelemetry::layer().with_tracer(tracer))
+            .try_init()
+            .expect("init tracing");
 
-    match Cli::parse() {
-        Cli::Generate(gen) => generate(gen),
-        Cli::Run(opts) => run(opts).await,
+        tracing::info!(endpoint=%endpoint, id= %opts.id, "tracing initialized");
+    } else {
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::FmtSubscriber::builder()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .finish(),
+        )
+        .expect("init stdout tracinng");
+    }
+    match opts.command {
+        Commands::Generate(gen) => generate(gen),
+        Commands::Run(opts) => run(opts).await,
     }
 }
 
@@ -182,9 +228,15 @@ async fn run(opt: Run) {
         }
     };
     participants.sort();
-    let pool = history::open(opt.directory.join("history.db").as_os_str().to_str().unwrap())
-        .await
-        .unwrap();
+    let pool = history::open(
+        opt.directory
+            .join("history.db")
+            .as_os_str()
+            .to_str()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     let mut node = match node::Node::init(
         opt.directory.as_path(),
         pool,
@@ -194,7 +246,9 @@ async fn run(opt: Run) {
         privates.into_boxed_slice(),
         opt.connect,
         opt.network_delay.into(),
-    ).await {
+    )
+    .await
+    {
         Ok(node) => node,
         Err(err) => {
             tracing::error!(error = %err, "failed to initialize node");
