@@ -160,33 +160,16 @@ impl<T: Actions> Consensus<T> {
         }));
     }
 
+    #[tracing::instrument(skip(self, sync))]
     fn on_sync(&self, sync: Sync) -> Result<()> {
         if let Some(double) = &sync.commit {
             if double.inner.view > View(0) {
-                ensure!(
-                    double.signers.iter().filter(|b| *b).count()
-                        == self.participants.honest_majority()
-                );
-                double.signature.verify(
-                    Domain::Vote2,
-                    &double.inner.to_bytes(),
-                    self.participants.decode(&double.signers),
-                )?;
+                self.verify_certificate(Domain::Vote2, &double.inner, &double.signature, &double.signers)?;
             }
         }
         if let Some(locked) = &sync.locked {
             if locked.inner.view > View(0) {
-                ensure!(
-                    locked.signers.iter().filter(|b| *b).count()
-                        == self.participants.honest_majority()
-                );
-                if locked.inner.view > View(0) {
-                    locked.signature.verify(
-                        Domain::Vote,
-                        &locked.inner.to_bytes(),
-                        self.participants.decode(&locked.signers),
-                    )?;
-                }
+                self.verify_certificate(Domain::Vote, &locked.inner, &locked.signature, &locked.signers)?;
             }
         }
 
@@ -217,15 +200,7 @@ impl<T: Actions> Consensus<T> {
         fields(view = %wish.view),
     )]
     fn on_wish(&self, wish: Signed<Wish>) -> Result<()> {
-        ensure!(
-            wish.signer < self.participants.len() as u16,
-            "invalid signer"
-        );
-        wish.signature.verify(
-            Domain::Wish,
-            &wish.inner.to_bytes(),
-            &self.participants[wish.signer],
-        )?;
+        self.verify_one(Domain::Wish, &wish.inner, &wish.signature, wish.signer)?;
 
         let wishes = {
             let mut state = self.state.lock();
@@ -267,16 +242,11 @@ impl<T: Actions> Consensus<T> {
         fields(view = %timeout.certificate.inner),
     )]
     fn on_timeout(&self, timeout: Timeout) -> Result<()> {
-        ensure!(
-            timeout.certificate.signers.iter().filter(|b| *b).count()
-                == self.participants.honest_majority(),
-            "must be signed exactly by an honest majority: {:?}",
-            self.participants.honest_majority(),
-        );
-        timeout.certificate.signature.verify(
-            Domain::Wish,
-            &timeout.certificate.inner.to_bytes(),
-            self.participants.decode(&timeout.certificate.signers),
+        self.verify_certificate(
+            Domain::Wish, 
+            &timeout.certificate.inner, 
+            &timeout.certificate.signature, 
+            &timeout.certificate.signers,
         )?;
 
         let mut state = self.state.lock();
@@ -298,41 +268,21 @@ impl<T: Actions> Consensus<T> {
         fields(view = %propose.view, height = propose.block.height, id = %propose.block.id),
     )]
     fn on_propose(&self, propose: Signed<Propose>) -> Result<()> {
-        // signature checks. should be executed before acquiring locks on state.
-        ensure!(
-            propose.signer < self.participants.len() as u16,
-            "signer identifier is out of bounds"
-        );
-        propose.signature.verify(
-            Domain::Propose,
-            &propose.inner.to_bytes(),
-            &self.participants[propose.signer],
-        )?;
+        self.verify_one(Domain::Propose, &propose.inner, &propose.signature, propose.signer)?;
         if propose.inner.locked.inner.view > View(0) {
-            ensure!(
-                propose.inner.locked.signers.iter().filter(|b| *b).count()
-                    == self.participants.honest_majority()
-            );
-            ensure!(
-                propose.inner.locked.signers.iter().filter(|b| *b).count()
-                    == self.participants.honest_majority(),
-                "locked signed by more than 2/3 participants"
-            );
-            propose.inner.locked.signature.verify(
-                Domain::Vote,
-                &propose.inner.locked.inner.to_bytes(),
-                self.participants.decode(&propose.inner.locked.signers),
+            self.verify_certificate(
+                Domain::Vote, 
+                &propose.inner.locked.inner, 
+                &propose.inner.locked.signature, 
+                &propose.inner.locked.signers,
             )?;
         }
         if propose.inner.double.inner.view > View(0) {
-            ensure!(
-                propose.inner.double.signers.iter().filter(|b| *b).count()
-                    == self.participants.honest_majority()
-            );
-            propose.inner.double.signature.verify(
-                Domain::Vote2,
-                &propose.inner.double.inner.to_bytes(),
-                self.participants.decode(&propose.inner.double.signers),
+            self.verify_certificate(
+                Domain::Vote2, 
+                &propose.inner.double.inner, 
+                &propose.inner.double.signature, 
+                &propose.inner.double.signers,
             )?;
         }
         let mut change = StateChange::new();
@@ -400,42 +350,12 @@ impl<T: Actions> Consensus<T> {
         fields(view = %prepare.certificate.view, height = prepare.certificate.height, id = %prepare.certificate.id),
     )]
     fn on_prepare(&self, prepare: Signed<Prepare>) -> Result<()> {
-        ensure!(
-            prepare.signer < self.participants.len() as u16,
-            "invalid signer {:?}",
-            prepare.signer,
-        );
-        prepare.signature.verify(
-            Domain::Prepare,
-            &prepare.inner.to_bytes(),
-            &self.participants[prepare.signer],
-        )?;
-
-        ensure!(
-            prepare
-                .inner
-                .certificate
-                .signers
-                .iter()
-                .filter(|b| *b)
-                .count()
-                == self.participants.honest_majority()
-        );
-        ensure!(
-            prepare
-                .inner
-                .certificate
-                .signers
-                .iter()
-                .filter(|b| *b)
-                .count()
-                == self.participants.honest_majority(),
-            "must be signed by honest majority"
-        );
-        prepare.inner.certificate.signature.verify(
-            Domain::Vote,
-            &prepare.certificate.inner.to_bytes(),
-            self.participants.decode(&prepare.inner.certificate.signers),
+        self.verify_one(Domain::Prepare, &prepare.inner, &prepare.signature, prepare.signer)?;
+        self.verify_certificate(
+            Domain::Vote, 
+            &prepare.certificate.inner, 
+            &prepare.inner.certificate.signature, 
+            &prepare.inner.certificate.signers,
         )?;
         let mut change = StateChange::new();
         {
@@ -478,15 +398,7 @@ impl<T: Actions> Consensus<T> {
         fields(view = %vote.inner.view, height = vote.inner.block.height, id = %vote.inner.block.id),
     )]
     fn on_vote(&self, vote: Signed<Vote>) -> Result<()> {
-        ensure!(
-            vote.signer < self.participants.len() as u16,
-            "invalid signer"
-        );
-        vote.signature.verify(
-            Domain::Vote,
-            &vote.to_bytes(),
-            &self.participants[vote.signer],
-        )?;
+        self.verify_one(Domain::Vote, &vote.inner, &vote.signature, vote.signer)?;
 
         let signer = self.participants.leader(vote.inner.view);
         let pk = self
@@ -503,8 +415,7 @@ impl<T: Actions> Consensus<T> {
                 .or_insert_with(|| Votes::new(self.participants.len()));
             ensure!(
                 !votes.voted(vote.signer),
-                "signer {} already voted",
-                vote.signer,
+                "signer {} already voted", vote.signer,
             );
             votes.add(vote.clone());
             if votes.count() == self.participants.honest_majority() {
@@ -539,25 +450,8 @@ impl<T: Actions> Consensus<T> {
         fields(view = %vote.inner.view, height = vote.inner.block.height, id = %vote.inner.block.id),
     )]
     fn on_vote2(&self, vote: Signed<Certificate<Vote>>) -> Result<()> {
-        ensure!(
-            vote.signer < self.participants.len() as u16,
-            "invalid signer index {:?}",
-            vote.signer
-        );
-        vote.signature.verify(
-            Domain::Vote2,
-            &vote.inner.inner.to_bytes(),
-            &self.participants[vote.signer],
-        )?;
-        ensure!(
-            vote.inner.signers.iter().filter(|b| *b).count() == self.participants.honest_majority(),
-            "must be signed by honest majority"
-        );
-        vote.inner.signature.verify(
-            Domain::Vote,
-            &vote.inner.inner.to_bytes(),
-            self.participants.decode(&vote.inner.signers),
-        )?;
+        self.verify_one(Domain::Vote2, &vote.inner.inner, &vote.signature, vote.signer)?;
+        self.verify_certificate(Domain::Vote, &vote.inner.inner, &vote.inner.signature, &vote.inner.signers)?;
 
         ensure!(
             self.keys
@@ -611,6 +505,29 @@ impl<T: Actions> Consensus<T> {
             self.actions.send(Action::Propose);
         }
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self, signed, signature))]
+    fn verify_one(&self, domain: Domain, signed: &impl ToBytes, signature: &Signature, signer: Signer) -> Result<()> {
+        ensure!(
+            signer < self.participants.len() as u16,
+            "invalid signer index {:?}",
+            signer
+        );
+        signature.verify(domain, &signed.to_bytes(), &self.participants[signer])
+    }
+
+    #[tracing::instrument(skip(self, signed, signature, signers))]
+    fn verify_certificate(&self, domain: Domain, signed: &impl ToBytes, signature: &AggregateSignature, signers: &BitVec) -> Result<()> {
+        ensure!(
+            signers.iter().filter(|b| *b).count() == self.participants.honest_majority(),
+            "must be signed by honest majority"
+        );
+        signature.verify(
+            domain,
+            &signed.to_bytes(),
+            self.participants.decode(&signers),
+        )
     }
 }
 
