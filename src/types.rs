@@ -507,8 +507,18 @@ impl Signature {
         }
     }
 
+    pub fn verify_with_pk(&self, domain: Domain, message: &[u8], public_key: &PublicKey) -> Result<()> {
+        match self
+            .to_blst()?
+            .verify(true, message, domain.into(), &[], &public_key.0, true)
+        {
+            ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
+            err => Err(anyhow!("invalid signature: {:?}", err)),
+        }
+    }
+
     pub fn verify_possesion(&self, public_key: &PublicKey) -> Result<()> {
-        self.verify(Domain::Possesion, &public_key.to_bytes(), public_key)
+        self.verify_with_pk(Domain::Possesion, &public_key.to_bytes(), public_key)
     }
 
     fn to_blst(&self) -> anyhow::Result<blst::Signature> {
