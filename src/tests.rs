@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::sequential::{self as seq, Actions, OnDelay, OnMessage, Proposer, StateChange};
+use crate::sequential::{self as seq, Actions, OnDelay, OnMessage, Proposer, StateChange, LEADER_TIMEOUT_DELAY};
 use crate::types::*;
 
 use bit_vec::BitVec;
@@ -65,7 +65,7 @@ pub(crate) fn gen_genesis() -> Certificate<Vote> {
     Certificate {
         inner: Vote {
             view: 0.into(),
-            block: Block::new(0,ID::default(), GENESIS.into()),
+            block: Block::new(0, ID::default(), GENESIS.into()),
         },
         signature: AggregateSignature::empty(),
         signers: BitVec::new(),
@@ -171,7 +171,14 @@ impl Tester {
 }
 
 impl Tester {
-    fn prepare(&self, view: View, height: u64, prev: &str, id: &str, signers: Vec<Signer>) -> Message {
+    fn prepare(
+        &self,
+        view: View,
+        height: u64,
+        prev: &str,
+        id: &str,
+        signers: Vec<Signer>,
+    ) -> Message {
         let vote = Vote {
             view,
             block: Block::new(height, ID::from_str(prev), ID::from_str(id)),
@@ -304,7 +311,7 @@ impl Instance {
         self.send_one(tester.sync_genesis(), 1);
         self.on_message(tester.propose_first(view, id));
         self.voted(view);
-        self.send_one(tester.vote(view,1, GENESIS, id, self.signer), 1);
+        self.send_one(tester.vote(view, 1, GENESIS, id, self.signer), 1);
         self.on_message(tester.prepare(view, 1, GENESIS, id, vec![0, 1, 2]));
         self.lock(tester.certify_vote(view, 1, GENESIS, id, vec![0, 1, 2]));
         self.send_one(
@@ -508,15 +515,15 @@ fn test_commit_one() {
             2,
             "a",
             "b",
-            tester.certify_vote( 1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
-            tester.certify_vote2( 1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
+            tester.certify_vote(1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
+            tester.certify_vote2(1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
         ));
         inst.state_change(
             None,
             Some(tester.certify_vote2(1.into(), 1, GENESIS, "a", vec![0, 1, 2])),
             Some(2.into()),
         );
-        inst.send_one(tester.vote(2.into(), 2,  "a", "b", inst.signer), 2);
+        inst.send_one(tester.vote(2.into(), 2, "a", "b", inst.signer), 2);
     });
 }
 
@@ -530,7 +537,7 @@ fn test_tick_on_epoch_boundary() {
             2,
             "a",
             "b",
-            tester.certify_vote(1.into(), 1,  GENESIS, "a", vec![0, 1, 2]),
+            tester.certify_vote(1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
             tester.certify_vote2(1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
         ));
         inst.state_change(
@@ -539,21 +546,21 @@ fn test_tick_on_epoch_boundary() {
             Some(View(2)),
         );
         inst.drain_actions();
-        inst.on_message(tester.prepare(2.into(), 2,  "a", "b", vec![1, 2, 3]));
-        inst.lock(tester.certify_vote(2.into(), 2,  "a", "b", vec![1, 2, 3]));
+        inst.on_message(tester.prepare(2.into(), 2, "a", "b", vec![1, 2, 3]));
+        inst.lock(tester.certify_vote(2.into(), 2, "a", "b", vec![1, 2, 3]));
         inst.drain_actions();
 
         inst.on_tick();
         inst.consume_actions();
         inst.send_one(tester.wish(3.into(), inst.signer), 3);
         inst.on_message(tester.timeout(3.into(), vec![0, 1, 2]));
-        let locked_b = tester.certify_vote(2.into(), 2,  "a", "b", vec![1, 2, 3]);
+        let locked_b = tester.certify_vote(2.into(), 2, "a", "b", vec![1, 2, 3]);
         let double_a = tester.certify_vote2(1.into(), 1, GENESIS, "a", vec![0, 1, 2]);
         inst.send_one(
             tester.sync(Some(locked_b.clone()), Some(double_a.clone())),
             3,
         );
-        inst.on_delay();
+        (0..LEADER_TIMEOUT_DELAY).for_each(|_| inst.on_delay());
         inst.send_all(tester.propose(3.into(), 2, "a", "b", locked_b.clone(), double_a.clone()));
         inst.on_message(tester.propose(3.into(), 2, "a", "b", locked_b.clone(), double_a.clone()));
         inst.voted(3.into());
@@ -567,15 +574,22 @@ fn test_propose_after_delay() {
         let inst = &mut instances.0[2];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
-        let locked_a = tester.certify_vote(1.into(), 1,  GENESIS, "a", vec![0, 1, 2]);
+        let locked_a = tester.certify_vote(1.into(), 1, GENESIS, "a", vec![0, 1, 2]);
         inst.send_one(
             tester.sync(Some(locked_a.clone()), Some(tester.genesis())),
             2,
         );
 
         inst.no_actions();
-        inst.on_delay();
-        inst.send_all(tester.propose(2.into(), 1, GENESIS, "a", locked_a.clone(), tester.genesis()));
+        (0..LEADER_TIMEOUT_DELAY).for_each(|_| inst.on_delay());
+        inst.send_all(tester.propose(
+            2.into(),
+            1,
+            GENESIS,
+            "a",
+            locked_a.clone(),
+            tester.genesis(),
+        ));
     })
 }
 
@@ -586,7 +600,7 @@ fn test_nonleader_on_delay() {
         let inst = &mut instances.0[0];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_tick();
-        let locked_a = tester.certify_vote(1.into(), 1,  GENESIS, "a", vec![0, 1, 2]);
+        let locked_a = tester.certify_vote(1.into(), 1, GENESIS, "a", vec![0, 1, 2]);
         inst.send_one(
             tester.sync(Some(locked_a.clone()), Some(tester.genesis())),
             2,
@@ -602,7 +616,7 @@ fn test_on_sync() {
         let inst = &mut instances.0[0];
         inst.bootstrap(tester, 1.into(), "a");
         inst.on_message(tester.sync(
-            Some(tester.certify_vote(2.into(), 2,  GENESIS, "a", vec![0, 1, 2])),
+            Some(tester.certify_vote(2.into(), 2, GENESIS, "a", vec![0, 1, 2])),
             Some(tester.certify_vote2(2.into(), 2, GENESIS, "a", vec![0, 1, 2])),
         ));
     })
@@ -619,8 +633,8 @@ fn test_domain_misuse() {
             2,
             "a",
             "b",
-            tester.certify_vote(1.into(), 1,  GENESIS, "a", vec![0, 1, 2]),
-            tester.certify_vote(1.into(), 1,  GENESIS, "a", vec![0, 1, 2]),
+            tester.certify_vote(1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
+            tester.certify_vote(1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
         ));
         inst.on_message_err(tester.propose(
             2.into(),
@@ -649,11 +663,11 @@ fn test_repetetive_messages() {
     gentest(4, |tester, instances| {
         let inst = &mut instances.0[2];
         inst.bootstrap(tester, 1.into(), "a");
-        let locked_a = tester.certify_vote(1.into(), 1,  GENESIS, "a", vec![0, 1, 2]);
+        let locked_a = tester.certify_vote(1.into(), 1, GENESIS, "a", vec![0, 1, 2]);
         let double_a = tester.certify_vote2(1.into(), 1, GENESIS, "a", vec![0, 1, 2]);
         inst.on_message(tester.propose(2.into(), 2, "a", "b", locked_a.clone(), double_a.clone()));
-        inst.on_message(tester.vote(2.into(), 2,  "a", "b", 1));
-        inst.on_message_err(tester.vote(2.into(), 2,  "a", "b", 1));
+        inst.on_message(tester.vote(2.into(), 2, "a", "b", 1));
+        inst.on_message_err(tester.vote(2.into(), 2, "a", "b", 1));
     })
 }
 
@@ -664,7 +678,7 @@ fn test_multi_bootstrap() {
         instances.for_each(|i| i.send_one(tester.wish(1.into(), i.signer), 1));
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
         instances.send_one(tester.sync_genesis(), 1);
-        instances.on_delay();
+        (0..LEADER_TIMEOUT_DELAY).for_each(|_| instances.on_delay());
         instances.leader(1.into()).propose();
 
         instances.no_actions();
@@ -691,11 +705,15 @@ fn test_multi_bootstrap() {
         votes.into_iter().for_each(|v| {
             instances.leader(1.into()).on_message(v);
         });
-        instances
-            .leader(1.into())
-            .send_all(tester.prepare(1.into(), 1, GENESIS, "a", vec![0, 1, 2]));
+        instances.leader(1.into()).send_all(tester.prepare(
+            1.into(),
+            1,
+            GENESIS,
+            "a",
+            vec![0, 1, 2],
+        ));
         instances.on_message(tester.prepare(1.into(), 1, GENESIS, "a", vec![0, 1, 2]));
-        instances.lock(tester.certify_vote(1.into(), 1,  GENESIS, "a", vec![0, 1, 2]));
+        instances.lock(tester.certify_vote(1.into(), 1, GENESIS, "a", vec![0, 1, 2]));
         instances
             .map(|i| {
                 let vote = tester.vote2(1.into(), 1, GENESIS, "a", i.signer, vec![0, 1, 2]);
@@ -713,7 +731,7 @@ fn test_multi_bootstrap() {
             2,
             "a",
             "b",
-            tester.certify_vote(1.into(), 1,  GENESIS, "a", vec![0, 1, 2]),
+            tester.certify_vote(1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
             tester.certify_vote2(1.into(), 1, GENESIS, "a", vec![0, 1, 2]),
         ));
 
@@ -1011,8 +1029,14 @@ fn vote_strat(
     views: impl Strategy<Value = u64>,
     keys: Vec<PrivateKey>,
 ) -> impl Strategy<Value = Message> {
-    (views, 0..keys.len(), any::<u64>(), any::<[u8; 32]>(), any::<[u8; 32]>()).prop_map(
-        move |(view, signer, height, prev, id)| {
+    (
+        views,
+        0..keys.len(),
+        any::<u64>(),
+        any::<[u8; 32]>(),
+        any::<[u8; 32]>(),
+    )
+        .prop_map(move |(view, signer, height, prev, id)| {
             let msg = Vote {
                 view: View(view),
                 block: Block::new(height, prev.into(), id.into()),
@@ -1023,8 +1047,7 @@ fn vote_strat(
                 signer: signer as Signer,
                 signature,
             })
-        },
-    )
+        })
 }
 
 fn cert_strat<T: ToBytes + Debug>(

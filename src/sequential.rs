@@ -8,14 +8,19 @@ use parking_lot::Mutex;
 
 use crate::types::*;
 
-// reset timers. single tick should be sufficient to finish consensus round.
-// - wait delay for leader to receive sync messages. during this delay leader needs to delive timeout certificate
-//   and obtain sync messages from all honest participants. should be equal to two maximal network delays.
-// - wait for 4 normal rounds, each one atleast one maximal network delay.
-// - wait for 1 more to deliver propose to all participants, so that they enter next view.
+// TIMEOUT should be sufficient to:
+// - 2 delays for a leader to receive latest lock 
+//   - participants receive timeout certificate
+//   - leader receives all `sync` messages within maximal delay
+// - 4 delays to conclude normal round
+//   - participants receive propose
+//   - leader receves 2f+1 votes on propose
+//   - participants receive prepare
+//   - leader receives 2f+1 votes on prepare
+// - 1 delay for next `propose` to all participants
 // single tick atleast 7 maximal network delays.
-pub(crate) const TIMEOUT: u8 = 7 * DELAY;
-const DELAY: u8 = 1;
+pub(crate) const TIMEOUT: u8 = 7;
+pub(crate) const LEADER_TIMEOUT_DELAY: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateChange {
@@ -558,11 +563,11 @@ impl<T: Actions> OnDelay for Consensus<T> {
                     );
                     (None, None)
                 }
-            } else if state.ticks == DELAY
+            } else if state.ticks == LEADER_TIMEOUT_DELAY
                 && state.is_waiting(state.view)
                 && self.is_leader(state.view)
             {
-                state.reset_delay();
+                state.waiting_delay_view = None;
                 // i want to obtain double certificate on every block.
                 // therefore i extend locked if it is equal to double, otherwise i retry locked block.
                 if state.locked.inner != state.commit.inner {
@@ -682,10 +687,6 @@ impl State {
 
     fn wait_first_delay(&mut self, view: View) {
         self.waiting_delay_view = Some(view);
-    }
-
-    fn reset_delay(&mut self) {
-        self.waiting_delay_view = None;
     }
 
     fn is_waiting(&self, view: View) -> bool {
