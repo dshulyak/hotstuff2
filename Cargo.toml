@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["example"]
+members = ["example", "fuzz"]
 resolver = "2"
-
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
@@ -17,6 +16,7 @@ parking_lot = "0.12.1"
 hex = "0.4.3"
 ctrlc = "3.4.4"
 tracing = "0.1.40"
+itertools = "0.12.1"
 
 [dev-dependencies]
 rand = "0.8.0"

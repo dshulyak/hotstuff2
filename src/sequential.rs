@@ -122,6 +122,14 @@ impl<T: Actions> Consensus<T> {
         }
     }
 
+    pub fn public_keys<'a>(&'a self) -> impl IntoIterator<Item = (Signer, PublicKey)> + 'a {
+        self.keys.iter().map(|(signer, key)| (*signer, key.public()))
+    }
+
+    pub fn sink(&self) -> &T {
+        &self.actions
+    }
+
     pub fn current_view(&self) -> View {
         self.state.lock().view
     }

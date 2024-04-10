@@ -32,6 +32,10 @@ impl ID {
     pub fn short_id(&self) -> String {
         hex::encode(&self.0)[..8].to_string()
     }
+
+    pub fn empty() -> Self {
+        ID([0; 32].into())
+    }
 }
 
 impl Display for ID {

@@ -1,0 +1,21 @@
+[package]
+name = "example-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary = { version = "1.0.3", features = ["derive"] }
+bit-vec = "0.6.3"
+hotstuff2 = { path = "../" }
+itertools = "0.12.1"
+
+[[bin]]
+name = "twins_basic"
+path = "fuzz_targets/twins_basic.rs"
+test = false
+doc = false
