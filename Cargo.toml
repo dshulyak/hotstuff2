@@ -17,6 +17,7 @@ hex = "0.4.3"
 ctrlc = "3.4.4"
 tracing = "0.1.40"
 itertools = "0.12.1"
+arbitrary = { version = "1.0.3", features = ["derive"] }
 
 [dev-dependencies]
 rand = "0.8.0"

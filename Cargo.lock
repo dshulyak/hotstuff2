@@ -627,10 +627,7 @@ dependencies = [
 name = "example-fuzz"
 version = "0.0.0"
 dependencies = [
- "arbitrary",
- "bit-vec",
  "hotstuff2",
- "itertools",
  "libfuzzer-sys",
 ]
 
@@ -902,6 +899,7 @@ name = "hotstuff2"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arbitrary",
  "bit-vec",
  "blst",
  "ctrlc",
