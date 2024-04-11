@@ -12,7 +12,10 @@ use itertools::Itertools;
 
 use crate::{
     sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer},
-    types::{AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg, Vote, ID},
+    types::{
+        AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg,
+        Vote, ID,
+    },
 };
 
 fn genesis() -> Certificate<Vote> {
@@ -92,13 +95,37 @@ pub enum Op {
     // consume and execute actions
     // - send messages
     // - commits
-    Advance,
+    Advance(usize),
+}
+
+pub struct Scenario(Vec<Op>);
+
+impl Scenario {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        let ops = value
+            .lines()
+            .map(|line| Op::parse(line.trim()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Scenario(ops))
+    }
+}
+
+impl Debug for Scenario {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for op in self.0.iter() {
+            writeln!(f, "{:?}", op)?;
+        }
+        Ok(())
+    }
 }
 
 impl Op {
     pub fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
-            "advance" => Ok(Op::Advance),
+            "advance" => {
+                let n = value.strip_prefix("advance").unwrap().parse::<usize>()?;
+                Ok(Op::Advance(n))
+            },
             _ => {
                 let mut partitions = vec![];
                 for side in value.split("|") {
@@ -137,7 +164,7 @@ impl Debug for Op {
                 }
                 Ok(())
             }
-            Op::Advance => f.write_str("advance"),
+            Op::Advance(n) => write!(f, "advance {}", n),
         }
     }
 }
@@ -153,7 +180,7 @@ impl<const TOTAL: usize, const TWINS: usize> Into<Op> for ArbitraryOp<TOTAL, TWI
 
 impl<'a, const TOTAL: usize, const TWINS: usize> Arbitrary<'a> for ArbitraryOp<TOTAL, TWINS> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        if u.ratio(1, 10)? {
+        if u.ratio(1, 2)? {
             // generate all nodes into single array
             // split array into 1-3 random partitions
             // only 1 twin can exist in the partition, so any 2nd twin is moved to the next one
@@ -162,7 +189,7 @@ impl<'a, const TOTAL: usize, const TWINS: usize> Arbitrary<'a> for ArbitraryOp<T
             let nodes = Model::nodes(TOTAL, TWINS);
             Ok(ArbitraryOp(Op::Routes(vec![nodes])))
         } else {
-            Ok(ArbitraryOp(Op::Advance))
+            Ok(ArbitraryOp(Op::Advance(u.int_in_range(1..=7)?)))
         }
     }
 }
@@ -236,8 +263,10 @@ impl Model {
             Op::Routes(partition) => {
                 self.paritition(partition);
             }
-            Op::Advance => {
-                self.advance();
+            Op::Advance(n) => {
+                for _ in 0..n {
+                    self.advance();
+                }
             }
         }
         self.verify()
@@ -269,8 +298,8 @@ impl Model {
                 .get(from)
                 .and_then(|certs| certs.get(&height))
                 .unwrap();
-            if let Some(consensus) =  self.consensus.get(to) {
-                let sync = SyncMsg{
+            if let Some(consensus) = self.consensus.get(to) {
+                let sync = SyncMsg {
                     locked: None,
                     commit: Some(cert.clone()),
                 };
