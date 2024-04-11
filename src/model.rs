@@ -1,9 +1,9 @@
 // ideas for the model based on [Twins: BFT Systems Made Robust](https://drops.dagstuhl.de/storage/00lipics/lipics-vol217-opodis2021/LIPIcs.OPODIS.2021.7/LIPIcs.OPODIS.2021.7.pdf)
 
-
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap}, fmt::Debug,
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
 };
 
 use arbitrary::Arbitrary;
@@ -12,7 +12,7 @@ use itertools::Itertools;
 
 use crate::{
     sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer},
-    types::{AggregateSignature, Block, Certificate, PrivateKey, PublicKey, Vote, ID},
+    types::{AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg, Vote, ID},
 };
 
 fn genesis() -> Certificate<Vote> {
@@ -66,13 +66,22 @@ impl Node {
             Node::Twin(id, twin) => *id + *twin,
         }
     }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        let mut parts = value.split('/');
+        let id = parts.next().unwrap().parse::<u8>()?;
+        match parts.next() {
+            None => Ok(Node::Honest(id)),
+            Some(twin) => Ok(Node::Twin(id, twin.parse::<u8>()?)),
+        }
+    }
 }
 
 impl Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Node::Honest(id) => write!(f, "H{}", id),
-            Node::Twin(id, twin) => write!(f, "T{}/{}", id, twin),
+            Node::Honest(id) => write!(f, "{}", id),
+            Node::Twin(id, twin) => write!(f, "{}/{}", id, twin),
         }
     }
 }
@@ -86,6 +95,29 @@ pub enum Op {
     Advance,
 }
 
+impl Op {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "advance" => Ok(Op::Advance),
+            _ => {
+                let mut partitions = vec![];
+                for side in value.split("|") {
+                    let nodes = side
+                        .trim()
+                        .strip_prefix("{")
+                        .and_then(|side| side.strip_suffix("}"))
+                        .ok_or_else(|| anyhow::anyhow!("invalid partition"))?
+                        .split(",")
+                        .map(|node| Node::parse(node.trim()))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    partitions.push(nodes);
+                }
+                Ok(Op::Routes(partitions))
+            }
+        }
+    }
+}
+
 impl Debug for Op {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -95,14 +127,14 @@ impl Debug for Op {
                         write!(f, " | ")?;
                     }
                     write!(f, "{{")?;
-                    for (j, node)  in side.iter().enumerate() {
+                    for (j, node) in side.iter().enumerate() {
                         if j > 0 {
                             write!(f, ", ")?;
                         }
                         write!(f, "{:?}", node)?;
                     }
                     write!(f, "}}")?;
-                };
+                }
                 Ok(())
             }
             Op::Advance => f.write_str("advance"),
@@ -110,7 +142,16 @@ impl Debug for Op {
     }
 }
 
-impl<'a> Arbitrary<'a> for Op {
+#[derive(Debug)]
+pub struct ArbitraryOp<const TOTAL: usize, const TWINS: usize>(Op);
+
+impl<const TOTAL: usize, const TWINS: usize> Into<Op> for ArbitraryOp<TOTAL, TWINS> {
+    fn into(self) -> Op {
+        self.0
+    }
+}
+
+impl<'a, const TOTAL: usize, const TWINS: usize> Arbitrary<'a> for ArbitraryOp<TOTAL, TWINS> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         if u.ratio(1, 10)? {
             // generate all nodes into single array
@@ -118,12 +159,10 @@ impl<'a> Arbitrary<'a> for Op {
             // only 1 twin can exist in the partition, so any 2nd twin is moved to the next one
             // if partition doesn't exist creeate empty partition
 
-            let honest = (0..5).map(|i| Node::Honest(i));
-            let twins = (5..7)
-                .flat_map(|i| (0..=0).map(|j| Node::Twin(i, j)).collect::<Vec<Node>>());
-            Ok(Op::Routes(vec![honest.chain(twins).collect()]))
+            let nodes = Model::nodes(TOTAL, TWINS);
+            Ok(ArbitraryOp(Op::Routes(vec![nodes])))
         } else {
-            Ok(Op::Advance)
+            Ok(ArbitraryOp(Op::Advance))
         }
     }
 }
@@ -131,20 +170,26 @@ impl<'a> Arbitrary<'a> for Op {
 pub struct Model {
     consensus: HashMap<Node, Consensus<Sink>>,
     public_key_to_node: HashMap<PublicKey, Node>,
-    commits: BTreeMap<u64, HashMap<Node, Block>>,
+    commits: HashMap<Node, BTreeMap<u64, Certificate<Vote>>>,
     locks: HashMap<Node, Certificate<Vote>>,
     proposals_counter: HashMap<Node, u64>,
     routes: Option<HashMap<Node, Node>>,
 }
 
 impl Model {
+    fn nodes(total: usize, twins: usize) -> Vec<Node> {
+        (0..=total - twins)
+            .map(|i| Node::Honest(i as u8))
+            .chain(
+                (total - twins..total).flat_map(|i| (0..=1).map(move |j| Node::Twin(i as u8, j))),
+            )
+            .collect()
+    }
+
     pub fn new(total: usize, twins: usize) -> Self {
         let keys = privates(total);
-        let dishonest =
-            (total - twins..total).flat_map(|i| (0..=1).map(move |j| Node::Twin(i as u8, j)));
-        let nodes = (0..=total - twins)
-            .map(|i| Node::Honest(i as u8))
-            .chain(dishonest)
+        let nodes = Self::nodes(total, twins)
+            .into_iter()
             .map(|n| {
                 (
                     n,
@@ -179,7 +224,7 @@ impl Model {
         Self {
             consensus: nodes,
             public_key_to_node: by_public,
-            commits: BTreeMap::new(),
+            commits: HashMap::new(),
             locks: HashMap::new(),
             proposals_counter: HashMap::new(),
             routes: None,
@@ -198,6 +243,42 @@ impl Model {
         self.verify()
     }
 
+    fn last_commit(&self, node: &Node) -> Option<&Certificate<Vote>> {
+        self.commits
+            .get(node)
+            .and_then(|certs| certs.last_key_value().map(|(_, cert)| cert))
+    }
+
+    fn sync_from(&mut self, from: &Node, to: &Node) {
+        tracing::debug!("syncing from {:?} to {:?}", from, to);
+        let from_last_commit = self.last_commit(from);
+        let to_last_commit = self.last_commit(to);
+        for height in to_last_commit
+            .map(|cert| cert.block.height + 1)
+            .unwrap_or(1)
+            ..=from_last_commit.map(|cert| cert.block.height).unwrap_or(1)
+        {
+            tracing::debug!(
+                "uploading certificate for height {} from {:?} to {:?}",
+                height,
+                from,
+                to
+            );
+            let cert = self
+                .commits
+                .get(from)
+                .and_then(|certs| certs.get(&height))
+                .unwrap();
+            if let Some(consensus) =  self.consensus.get(to) {
+                let sync = SyncMsg{
+                    locked: None,
+                    commit: Some(cert.clone()),
+                };
+                _ = consensus.on_message(Message::Sync(sync));
+            };
+        }
+    }
+
     fn advance(&mut self) {
         if self.routes.is_none() {
             return;
@@ -209,9 +290,9 @@ impl Model {
                     Action::StateChange(change) => {
                         if let Some(cert) = change.commit {
                             self.commits
-                                .entry(cert.block.height)
-                                .or_insert_with(HashMap::new)
-                                .insert(*id, cert.block.clone());
+                                .entry(*id)
+                                .or_insert_with(BTreeMap::new)
+                                .insert(cert.block.height, cert);
                         }
                         if let Some(lock) = change.lock {
                             self.locks.insert(*id, lock);
@@ -248,14 +329,18 @@ impl Model {
     }
 
     fn verify(&self) -> anyhow::Result<()> {
-        if let Some(mut values) = self
+        let certs = self
             .commits
-            .last_key_value()
-            .map(|(_, v)| v.values().into_iter())
-        {
-            let first = values.next().unwrap();
-            for other in values {
-                anyhow::ensure!(first == other, "commits are not equal");
+            .iter()
+            .flat_map(|(_, certs)| certs.last_key_value());
+        let mut by_height = HashMap::new();
+        for (height, cert) in certs {
+            if let Some(by_height) = by_height.get(height) {
+                if by_height != cert {
+                    return Err(anyhow::anyhow!("inconsistent commits"));
+                }
+            } else {
+                by_height.insert(*height, cert.clone());
             }
         }
         Ok(())
@@ -274,6 +359,11 @@ impl Model {
                 );
             }
             Some(_) => {
+                for side in partition.iter() {
+                    for pair in side.iter().permutations(2) {
+                        self.sync_from(&pair[0], &pair[1]);
+                    }
+                }
                 self.routes = Some(
                     partition
                         .iter()
@@ -282,7 +372,6 @@ impl Model {
                         })
                         .collect::<HashMap<_, _>>(),
                 );
-                // TODO restored connections should sync latest commits and locks from each other
             }
         }
     }

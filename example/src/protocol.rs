@@ -390,7 +390,7 @@ mod tests {
     use tokio::time::{self, timeout};
     use tokio_test::{assert_ok, io::Builder};
 
-    use crate::{codec::AsyncEncode, history::inmemory};
+    use crate::history::inmemory;
 
     use super::*;
 
