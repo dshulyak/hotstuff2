@@ -427,8 +427,13 @@ impl Model {
         }
         for (target, inbox) in self.inboxes.iter_mut() {
             for msg in inbox.drain(..) {
-                if let Err(err) =  self.consensus.get(target).unwrap().on_message(msg.clone()) {
-                    tracing::trace!("error processing message {:?} on node {:?}: {:?}", msg, target, err);
+                if let Err(err) = self.consensus.get(target).unwrap().on_message(msg.clone()) {
+                    tracing::trace!(
+                        "error processing message {:?} on node {:?}: {:?}",
+                        msg,
+                        target,
+                        err
+                    );
                 }
             }
         }
@@ -544,14 +549,7 @@ mod tests {
             model.step(op).unwrap();
         }
         model
-            .verify_committed(
-                1,
-                vec![
-                    Node::Honest(0),
-                    Node::Honest(1),
-                    Node::Honest(2),
-                ],
-            )
+            .verify_committed(1, vec![Node::Honest(0), Node::Honest(1), Node::Honest(2)])
             .unwrap();
     }
 
@@ -579,6 +577,61 @@ mod tests {
                     Node::Honest(1),
                     Node::Honest(2),
                     Node::Honest(3),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_twins_sanity() {
+        init_tracing();
+        let scenario = Scenario::parse(
+            r#"
+            {0, 1, 2, 3/0} | {3/1}
+            advance 16
+        "#,
+        )
+        .unwrap();
+        let mut model = Model::new(4, 1);
+        for op in scenario {
+            model.step(op).unwrap();
+        }
+        model
+            .verify_committed(
+                1,
+                vec![
+                    Node::Honest(0),
+                    Node::Honest(1),
+                    Node::Honest(2),
+                    Node::Twin(3, 0),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_twins_noop() {
+        init_tracing();
+        let scenario = Scenario::parse(
+            r#"
+            {0, 1, 2, 3/0, 3/1}
+            advance 16
+        "#,
+        )
+        .unwrap();
+        let mut model = Model::new(4, 1);
+        for op in scenario {
+            model.step(op).unwrap();
+        }
+        model
+            .verify_committed(
+                1,
+                vec![
+                    Node::Honest(0),
+                    Node::Honest(1),
+                    Node::Honest(2),
+                    Node::Twin(3, 0),
+                    Node::Twin(3, 1),
                 ],
             )
             .unwrap();
