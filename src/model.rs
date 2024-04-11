@@ -3,7 +3,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap}, fmt::Debug,
 };
 
 use arbitrary::Arbitrary;
@@ -53,7 +53,7 @@ fn privates(n: usize) -> Vec<PrivateKey> {
     keys
 }
 
-#[derive(Debug, Eq, Hash, PartialEq, Copy, Clone, PartialOrd, Ord)]
+#[derive(Eq, Hash, PartialEq, Copy, Clone, PartialOrd, Ord)]
 pub enum Node {
     Honest(u8),
     Twin(u8, u8),
@@ -68,7 +68,15 @@ impl Node {
     }
 }
 
-#[derive(Debug)]
+impl Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Node::Honest(id) => write!(f, "H{}", id),
+            Node::Twin(id, twin) => write!(f, "T{}/{}", id, twin),
+        }
+    }
+}
+
 pub enum Op {
     // install routing table
     Routes(Vec<Vec<Node>>),
@@ -76,6 +84,30 @@ pub enum Op {
     // - send messages
     // - commits
     Advance,
+}
+
+impl Debug for Op {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Op::Routes(partition) => {
+                for (i, side) in partition.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{{")?;
+                    for (j, node)  in side.iter().enumerate() {
+                        if j > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{:?}", node)?;
+                    }
+                    write!(f, "}}")?;
+                };
+                Ok(())
+            }
+            Op::Advance => f.write_str("advance"),
+        }
+    }
 }
 
 impl<'a> Arbitrary<'a> for Op {
