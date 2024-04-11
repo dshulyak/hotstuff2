@@ -89,6 +89,7 @@ impl Debug for Node {
     }
 }
 
+#[derive(Clone)]
 pub enum Op {
     // install routing table
     Routes(Vec<Vec<Node>>),
@@ -325,11 +326,10 @@ impl Model {
             .unwrap_or(1)
             ..=from_last_commit.map(|cert| cert.block.height).unwrap_or(1)
         {
-            let cert = self
-                .commits
-                .get(from)
-                .and_then(|certs| certs.get(&height))
-                .unwrap();
+            let cert = self.commits.get(from).and_then(|certs| certs.get(&height));
+            if cert.is_none() {
+                continue;
+            }
             tracing::trace!(
                 "uploading certificate for height {:?} from {:?} to {:?}",
                 cert,
@@ -339,7 +339,7 @@ impl Model {
             if let Some(consensus) = self.consensus.get(to) {
                 let sync = SyncMsg {
                     locked: None,
-                    commit: Some(cert.clone()),
+                    commit: Some(cert.unwrap().clone()),
                 };
                 if let Err(err) = consensus.on_message(Message::Sync(sync)) {
                     tracing::warn!("error syncing from {:?} to {:?}: {:?}", from, to, err);
@@ -500,6 +500,10 @@ impl Model {
 mod tests {
     use super::*;
 
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestRunner};
+
     fn init_tracing() {
         let rst = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -633,6 +637,39 @@ mod tests {
                     Node::Twin(3, 0),
                     Node::Twin(3, 1),
                 ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_random_partitions() {
+        init_tracing();
+        let mut runner = TestRunner::new(Config {
+            cases: 100,
+            ..Config::default()
+        });
+        let total = 4;
+        let twins = 1;
+        let nodes = Model::nodes(total, twins);
+        runner
+            .run(
+                &vec(
+                    prop_oneof![
+                        1 => Just(Op::Routes(vec![nodes])),
+                        4 => (1..4usize).prop_map(Op::Advance),
+                    ],
+                    10..20,
+                ),
+                |ops| {
+                    tracing::info!("SCENARIO:\n{:?}", Scenario(ops.clone()));
+                    let mut model = Model::new(total, twins);
+                    for op in ops {
+                        model
+                            .step(op)
+                            .map_err(|err| TestCaseError::fail(err.to_string()))?;
+                    }
+                    Ok(())
+                },
             )
             .unwrap();
     }
