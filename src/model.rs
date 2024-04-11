@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
 };
 
@@ -49,7 +49,7 @@ impl Actions for Sink {
 }
 
 fn privates(n: usize) -> Vec<PrivateKey> {
-    let mut keys = (0..=n)
+    let mut keys = (0..n)
         .map(|i| PrivateKey::from_seed(&[i as u8; 32]))
         .collect::<Vec<_>>();
     keys.sort_by(|a, b| a.public().cmp(&b.public()));
@@ -98,15 +98,44 @@ pub enum Op {
     Advance(usize),
 }
 
+impl Op {
+    fn to_routes(&self) -> Option<HashMap<Node, HashSet<Node>>> {
+        match self {
+            Op::Routes(routes) => {
+                let mut rst = HashMap::new();
+                for side in routes.iter() {
+                    for pair in side.iter().permutations(2) {
+                        rst.entry(*pair[0])
+                            .or_insert_with(HashSet::new)
+                            .insert(*pair[1]);
+                    }
+                }
+                Some(rst)
+            }
+            _ => None,
+        }
+    }
+}
+
 pub struct Scenario(Vec<Op>);
 
 impl Scenario {
     pub fn parse(value: &str) -> anyhow::Result<Self> {
         let ops = value
             .lines()
+            .filter(|line| !line.trim().is_empty())
             .map(|line| Op::parse(line.trim()))
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Scenario(ops))
+    }
+}
+
+impl IntoIterator for Scenario {
+    type Item = Op;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
     }
 }
 
@@ -121,26 +150,28 @@ impl Debug for Scenario {
 
 impl Op {
     pub fn parse(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "advance" => {
-                let n = value.strip_prefix("advance").unwrap().parse::<usize>()?;
-                Ok(Op::Advance(n))
-            },
-            _ => {
-                let mut partitions = vec![];
-                for side in value.split("|") {
-                    let nodes = side
-                        .trim()
-                        .strip_prefix("{")
-                        .and_then(|side| side.strip_suffix("}"))
-                        .ok_or_else(|| anyhow::anyhow!("invalid partition"))?
-                        .split(",")
-                        .map(|node| Node::parse(node.trim()))
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                    partitions.push(nodes);
-                }
-                Ok(Op::Routes(partitions))
+        if value.starts_with("advance") {
+            Ok(Op::Advance(
+                value
+                    .strip_prefix("advance")
+                    .unwrap()
+                    .trim()
+                    .parse::<usize>()?,
+            ))
+        } else {
+            let mut partitions = vec![];
+            for side in value.split("|") {
+                let nodes = side
+                    .trim()
+                    .strip_prefix("{")
+                    .and_then(|side| side.strip_suffix("}"))
+                    .ok_or_else(|| anyhow::anyhow!("invalid partition {}", side))?
+                    .split(",")
+                    .map(|node| Node::parse(node.trim()))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                partitions.push(nodes);
             }
+            Ok(Op::Routes(partitions))
         }
     }
 }
@@ -200,12 +231,14 @@ pub struct Model {
     commits: HashMap<Node, BTreeMap<u64, Certificate<Vote>>>,
     locks: HashMap<Node, Certificate<Vote>>,
     proposals_counter: HashMap<Node, u64>,
-    routes: Option<HashMap<Node, Node>>,
+    routes: Option<HashMap<Node, HashSet<Node>>>,
+    inboxes: HashMap<Node, Vec<Message>>,
+    consecutive_advance: usize,
 }
 
 impl Model {
     fn nodes(total: usize, twins: usize) -> Vec<Node> {
-        (0..=total - twins)
+        (0..total - twins)
             .map(|i| Node::Honest(i as u8))
             .chain(
                 (total - twins..total).flat_map(|i| (0..=1).map(move |j| Node::Twin(i as u8, j))),
@@ -248,13 +281,16 @@ impl Model {
             .iter()
             .flat_map(|(n, c)| c.public_keys().into_iter().map(|(_, public)| (public, *n)))
             .collect::<HashMap<_, _>>();
+        let inboxes = nodes.keys().map(|n| (*n, vec![])).collect();
         Self {
             consensus: nodes,
             public_key_to_node: by_public,
             commits: HashMap::new(),
             locks: HashMap::new(),
             proposals_counter: HashMap::new(),
+            inboxes: inboxes,
             routes: None,
+            consecutive_advance: 0,
         }
     }
 
@@ -262,9 +298,11 @@ impl Model {
         match op {
             Op::Routes(partition) => {
                 self.paritition(partition);
+                self.consecutive_advance = 0;
             }
             Op::Advance(n) => {
                 for _ in 0..n {
+                    self.consecutive_advance += 1;
                     self.advance();
                 }
             }
@@ -287,23 +325,25 @@ impl Model {
             .unwrap_or(1)
             ..=from_last_commit.map(|cert| cert.block.height).unwrap_or(1)
         {
-            tracing::debug!(
-                "uploading certificate for height {} from {:?} to {:?}",
-                height,
-                from,
-                to
-            );
             let cert = self
                 .commits
                 .get(from)
                 .and_then(|certs| certs.get(&height))
                 .unwrap();
+            tracing::trace!(
+                "uploading certificate for height {:?} from {:?} to {:?}",
+                cert,
+                from,
+                to
+            );
             if let Some(consensus) = self.consensus.get(to) {
                 let sync = SyncMsg {
                     locked: None,
                     commit: Some(cert.clone()),
                 };
-                _ = consensus.on_message(Message::Sync(sync));
+                if let Err(err) = consensus.on_message(Message::Sync(sync)) {
+                    tracing::warn!("error syncing from {:?} to {:?}: {:?}", from, to, err);
+                };
             };
         }
     }
@@ -313,32 +353,64 @@ impl Model {
             return;
         }
         let routes = self.routes.as_ref().unwrap();
-        for (id, consensus) in self.consensus.iter() {
+        let mut queue = self.consensus.keys().collect::<Vec<_>>();
+        while let Some(id) = queue.pop() {
+            let consensus = self.consensus.get(id).unwrap();
             for action in consensus.sink().drain() {
                 match action {
                     Action::StateChange(change) => {
                         if let Some(cert) = change.commit {
+                            tracing::debug!(
+                                "{}: committing block {:?} on node {:?}",
+                                self.consecutive_advance,
+                                cert.block,
+                                id
+                            );
                             self.commits
                                 .entry(*id)
                                 .or_insert_with(BTreeMap::new)
                                 .insert(cert.block.height, cert);
                         }
                         if let Some(lock) = change.lock {
+                            tracing::debug!(
+                                "{}, locking block {:?} on node {:?}",
+                                self.consecutive_advance,
+                                lock.block,
+                                id
+                            );
                             self.locks.insert(*id, lock);
                         }
                     }
                     Action::Send(msg, target) => {
                         if let Some(target) = target {
-                            _ = self
-                                .consensus
-                                .get(self.public_key_to_node.get(&target).unwrap())
-                                .unwrap()
-                                .on_message(msg.clone());
-                        } else {
-                            for linked in routes.get(id).iter() {
-                                _ = self.consensus.get(linked).unwrap().on_message(msg.clone());
+                            let route = self.public_key_to_node.get(&target).unwrap();
+                            if routes
+                                .get(id)
+                                .and_then(|linked| linked.get(route))
+                                .is_some()
+                                || route == id
+                            {
+                                tracing::trace!(
+                                    "{}: routed {:?} => {:?}: {:?}",
+                                    self.consecutive_advance,
+                                    id,
+                                    route,
+                                    msg,
+                                );
+                                self.inboxes.get_mut(route).unwrap().push(msg.clone());
                             }
-                            _ = consensus.on_message(msg.clone());
+                        } else {
+                            for linked in routes.get(id).unwrap().iter() {
+                                tracing::trace!(
+                                    "{}: unrouted {:?} => {:?}: {:?}",
+                                    self.consecutive_advance,
+                                    id,
+                                    linked,
+                                    msg,
+                                );
+                                self.inboxes.get_mut(linked).unwrap().push(msg.clone());
+                            }
+                            self.inboxes.get_mut(id).unwrap().push(msg);
                         }
                     }
                     Action::Propose => {
@@ -348,13 +420,40 @@ impl Model {
                         block_id[9] = id.num();
                         _ = consensus.propose(block_id.into());
                         self.proposals_counter.insert(*id, nonce + 1);
+                        queue.push(id);
                     }
+                }
+            }
+        }
+        for (target, inbox) in self.inboxes.iter_mut() {
+            for msg in inbox.drain(..) {
+                if let Err(err) =  self.consensus.get(target).unwrap().on_message(msg.clone()) {
+                    tracing::trace!("error processing message {:?} on node {:?}: {:?}", msg, target, err);
                 }
             }
         }
         for (_, consensus) in self.consensus.iter() {
             consensus.on_delay();
         }
+    }
+
+    #[cfg(test)]
+    fn verify_committed(&self, height: u64, nodes: Vec<Node>) -> anyhow::Result<()> {
+        let mut commits = nodes
+            .into_iter()
+            .map(|n| {
+                self.commits
+                    .get(&n)
+                    .and_then(|certs| certs.get(&height))
+                    .ok_or_else(|| anyhow::anyhow!("missing commit for node {:?}", n))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter();
+        let first = commits.next().unwrap();
+        for commit in commits {
+            anyhow::ensure!(first == commit, "inconsistent commits");
+        }
+        Ok(())
     }
 
     fn verify(&self) -> anyhow::Result<()> {
@@ -376,32 +475,112 @@ impl Model {
     }
 
     fn paritition(&mut self, partition: Vec<Vec<Node>>) {
+        tracing::debug!("uptading to partition {:?}", partition);
         match self.routes.take() {
-            None => {
-                self.routes = Some(
-                    partition
-                        .iter()
-                        .flat_map(|side| {
-                            side.iter().permutations(2).map(|pair| (*pair[0], *pair[1]))
-                        })
-                        .collect::<HashMap<_, _>>(),
-                );
-            }
+            None => {}
             Some(_) => {
                 for side in partition.iter() {
                     for pair in side.iter().permutations(2) {
                         self.sync_from(&pair[0], &pair[1]);
                     }
                 }
-                self.routes = Some(
-                    partition
-                        .iter()
-                        .flat_map(|side| {
-                            side.iter().permutations(2).map(|pair| (*pair[0], *pair[1]))
-                        })
-                        .collect::<HashMap<_, _>>(),
-                );
             }
         }
+        self.routes = Op::Routes(partition).to_routes();
+        tracing::debug!("routes {:?}", self.routes.as_ref().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_tracing() {
+        let rst = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        assert!(rst.is_ok());
+    }
+
+    #[test]
+    fn test_sanity() {
+        init_tracing();
+        let scenario = Scenario::parse(
+            r#"
+            {0, 1, 2, 3}
+            advance 16
+        "#,
+        )
+        .unwrap();
+        let mut model = Model::new(4, 0);
+        for op in scenario {
+            model.step(op).unwrap();
+        }
+        model
+            .verify_committed(
+                1,
+                vec![
+                    Node::Honest(0),
+                    Node::Honest(1),
+                    Node::Honest(2),
+                    Node::Honest(3),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_partition() {
+        init_tracing();
+        let scenario = Scenario::parse(
+            r#"
+            {0, 1, 2} | {3}
+            advance 16
+        "#,
+        )
+        .unwrap();
+        let mut model = Model::new(4, 0);
+        for op in scenario {
+            model.step(op).unwrap();
+        }
+        model
+            .verify_committed(
+                1,
+                vec![
+                    Node::Honest(0),
+                    Node::Honest(1),
+                    Node::Honest(2),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_sync_after_partition() {
+        init_tracing();
+        let scenario = Scenario::parse(
+            r#"
+            {0, 1, 2} | {3}
+            advance 16
+            {0, 1, 2, 3}
+            advance 1
+        "#,
+        )
+        .unwrap();
+        let mut model = Model::new(4, 0);
+        for op in scenario {
+            model.step(op).unwrap();
+        }
+        model
+            .verify_committed(
+                1,
+                vec![
+                    Node::Honest(0),
+                    Node::Honest(1),
+                    Node::Honest(2),
+                    Node::Honest(3),
+                ],
+            )
+            .unwrap();
     }
 }

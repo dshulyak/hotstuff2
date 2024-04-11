@@ -195,7 +195,7 @@ impl<T: Actions> Consensus<T> {
             }
         }
         if let Some(commit) = sync.commit {
-            if commit.inner.block.id == state.commit.inner.block.prev {
+            if commit.inner.block.prev == state.commit.inner.block.id {
                 state.commit = commit;
                 let next = state.commit.inner.view + 1;
                 state.enter_view(next);

@@ -909,6 +909,7 @@ dependencies = [
  "proptest",
  "rand",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
