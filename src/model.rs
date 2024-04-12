@@ -11,7 +11,7 @@ use bit_vec::BitVec;
 use itertools::Itertools;
 
 use crate::{
-    crypto::NoopBackend,
+    crypto,
     sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer},
     types::{
         AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg,
@@ -228,7 +228,7 @@ impl<'a, const TOTAL: usize, const TWINS: usize> Arbitrary<'a> for ArbitraryOp<T
 }
 
 pub struct Model {
-    consensus: HashMap<Node, Consensus<Sink, NoopBackend>>,
+    consensus: HashMap<Node, Consensus<Sink, crypto::NoopBackend>>,
     public_key_to_node: HashMap<PublicKey, Node>,
     commits: HashMap<Node, BTreeMap<u64, Certificate<Vote>>>,
     locks: HashMap<Node, Certificate<Vote>>,
@@ -401,15 +401,17 @@ impl Model {
                                 self.inboxes.get_mut(route).unwrap().push(msg.clone());
                             }
                         } else {
-                            for linked in routes.get(id).unwrap().iter() {
-                                tracing::trace!(
-                                    "{}: unrouted {:?} => {:?}: {:?}",
-                                    self.consecutive_advance,
-                                    id,
-                                    linked,
-                                    msg,
-                                );
-                                self.inboxes.get_mut(linked).unwrap().push(msg.clone());
+                            if let Some(links) = routes.get(id) {
+                                for linked in links {
+                                    tracing::trace!(
+                                        "{}: unrouted {:?} => {:?}: {:?}",
+                                        self.consecutive_advance,
+                                        id,
+                                        linked,
+                                        msg,
+                                    );
+                                    self.inboxes.get_mut(linked).unwrap().push(msg.clone());
+                                }
                             }
                             self.inboxes.get_mut(id).unwrap().push(msg);
                         }
@@ -503,6 +505,7 @@ mod tests {
 
     use proptest::collection::vec;
     use proptest::prelude::*;
+    use proptest::sample::subsequence;
     use proptest::test_runner::{Config, TestRunner};
 
     fn init_tracing() {
@@ -642,24 +645,37 @@ mod tests {
             .unwrap();
     }
 
+    fn two_sided_partition(nodes: Vec<Node>) -> impl Strategy<Value = Op> {
+        subsequence(nodes.clone(), 1..nodes.len() - 1).prop_map(move |partitioned| {
+            let left = nodes
+                .clone()
+                .iter()
+                .filter(|n| !partitioned.contains(n))
+                .map(|n| *n)
+                .collect::<Vec<_>>();
+            Op::Routes(vec![left, partitioned])
+        })
+    }
+
     #[test]
     fn test_random_partitions() {
         init_tracing();
         let mut runner = TestRunner::new(Config {
-            cases: 100,
+            cases: 1000,
             ..Config::default()
         });
         let total = 4;
         let twins = 1;
         let nodes = Model::nodes(total, twins);
+
         runner
             .run(
                 &vec(
                     prop_oneof![
-                        1 => Just(Op::Routes(vec![nodes])),
+                        1 => two_sided_partition(nodes),
                         4 => (1..4usize).prop_map(Op::Advance),
                     ],
-                    10..20,
+                    50..100,
                 ),
                 |ops| {
                     tracing::info!("SCENARIO:\n{:?}", Scenario(ops.clone()));
