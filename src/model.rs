@@ -11,6 +11,7 @@ use bit_vec::BitVec;
 use itertools::Itertools;
 
 use crate::{
+    crypto::NoopBackend,
     sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer},
     types::{
         AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg,
@@ -227,7 +228,7 @@ impl<'a, const TOTAL: usize, const TWINS: usize> Arbitrary<'a> for ArbitraryOp<T
 }
 
 pub struct Model {
-    consensus: HashMap<Node, Consensus<Sink>>,
+    consensus: HashMap<Node, Consensus<Sink, NoopBackend>>,
     public_key_to_node: HashMap<PublicKey, Node>,
     commits: HashMap<Node, BTreeMap<u64, Certificate<Vote>>>,
     locks: HashMap<Node, Certificate<Vote>>,

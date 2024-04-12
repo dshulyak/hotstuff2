@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::ops::Index;
 
 use anyhow::{anyhow, ensure, Ok, Result};
 use bit_vec::BitVec;
 use parking_lot::Mutex;
 
-use crate::types::*;
+use crate::{crypto, types::*};
 
 // TIMEOUT should be sufficient to:
 // - 2 delays for a leader to receive latest lock 
@@ -75,16 +76,17 @@ pub trait Actions: Debug {
 }
 
 #[derive(Debug)]
-pub struct Consensus<T: Actions> {
+pub struct Consensus<T: Actions, C: crypto::Backend = crypto::BLSTBackend> {
     // participants must be sorted lexicographically across all participating nodes.
     // used to decode public keys by reference.
     participants: Signers,
     keys: HashMap<Signer, PrivateKey>,
     actions: T,
     state: Mutex<State>,
+    crypto: PhantomData<C>,
 }
 
-impl<T: Actions> Consensus<T> {
+impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
     pub fn new(
         view: View,
         participants: Box<[PublicKey]>,
@@ -119,6 +121,7 @@ impl<T: Actions> Consensus<T> {
                 ticks: 0,
                 waiting_delay_view: None,
             }),
+            crypto: PhantomData,
         }
     }
 
@@ -165,7 +168,7 @@ impl<T: Actions> Consensus<T> {
             .keys
             .get(&signer)
             .expect("propose shouldn't be called if node is not a leader");
-        let signature = pk.sign(Domain::Propose, &proposal.to_bytes());
+        let signature = C::sign(pk, Domain::Propose, &proposal.to_bytes());
         self.send_all(Message::Propose(Signed {
             inner: proposal,
             signer: signer,
@@ -241,7 +244,7 @@ impl<T: Actions> Consensus<T> {
             self.send_all(Message::Timeout(Timeout {
                 certificate: Certificate {
                     inner: wishes.message().view,
-                    signature: AggregateSignature::aggregate(wishes.signatures())
+                    signature: C::aggregate(wishes.signatures())
                         .expect("failed to aggregate signatures"),
                     signers: wishes.signers(),
                 },
@@ -345,7 +348,7 @@ impl<T: Actions> Consensus<T> {
                 view: propose.inner.view,
                 block: propose.inner.block.clone(),
             };
-            let signature = pk.sign(Domain::Vote, &vote.to_bytes());
+            let signature = C::sign(pk, Domain::Vote, &vote.to_bytes());
             self.send_leader(
                 Message::Vote(Signed {
                     inner: vote,
@@ -393,7 +396,7 @@ impl<T: Actions> Consensus<T> {
         let locked: Certificate<Vote> = prepare.inner.certificate;
         self.keys.iter().for_each(|(signer, pk)| {
             let vote = locked.inner.to_bytes();
-            let signature = pk.sign(Domain::Vote2, &vote);
+            let signature = C::sign(pk, Domain::Vote2, &vote);
             self.send_leader(
                 Message::Vote2(Signed {
                     inner: locked.clone(),
@@ -439,7 +442,7 @@ impl<T: Actions> Consensus<T> {
         };
 
         if let Some(votes) = votes {
-            let signature = AggregateSignature::aggregate(votes.signatures())
+            let signature = C::aggregate(votes.signatures())
                 .expect("failed to aggregate signatures");
             let cert = Prepare {
                 certificate: Certificate {
@@ -448,7 +451,7 @@ impl<T: Actions> Consensus<T> {
                     signers: votes.signers(),
                 },
             };
-            let signature = pk.sign(Domain::Prepare, &cert.to_bytes());
+            let signature = C::sign(pk, Domain::Prepare, &cert.to_bytes());
             self.send_all(Message::Prepare(Signed {
                 inner: cert,
                 signer: signer,
@@ -501,7 +504,7 @@ impl<T: Actions> Consensus<T> {
         if let Some(votes) = votes {
             let cert = Certificate {
                 inner: votes.message().inner.clone(),
-                signature: AggregateSignature::aggregate(votes.signatures())
+                signature: C::aggregate(votes.signatures())
                     .expect("failed to aggregate signatures"),
                 signers: votes.signers(),
             };
@@ -527,7 +530,7 @@ impl<T: Actions> Consensus<T> {
             "invalid signer index {:?}",
             signer
         );
-        signature.verify(domain, &signed.to_bytes(), &self.participants[signer])
+        C::verify(domain, &self.participants[signer], signature, &signed.to_bytes())
     }
 
     #[tracing::instrument(skip(self, signed, signature, signers))]
@@ -536,15 +539,11 @@ impl<T: Actions> Consensus<T> {
             signers.iter().filter(|b| *b).count() == self.participants.honest_majority(),
             "must be signed by honest majority"
         );
-        signature.verify(
-            domain,
-            &signed.to_bytes(),
-            self.participants.decode(&signers),
-        )
+        C::verify_aggregated(domain, self.participants.decode(&signers),signature, &signed.to_bytes())
     }
 }
 
-impl<T: Actions> OnDelay for Consensus<T> {
+impl<T: Actions, C: crypto::Backend> OnDelay for Consensus<T, C> {
     fn on_delay(&self) {
         let rst = {
             let mut state = self.state.lock();
@@ -610,7 +609,7 @@ impl<T: Actions> OnDelay for Consensus<T> {
             (Some(proposal), None) => self.send_proposal(proposal),
             (None, Some(wish)) => {
                 for (signer, pk) in self.keys.iter() {
-                    let signature = pk.sign(Domain::Wish, &wish.to_bytes());
+                    let signature = C::sign(pk, Domain::Wish, &wish.to_bytes());
                     self.send_leader(
                         Message::Wish(Signed {
                             inner: wish.clone(),
@@ -626,7 +625,7 @@ impl<T: Actions> OnDelay for Consensus<T> {
     }
 }
 
-impl<T: Actions> OnMessage for Consensus<T> {
+impl<T: Actions, C: crypto::Backend> OnMessage for Consensus<T, C> {
     fn on_message(&self, message: Message) -> Result<()> {
         match message {
             Message::Sync(sync) => self.on_sync(sync),
@@ -640,7 +639,7 @@ impl<T: Actions> OnMessage for Consensus<T> {
     }
 }
 
-impl<T: Actions> Proposer for Consensus<T> {
+impl<T: Actions, C: crypto::Backend> Proposer for Consensus<T, C> {
     #[tracing::instrument(
         skip(self), 
         fields(id = %id),
