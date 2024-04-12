@@ -6,7 +6,6 @@ use std::{
     fmt::Debug,
 };
 
-use arbitrary::Arbitrary;
 use bit_vec::BitVec;
 use itertools::Itertools;
 
@@ -208,31 +207,6 @@ impl Debug for Op {
                 Ok(())
             }
             Op::Advance(n) => write!(f, "advance {}", n),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ArbitraryOp<const TOTAL: usize, const TWINS: usize>(Op);
-
-impl<const TOTAL: usize, const TWINS: usize> Into<Op> for ArbitraryOp<TOTAL, TWINS> {
-    fn into(self) -> Op {
-        self.0
-    }
-}
-
-impl<'a, const TOTAL: usize, const TWINS: usize> Arbitrary<'a> for ArbitraryOp<TOTAL, TWINS> {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        if u.ratio(1, 4)? {
-            let mut nodes = Model::nodes(TOTAL, TWINS);
-            for i in (1..nodes.len()).rev() {
-                let j = u.int_in_range(0..=i)?;
-                nodes.swap(i, j);
-            }
-            let (left, right) = nodes.split_at(u.int_in_range(1..=nodes.len() - 2)?);
-            Ok(ArbitraryOp(Op::Routes(vec![left.to_vec(), right.to_vec()])))
-        } else {
-            Ok(ArbitraryOp(Op::Advance(u.int_in_range(1..=4)?)))
         }
     }
 }
