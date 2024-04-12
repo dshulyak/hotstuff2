@@ -12,7 +12,7 @@ use itertools::Itertools;
 
 use crate::{
     crypto,
-    sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer},
+    sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer, TIMEOUT},
     types::{
         AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg,
         Vote, ID,
@@ -219,7 +219,7 @@ impl<'a, const TOTAL: usize, const TWINS: usize> Arbitrary<'a> for ArbitraryOp<T
                 let j = u.int_in_range(0..=i)?;
                 nodes.swap(i, j);
             }
-            let (left, right) = nodes.split_at(u.int_in_range(1..=nodes.len()-2)?);
+            let (left, right) = nodes.split_at(u.int_in_range(1..=nodes.len() - 2)?);
             Ok(ArbitraryOp(Op::Routes(vec![left.to_vec(), right.to_vec()])))
         } else {
             Ok(ArbitraryOp(Op::Advance(u.int_in_range(1..=4)?)))
@@ -233,7 +233,7 @@ pub struct Model {
     commits: HashMap<Node, BTreeMap<u64, Certificate<Vote>>>,
     locks: HashMap<Node, Certificate<Vote>>,
     proposals_counter: HashMap<Node, u64>,
-    routes: Option<HashMap<Node, HashSet<Node>>>,
+    routes: HashMap<Node, HashSet<Node>>,
     inboxes: HashMap<Node, Vec<Message>>,
     consecutive_advance: usize,
 }
@@ -284,19 +284,22 @@ impl Model {
             .flat_map(|(n, c)| c.public_keys().into_iter().map(|(_, public)| (public, *n)))
             .collect::<HashMap<_, _>>();
         let inboxes = nodes.keys().map(|n| (*n, vec![])).collect();
-        Self {
+        let mut model = Self {
             consensus: nodes,
             public_key_to_node: by_public,
             commits: HashMap::new(),
             locks: HashMap::new(),
             proposals_counter: HashMap::new(),
             inboxes: inboxes,
-            routes: None,
+            routes: HashMap::new(),
             consecutive_advance: 0,
-        }
+        };
+        model.step(Op::Advance(TIMEOUT as usize)).unwrap();
+        model
     }
 
     pub fn step(&mut self, op: Op) -> anyhow::Result<()> {
+        tracing::trace!("step: {:?}", op);
         match op {
             Op::Routes(partition) => {
                 self.paritition(partition);
@@ -350,10 +353,6 @@ impl Model {
     }
 
     fn advance(&mut self) {
-        if self.routes.is_none() {
-            return;
-        }
-        let routes = self.routes.as_ref().unwrap();
         let mut queue = self.consensus.keys().collect::<Vec<_>>();
         while let Some(id) = queue.pop() {
             let consensus = self.consensus.get(id).unwrap();
@@ -387,7 +386,8 @@ impl Model {
                     Action::Send(msg, target) => {
                         if let Some(target) = target {
                             let route = self.public_key_to_node.get(&target).unwrap();
-                            if routes
+                            if self
+                                .routes
                                 .get(id)
                                 .and_then(|linked| linked.get(route))
                                 .is_some()
@@ -403,7 +403,7 @@ impl Model {
                                 self.inboxes.get_mut(route).unwrap().push(msg.clone());
                             }
                         } else {
-                            if let Some(links) = routes.get(id) {
+                            if let Some(links) = self.routes.get(id) {
                                 for linked in links {
                                     tracing::trace!(
                                         "{}: unrouted {:?} => {:?}: {:?}",
@@ -489,18 +489,15 @@ impl Model {
 
     fn paritition(&mut self, partition: Vec<Vec<Node>>) {
         tracing::debug!("updating to partition {:?}", partition);
-        match self.routes.take() {
-            None => {}
-            Some(_) => {
-                for side in partition.iter() {
-                    for pair in side.iter().permutations(2) {
-                        self.sync_from(&pair[0], &pair[1]);
-                    }
-                }
+
+        for side in partition.iter() {
+            for pair in side.iter().permutations(2) {
+                self.sync_from(&pair[0], &pair[1]);
             }
         }
-        self.routes = Op::Routes(partition).to_routes();
-        tracing::debug!("routes {:?}", self.routes.as_ref().unwrap())
+
+        self.routes = Op::Routes(partition).to_routes().unwrap();
+        tracing::debug!("routes {:?}", self.routes)
     }
 }
 
@@ -526,7 +523,7 @@ mod tests {
         let scenario = Scenario::parse(
             r#"
             {0, 1, 2, 3}
-            advance 16
+            advance 9
         "#,
         )
         .unwrap();
@@ -553,7 +550,7 @@ mod tests {
         let scenario = Scenario::parse(
             r#"
             {0, 1, 2} | {3}
-            advance 16
+            advance 9
         "#,
         )
         .unwrap();
@@ -572,7 +569,7 @@ mod tests {
         let scenario = Scenario::parse(
             r#"
             {0, 1, 2} | {3}
-            advance 16
+            advance 9
             {0, 1, 2, 3}
             advance 1
         "#,
@@ -601,7 +598,7 @@ mod tests {
         let scenario = Scenario::parse(
             r#"
             {0, 1, 2, 3/0} | {3/1}
-            advance 16
+            advance 9
         "#,
         )
         .unwrap();
@@ -628,7 +625,7 @@ mod tests {
         let scenario = Scenario::parse(
             r#"
             {0, 1, 2, 3/0, 3/1}
-            advance 16
+            advance 9
         "#,
         )
         .unwrap();
@@ -720,7 +717,8 @@ advance 1
 {2, 3/0} | {0, 1, 3/1}
 advance 2
 advance 3
-"#);
+"#,
+        );
         let mut model = Model::new(4, 1);
         for op in scenario.unwrap() {
             model.step(op).unwrap();
@@ -735,7 +733,7 @@ advance 3
             ..Config::default()
         });
         let total = 4;
-        let twins = 1;
+        let twins = 1; // changing this to 2 immediately observes equivocation
         let nodes = Model::nodes(total, twins);
 
         runner

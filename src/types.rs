@@ -200,10 +200,16 @@ impl ToBytes for Wish {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct View(pub u64);
 
 impl Display for View {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Debug for View {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -375,7 +381,7 @@ impl Ord for PublicKey {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AggregateSignature([u8; SIGNATURE_SIZE]);
 
 impl AggregateSignature {
@@ -427,6 +433,12 @@ impl AggregateSignature {
 impl PartialEq for AggregateSignature {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
+    }
+}
+
+impl Debug for AggregateSignature {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", hex::encode(&self.0))
     }
 }
 
@@ -484,7 +496,7 @@ impl PrivateKey {
 pub const PUBLIC_KEY_SIZE: usize = 48;
 pub const SIGNATURE_SIZE: usize = 96;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Signature([u8; SIGNATURE_SIZE]);
 
 impl Into<AggregateSignature> for Signature {
@@ -541,6 +553,12 @@ impl Signature {
 
     pub fn from_bytes(bytes: &[u8; SIGNATURE_SIZE]) -> Result<Self> {
         Ok(Signature(*bytes))
+    }
+}
+
+impl Debug for Signature {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", hex::encode(&self.0))
     }
 }
 
