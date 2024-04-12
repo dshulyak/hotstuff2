@@ -152,8 +152,23 @@ impl IntoIterator for Scenario {
 
 impl Debug for Scenario {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut consecutive_advance = 0;
         for op in self.0.iter() {
-            writeln!(f, "{:?}", op)?;
+            match op {
+                Op::Routes(_) => {
+                    if consecutive_advance > 0 {
+                        writeln!(f, "advance {}", consecutive_advance)?;
+                        consecutive_advance = 0;
+                    }
+                    writeln!(f, "{:?}", op)?;
+                }
+                Op::Advance(n) => {
+                    consecutive_advance += n;
+                }
+            }
+        }
+        if consecutive_advance > 0 {
+            writeln!(f, "advance {}", consecutive_advance)?;
         }
         Ok(())
     }
@@ -381,13 +396,16 @@ impl Model {
                     Action::Send(msg, target) => {
                         if let Some(target) = target {
                             if let Some(route) = self.public_key_to_node.get(&target) {
-                                let targets = route.iter().filter(|target| {
-                                    self.routes
-                                        .get(id)
-                                        .and_then(|linked| linked.get(target))
-                                        .is_some()
-                                        || *target == id
-                                }).collect::<Vec<_>>();
+                                let targets = route
+                                    .iter()
+                                    .filter(|target| {
+                                        self.routes
+                                            .get(id)
+                                            .and_then(|linked| linked.get(target))
+                                            .is_some()
+                                            || *target == id
+                                    })
+                                    .collect::<Vec<_>>();
                                 if targets.len() == 0 {
                                     tracing::warn!(
                                         "{}: blocked from {:?} {:?}",
@@ -539,7 +557,6 @@ mod tests {
     use proptest::collection::vec;
     use proptest::prelude::*;
     use proptest::sample::subsequence;
-    use proptest::test_runner::{Config, TestRunner};
 
     fn init_tracing() {
         let rst = tracing_subscriber::fmt()
@@ -759,37 +776,109 @@ advance 3
     }
 
     #[test]
-    fn test_random_partitions() {
+    fn test_broken_liveness() {
         init_tracing();
-        let mut runner = TestRunner::new(Config {
-            cases: 1000,
-            ..Config::default()
-        });
-        let total = 4;
-        let twins = 1; // changing this to 2 finds equivocation
-        let nodes = Model::nodes(total, twins);
+        let scenario = Scenario::parse(
+            r#"
+{0, 1, 2, 3/0} | {3/1}
+{0, 1, 3/0, 3/1} | {2}
+{1, 2, 3/0, 3/1} | {0}
+{0, 1, 3/0, 3/1} | {2}
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 2, 3/0} | {3/1}
+advance 7
+{1, 2, 3/0, 3/1} | {0}
+advance 2
+{0, 1, 3/0, 3/1} | {2}
+advance 10
+{0, 1, 2, 3/0} | {3/1}
+{1, 2, 3/0, 3/1} | {0}
+{0, 1, 3/0, 3/1} | {2}
+advance 8
+{0, 2, 3/0, 3/1} | {1}
+{1, 2, 3/0, 3/1} | {0}
+advance 4
+{0, 2, 3/0, 3/1} | {1}
+{0, 1, 2, 3/0} | {3/1}
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 3/0, 3/1} | {2}
+advance 1
+{0, 1, 2, 3/0} | {3/1}
+{0, 1, 2, 3/0} | {3/1}
+{1, 2, 3/0, 3/1} | {0}
+{0, 1, 3/0, 3/1} | {2}
+{1, 2, 3/0, 3/1} | {0}
+{0, 1, 2, 3/0} | {3/1}
+{0, 1, 3/0, 3/1} | {2}
+{0, 1, 3/0, 3/1} | {2}
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 3/0, 3/1} | {2}
+{0, 1, 2, 3/0} | {3/1}
+{0, 1, 2, 3/0} | {3/1}
+advance 2
+{0, 1, 2, 3/0} | {3/1}
+{0, 2, 3/0, 3/1} | {1}
+advance 8
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 3/0, 3/1} | {2}
+{0, 1, 3/0, 3/1} | {2}
+{0, 2, 3/0, 3/1} | {1}
+{0, 2, 3/0, 3/1} | {1}
+{0, 1, 2, 3/0} | {3/1}
+{0, 1, 3/0, 3/1} | {2}
+{0, 1, 2, 3/0} | {3/1}
+{1, 2, 3/0, 3/1} | {0}
+{1, 2, 3/0, 3/1} | {0}
+advance 1
+{0, 1, 2, 3/1} | {3/0}
+advance 3
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 2, 3/1} | {3/0}
+{0, 2, 3/0} | {1, 3/1}
+{0, 1, 3/0, 3/1} | {2}
+advance 14
+{1, 2, 3/0, 3/1} | {0}
+{1, 2, 3/0, 3/1} | {0}
+advance 16
+{0, 1, 2, 3/0} | {3/1}
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 3/0, 3/1} | {2}
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 3/0, 3/1} | {2}
+{0, 1, 2, 3/0} | {3/1}
+{0, 1, 3/0, 3/1} | {2}
+{0, 1, 2, 3/0} | {3/1}
+{0, 1, 2, 3/1} | {3/0}
+{0, 1, 2, 3/0} | {3/1}
+"#,
+        );
+        let mut model = Model::new(4, 1);
+        for op in scenario.unwrap() {
+            if let Err(err) = model.step(op) {
+                assert!(false, "error: {:?}", err);
+            }
+        }
+    }
 
-        runner
-            .run(
-                &vec(
-                    prop_oneof![
-                        1 => two_sided_partition(nodes),
-                        4 => (1..4usize).prop_map(Op::Advance),
-                    ],
-                    100,
-                ),
-                |ops| {
-                    let scenario = Scenario(ops.clone());
-                    tracing::info!("SCENARIO:\n{:?}", scenario);
-                    let mut model = Model::new(total, twins);
-                    for op in ops {
-                        model
-                            .step(op)
-                            .map_err(|err| TestCaseError::fail(format!("{}", err.to_string())))?;
-                    }
-                    Ok(())
-                },
-            )
-            .unwrap();
+    proptest! {
+        // The next line modifies the number of tests.
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+        #[test]
+        fn test_random_partitions(ops in &vec(
+            prop_oneof![
+                1 => two_sided_partition(Model::nodes(4, 1)),
+                4 => (1..4usize).prop_map(Op::Advance),
+            ],
+            100,
+        ).prop_map(|ops| Scenario(ops))) {
+            let mut model = Model::new(4, 1);
+            for op in ops {
+                if let Err(err) = model.step(op) {
+                    assert!(false, "error: {:?}", err);
+                }
+            }
+        }
     }
 }
