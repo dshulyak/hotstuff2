@@ -213,16 +213,16 @@ impl<const TOTAL: usize, const TWINS: usize> Into<Op> for ArbitraryOp<TOTAL, TWI
 
 impl<'a, const TOTAL: usize, const TWINS: usize> Arbitrary<'a> for ArbitraryOp<TOTAL, TWINS> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        if u.ratio(1, 2)? {
-            // generate all nodes into single array
-            // split array into 1-3 random partitions
-            // only 1 twin can exist in the partition, so any 2nd twin is moved to the next one
-            // if partition doesn't exist creeate empty partition
-
-            let nodes = Model::nodes(TOTAL, TWINS);
-            Ok(ArbitraryOp(Op::Routes(vec![nodes])))
+        if u.ratio(1, 4)? {
+            let mut nodes = Model::nodes(TOTAL, TWINS);
+            for i in (1..nodes.len()).rev() {
+                let j = u.int_in_range(0..=i)?;
+                nodes.swap(i, j);
+            }
+            let (left, right) = nodes.split_at(u.int_in_range(1..=nodes.len()-2)?);
+            Ok(ArbitraryOp(Op::Routes(vec![left.to_vec(), right.to_vec()])))
         } else {
-            Ok(ArbitraryOp(Op::Advance(u.int_in_range(1..=7)?)))
+            Ok(ArbitraryOp(Op::Advance(u.int_in_range(1..=4)?)))
         }
     }
 }
