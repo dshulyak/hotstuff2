@@ -125,7 +125,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
         }
     }
 
-    pub fn public_keys<'a>(&'a self) -> impl IntoIterator<Item = (Signer, PublicKey)> + 'a {
+    pub fn public_keys(&self) -> impl IntoIterator<Item = (Signer, PublicKey)> + '_ {
         self.keys.iter().map(|(signer, key)| (*signer, key.public()))
     }
 
@@ -135,10 +135,6 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
 
     pub fn current_view(&self) -> View {
         self.state.lock().view
-    }
-
-    pub fn local_keys(&self) -> impl IntoIterator<Item = PublicKey> + '_ {
-        self.keys.values().map(|key| key.public())
     }
 
     pub(crate) fn is_leader(&self, view: View) -> bool {
@@ -198,7 +194,9 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             }
         }
         if let Some(commit) = sync.commit {
-            if commit.inner.block.prev == state.commit.inner.block.id {
+            // the second condition is required to update to a higher certificate for the same block.
+            if commit.inner.block.prev == state.commit.inner.block.id || 
+                (commit.inner.block.id == state.commit.inner.block.id && commit.inner.view > state.commit.inner.view)  {
                 state.commit = commit;
                 let next = state.commit.inner.view + 1;
                 state.enter_view(next);

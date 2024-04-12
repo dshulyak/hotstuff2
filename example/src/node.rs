@@ -226,8 +226,9 @@ impl Node {
 
         let local_public_keys = self
             .consensus
-            .local_keys()
+            .public_keys()
             .into_iter()
+            .map(|(_, pk)| pk)
             .collect::<HashSet<_>>();
         s.spawn(protocol::process_actions(
             &ctx,

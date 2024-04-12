@@ -39,11 +39,12 @@ fn schema() -> &'static str {
     ) without rowid;
 
     create table if not exists history (
-        view integer primary key not null,
-        height integer not null,
+        height integer primary key not null,
+        view integer not null,
         block char(32) not null,
         certificate blob not null
     );
+    create unique index history_by_view on history(view asc);
     "#
 }
 
@@ -125,7 +126,11 @@ async fn update_state_change(pool: &SqlitePool, change: &StateChange) -> Result<
             .context("update locked")?;
     }
     if let Some(commit) = &change.commit {
-        sqlx::query("insert into history (view, height, block, certificate) values (?, ?, ?, ?)")
+        sqlx::query(
+            "
+insert into history (view, height, block, certificate) values (?1, ?2, ?3, ?4)
+on conflict(height) do update set view=?1, certificate=?4;            
+        ")
             .bind(commit.inner.view.0 as i64)
             .bind(commit.inner.height as i64)
             .bind(commit.inner.block.to_bytes())

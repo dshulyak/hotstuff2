@@ -360,26 +360,28 @@ impl Model {
             for action in consensus.sink().drain() {
                 match action {
                     Action::StateChange(change) => {
+                        if let Some(lock) = change.lock {
+                            tracing::debug!(
+                                "{}, locking block {:?} in view {} on node {:?}",
+                                self.consecutive_advance,
+                                lock.block,
+                                lock.inner.view,
+                                id
+                            );
+                            self.locks.insert(*id, lock);
+                        }
                         if let Some(cert) = change.commit {
                             tracing::debug!(
-                                "{}: committing block {:?} on node {:?}",
+                                "{}: committing block {:?} in view {} on node {:?}",
                                 self.consecutive_advance,
                                 cert.block,
+                                cert.inner.view,
                                 id
                             );
                             self.commits
                                 .entry(*id)
                                 .or_insert_with(BTreeMap::new)
                                 .insert(cert.block.height, cert);
-                        }
-                        if let Some(lock) = change.lock {
-                            tracing::debug!(
-                                "{}, locking block {:?} on node {:?}",
-                                self.consecutive_advance,
-                                lock.block,
-                                id
-                            );
-                            self.locks.insert(*id, lock);
                         }
                     }
                     Action::Send(msg, target) => {
@@ -459,7 +461,7 @@ impl Model {
             .into_iter();
         let first = commits.next().unwrap();
         for commit in commits {
-            anyhow::ensure!(first == commit, "inconsistent commits");
+            anyhow::ensure!(first.block == commit.block);
         }
         Ok(())
     }
@@ -469,12 +471,15 @@ impl Model {
             .commits
             .iter()
             .flat_map(|(_, certs)| certs.last_key_value());
-        let mut by_height = HashMap::new();
+        let mut by_height: HashMap<u64, Certificate<Vote>> = HashMap::new();
         for (height, cert) in certs {
             if let Some(by_height) = by_height.get(height) {
-                if by_height != cert {
-                    return Err(anyhow::anyhow!("inconsistent commits"));
-                }
+                anyhow::ensure!(
+                    by_height.block == cert.block,
+                    "inconsistent commits {:?} != {:?}",
+                    by_height,
+                    cert
+                );
             } else {
                 by_height.insert(*height, cert.clone());
             }
@@ -483,7 +488,7 @@ impl Model {
     }
 
     fn paritition(&mut self, partition: Vec<Vec<Node>>) {
-        tracing::debug!("uptading to partition {:?}", partition);
+        tracing::debug!("updating to partition {:?}", partition);
         match self.routes.take() {
             None => {}
             Some(_) => {
@@ -658,6 +663,71 @@ mod tests {
     }
 
     #[test]
+    fn test_commits_in_different_views() {
+        init_tracing();
+        let scenario = Scenario::parse(
+            r#"
+advance 2
+{0, 1, 2, 3/1} | {3/0}
+advance 2
+advance 2
+advance 1
+advance 3
+advance 3
+advance 1
+advance 1
+advance 2
+advance 3
+advance 2
+{2, 3/0} | {0, 1, 3/1}
+advance 1
+{3/0, 3/1} | {0, 1, 2}
+advance 1
+advance 2
+advance 3
+advance 3
+advance 1
+advance 2
+advance 1
+advance 1
+advance 2
+advance 2
+{1, 2, 3/0} | {0, 3/1}
+advance 3
+advance 3
+advance 2
+advance 3
+{0, 1, 2, 3/0} | {3/1}
+advance 2
+advance 3
+advance 2
+advance 2
+advance 3
+advance 1
+advance 1
+{0, 1, 3/0} | {2, 3/1}
+advance 2
+advance 1
+advance 3
+advance 3
+advance 2
+advance 2
+advance 3
+advance 1
+advance 2
+advance 1
+{0, 2, 3/0, 3/1} | {1}
+{2, 3/0} | {0, 1, 3/1}
+advance 2
+advance 3
+"#);
+        let mut model = Model::new(4, 1);
+        for op in scenario.unwrap() {
+            model.step(op).unwrap();
+        }
+    }
+
+    #[test]
     fn test_random_partitions() {
         init_tracing();
         let mut runner = TestRunner::new(Config {
@@ -678,12 +748,13 @@ mod tests {
                     50..100,
                 ),
                 |ops| {
-                    tracing::info!("SCENARIO:\n{:?}", Scenario(ops.clone()));
+                    let scenario = Scenario(ops.clone());
+                    tracing::info!("SCENARIO:\n{:?}", scenario);
                     let mut model = Model::new(total, twins);
                     for op in ops {
                         model
                             .step(op)
-                            .map_err(|err| TestCaseError::fail(err.to_string()))?;
+                            .map_err(|err| TestCaseError::fail(format!("{}", err.to_string())))?;
                     }
                     Ok(())
                 },

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use bit_vec::BitVec;
 use blst::min_pk as blst;
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, AddAssign, Deref, Rem};
 
@@ -30,7 +30,7 @@ impl ID {
     }
 
     pub fn short_id(&self) -> String {
-        hex::encode(&self.0)[..8].to_string()
+        hex::encode(&self.0)[..32].to_string()
     }
 
     pub fn empty() -> Self {
@@ -74,7 +74,7 @@ impl Ord for ID {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Block {
     pub height: u64,
     pub prev: ID,
@@ -89,7 +89,13 @@ impl Block {
 
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}/{}", self.height, self.prev.short_id(), self.id.short_id(),)
+        write!(f, "{} prev={} id={}", self.height, self.prev.short_id(), self.id.short_id(),)
+    }
+}
+
+impl Debug for Block {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} prev={} id={}", self.height, self.prev.short_id(), self.id.short_id(),)
     }
 }
 
