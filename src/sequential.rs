@@ -321,7 +321,8 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
 
             ensure!(
                 propose.inner.view == state.view,
-                "node must be in the same round as propose"
+                "node {} must be in the same round as propose {}",
+                state.view, propose.inner.view,
             );
             ensure!(
                 state.voted < propose.inner.view,
@@ -683,6 +684,9 @@ impl State {
     }
 
     fn enter_view(&mut self, view: View) {
+        if view <= self.view {
+            return;
+        }
         self.view = view;
         self.ticks = 0;
         self.timeouts.retain(|view, _| view >= &self.view);

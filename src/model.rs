@@ -19,6 +19,9 @@ use crate::{
     },
 };
 
+// LIVENESS_MAX_ROUNDS is a maximal number of rounds that are required to make a new block.
+const LIVENESS_MAX_ROUNDS: u8 = 2 * TIMEOUT + 2;
+
 fn genesis() -> Certificate<Vote> {
     Certificate {
         inner: Vote {
@@ -64,6 +67,13 @@ pub enum Node {
 }
 
 impl Node {
+    fn key(&self) -> u8 {
+        match self {
+            Node::Honest(id) => *id,
+            Node::Twin(id, _) => *id,
+        }
+    }
+
     fn num(&self) -> u8 {
         match self {
             Node::Honest(id) => *id,
@@ -228,14 +238,17 @@ impl<'a, const TOTAL: usize, const TWINS: usize> Arbitrary<'a> for ArbitraryOp<T
 }
 
 pub struct Model {
+    total: usize,
     consensus: HashMap<Node, Consensus<Sink, crypto::NoopBackend>>,
-    public_key_to_node: HashMap<PublicKey, Node>,
+    public_key_to_node: HashMap<PublicKey, Vec<Node>>,
     commits: HashMap<Node, BTreeMap<u64, Certificate<Vote>>>,
     locks: HashMap<Node, Certificate<Vote>>,
     proposals_counter: HashMap<Node, u64>,
+    installed_partition: Vec<Vec<Node>>,
     routes: HashMap<Node, HashSet<Node>>,
     inboxes: HashMap<Node, Vec<Message>>,
     consecutive_advance: usize,
+    tracking_progress: HashSet<Node>,
 }
 
 impl Model {
@@ -279,20 +292,26 @@ impl Model {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let by_public = nodes
+        let mut by_public = HashMap::new();
+        for (pun, node) in nodes
             .iter()
             .flat_map(|(n, c)| c.public_keys().into_iter().map(|(_, public)| (public, *n)))
-            .collect::<HashMap<_, _>>();
+        {
+            by_public.entry(pun).or_insert_with(Vec::new).push(node);
+        }
         let inboxes = nodes.keys().map(|n| (*n, vec![])).collect();
         let mut model = Self {
+            total: total,
             consensus: nodes,
             public_key_to_node: by_public,
             commits: HashMap::new(),
             locks: HashMap::new(),
             proposals_counter: HashMap::new(),
             inboxes: inboxes,
+            installed_partition: vec![],
             routes: HashMap::new(),
             consecutive_advance: 0,
+            tracking_progress: HashSet::new(),
         };
         model.step(Op::Advance(TIMEOUT as usize)).unwrap();
         model
@@ -304,6 +323,7 @@ impl Model {
             Op::Routes(partition) => {
                 self.paritition(partition);
                 self.consecutive_advance = 0;
+                self.tracking_progress.clear();
             }
             Op::Advance(n) => {
                 for _ in 0..n {
@@ -381,26 +401,37 @@ impl Model {
                                 .entry(*id)
                                 .or_insert_with(BTreeMap::new)
                                 .insert(cert.block.height, cert);
+                            self.tracking_progress.insert(*id);
                         }
                     }
                     Action::Send(msg, target) => {
                         if let Some(target) = target {
-                            let route = self.public_key_to_node.get(&target).unwrap();
-                            if self
-                                .routes
-                                .get(id)
-                                .and_then(|linked| linked.get(route))
-                                .is_some()
-                                || route == id
-                            {
-                                tracing::trace!(
-                                    "{}: routed {:?} => {:?}: {:?}",
-                                    self.consecutive_advance,
-                                    id,
-                                    route,
-                                    msg,
-                                );
-                                self.inboxes.get_mut(route).unwrap().push(msg.clone());
+                            if let Some(route) = self.public_key_to_node.get(&target) {
+                                let targets = route.iter().filter(|target| {
+                                    self.routes
+                                        .get(id)
+                                        .and_then(|linked| linked.get(target))
+                                        .is_some()
+                                        || *target == id
+                                }).collect::<Vec<_>>();
+                                if targets.len() == 0 {
+                                    tracing::warn!(
+                                        "{}: blocked from {:?} {:?}",
+                                        self.consecutive_advance,
+                                        id,
+                                        msg,
+                                    );
+                                }
+                                for target in targets.into_iter() {
+                                    tracing::trace!(
+                                        "{}: routed {:?} => {:?}: {:?}",
+                                        self.consecutive_advance,
+                                        id,
+                                        target,
+                                        msg,
+                                    );
+                                    self.inboxes.get_mut(target).unwrap().push(msg.clone());
+                                }
                             }
                         } else {
                             if let Some(links) = self.routes.get(id) {
@@ -433,7 +464,7 @@ impl Model {
         for (target, inbox) in self.inboxes.iter_mut() {
             for msg in inbox.drain(..) {
                 if let Err(err) = self.consensus.get(target).unwrap().on_message(msg.clone()) {
-                    tracing::trace!(
+                    tracing::warn!(
                         "error processing message {:?} on node {:?}: {:?}",
                         msg,
                         target,
@@ -484,6 +515,27 @@ impl Model {
                 by_height.insert(*height, cert.clone());
             }
         }
+
+        if self.consecutive_advance >= LIVENESS_MAX_ROUNDS as usize {
+            for side in self.installed_partition.iter() {
+                let unique = side.iter().map(|n| n.key()).collect::<HashSet<_>>();
+                if unique.len() >= self.total * 2 / 3 + 1 {
+                    tracing::debug!(
+                        "checking liveness for side {:?} in {} advances {:?}",
+                        side,
+                        self.consecutive_advance,
+                        self.tracking_progress
+                    );
+                    for id in side {
+                        anyhow::ensure!(
+                            self.tracking_progress.get(id).is_some(),
+                            "liveness violation on node {:?}",
+                            id,
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -496,8 +548,13 @@ impl Model {
             }
         }
 
+        self.installed_partition = partition.clone();
         self.routes = Op::Routes(partition).to_routes().unwrap();
-        tracing::debug!("routes {:?}", self.routes)
+        tracing::debug!(
+            "routes {:?}. partition {:?}",
+            self.routes,
+            self.installed_partition
+        );
     }
 }
 
@@ -721,7 +778,9 @@ advance 3
         );
         let mut model = Model::new(4, 1);
         for op in scenario.unwrap() {
-            model.step(op).unwrap();
+            if let Err(err) = model.step(op) {
+                assert!(false, "error: {:?}", err);
+            }
         }
     }
 
@@ -733,7 +792,7 @@ advance 3
             ..Config::default()
         });
         let total = 4;
-        let twins = 1; // changing this to 2 immediately observes equivocation
+        let twins = 1; // changing this to 2 finds equivocation
         let nodes = Model::nodes(total, twins);
 
         runner
@@ -743,7 +802,7 @@ advance 3
                         1 => two_sided_partition(nodes),
                         4 => (1..4usize).prop_map(Op::Advance),
                     ],
-                    50..100,
+                    100,
                 ),
                 |ops| {
                     let scenario = Scenario(ops.clone());
