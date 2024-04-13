@@ -501,7 +501,7 @@ mod tests {
         let history = History::new(inmemory().await.unwrap());
         let change = StateChange {
             voted: None,
-            lock: Some(genesis_test()),
+            locked: Some(genesis_test()),
             commit: Some(genesis_test()),
             timeout: None,
         };
@@ -533,7 +533,7 @@ mod tests {
         let history = History::new(inmemory().await.unwrap());
         let change = StateChange {
             voted: None,
-            lock: Some(genesis_test()),
+            locked: Some(genesis_test()),
             commit: Some(genesis_test()),
             timeout: None,
         };

@@ -188,7 +188,7 @@ impl AsyncEncode for Propose {
         self.view.encode(w).await?;
         self.block.encode(w).await?;
         self.locked.encode(w).await?;
-        self.double.encode(w).await?;
+        self.commit.encode(w).await?;
         Ok(())
     }
 }
@@ -199,12 +199,12 @@ impl AsyncDecode for Propose {
         let view = View::decode(r).await?;
         let block = Block::decode(r).await?;
         let locked = Certificate::<Vote>::decode(r).await?;
-        let double = Certificate::<Vote>::decode(r).await?;
+        let commit = Certificate::<Vote>::decode(r).await?;
         Ok(Propose {
             view,
             block,
             locked,
-            double,
+            commit,
         })
     }
 }

@@ -28,7 +28,7 @@ pub struct StateChange {
     // committed certificate can be executed.
     pub commit: Option<Certificate<Vote>>,
     // node should not vote below highest known locked certificate. persisted for safety.
-    pub lock: Option<Certificate<Vote>>,
+    pub locked: Option<Certificate<Vote>>,
     // latest timeout should be provided to joined participants in order to synchronize views. 
     pub timeout: Option<Certificate<View>>,
     // node should not vote more than once in the view. hence when this even is received it has to be persisted.
@@ -39,14 +39,14 @@ impl StateChange {
     fn new() -> Self {
         Self {
             commit: None,
-            lock: None,
+            locked: None,
             voted: None,
             timeout: None
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.commit.is_none() && self.lock.is_none() && self.voted.is_none() && self.timeout.is_none()
+        self.commit.is_none() && self.locked.is_none() && self.voted.is_none() && self.timeout.is_none()
     }
 }
 
@@ -136,10 +136,6 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
         &self.actions
     }
 
-    pub fn current_view(&self) -> View {
-        self.state.lock().view
-    }
-
     pub(crate) fn is_leader(&self, view: View) -> bool {
         let leader = self.participants.leader(view);
         self.keys.get(&leader).is_some()
@@ -193,11 +189,12 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
         if let Some(locked) = sync.locked {
             if locked.inner.view > state.locked.inner.view {
                 state.locked = locked;
-                change.lock = Some(state.locked.clone());
+                change.locked = Some(state.locked.clone());
             }
         }
         if let Some(commit) = sync.commit {
-            // the second condition is required to update to a higher certificate for the same block.
+            // see motivation in on_propose
+            // in on_sync we enforce a chain for commit messages
             if commit.inner.block.prev == state.commit.inner.block.id || 
                 (commit.inner.block.id == state.commit.inner.block.id && commit.inner.view > state.commit.inner.view)  {
                 state.commit = commit;
@@ -300,12 +297,12 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 &propose.inner.locked.signers,
             )?;
         }
-        if propose.inner.double.inner.view > View(0) {
+        if propose.inner.commit.inner.view > View(0) {
             self.verify_certificate(
                 Domain::Vote2, 
-                &propose.inner.double.inner, 
-                &propose.inner.double.signature, 
-                &propose.inner.double.signers,
+                &propose.inner.commit.inner, 
+                &propose.inner.commit.signature, 
+                &propose.inner.commit.signers,
             )?;
         }
         let mut change = StateChange::new();
@@ -313,22 +310,18 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             let mut state = self.state.lock();
             if propose.inner.locked.inner.view > state.locked.inner.view {
                 state.locked = propose.inner.locked.clone();
-                change.lock = Some(state.locked.clone());
+                change.locked = Some(state.locked.clone());
             }
-            ensure!(propose.inner.locked.inner.view == state.locked.inner.view);
+            ensure!(propose.inner.locked == state.locked);
 
-            if propose.inner.double.inner.view > state.commit.inner.view {
-                state.commit = propose.inner.double.clone();
+            if propose.inner.commit.inner.view > state.commit.inner.view {
+                state.commit = propose.inner.commit.clone();
                 change.commit = Some(state.commit.clone());
                 let next = state.commit.inner.view + 1;
                 if next > state.view {
                     state.enter_view(next);
                 }
             }
-            ensure!(
-                propose.inner.double.inner == state.commit.inner,
-                "propose must extend known highest doubly certified block"
-            );
 
             ensure!(
                 propose.inner.view == state.view,
@@ -339,9 +332,20 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 state.voted < propose.inner.view,
                 "should not vote more than once in the same view"
             );
+            // motivation for the second condition is to acquire commit certificate for every block.
+            // in the original protocol i can reach consensus for locked certificate 
+            // by forming a certificate on top of the locked certifate that doesn't have commit certificate
+            //
+            // consider the following chain of certificates, numbers are used for view and letters for block:
+            // LOCK(1, A) -> COMMIT(1, A) -> LOCK(2, B) -> LOCK(3, C) -> COMMIT(3, C)
+            // as a result whole chain will be committed
+            // 
+            // instead i require for form commit certificate for every block in history
+            // LOCK(1, A) -> COMMIT(1, A) -> LOCK(2, B) -> LOCK(3, B) -> COMMIT(3, B)
             ensure!(
-                propose.inner.block.prev == state.commit.inner.block.id,
-                "proposed block {}/{} must extend commited block {}",
+                propose.inner.block.prev == state.locked.inner.block.id || 
+                (propose.inner.block.id == state.locked.inner.block.id && propose.inner.view > state.locked.inner.view),
+                "proposed block id={} prev={} must extend locked block id={}",
                 propose.inner.block.id,
                 propose.inner.block.prev,
                 state.commit.inner.block.id,
@@ -388,7 +392,8 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             let mut state = self.state.lock();
             ensure!(
                 prepare.inner.certificate.inner.view == state.view,
-                "accepting prepare only for view {:?}",
+                "accepting prepare {:?} only for current view {:?}",
+                prepare.inner.certificate.inner.view,
                 state.view,
             );
             ensure!(
@@ -397,7 +402,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 prepare.inner.certificate.inner.view, state.locked.inner.view,
             );
             state.locked = prepare.inner.certificate.clone();
-            change.lock = Some(state.locked.clone());
+            change.locked = Some(state.locked.clone());
         }
         if !change.is_empty() {
             self.actions.send(Action::StateChange(change));
@@ -526,7 +531,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                     id: ID::default(),
                 },
                 locked: votes.message().clone(),
-                double: cert,
+                commit: cert,
             });
             self.actions.send(Action::Propose);
         }
@@ -593,7 +598,7 @@ impl<T: Actions, C: crypto::Backend> OnDelay for Consensus<T, C> {
                             view: state.view,
                             block: state.locked.inner.block.clone(),
                             locked: state.locked.clone(),
-                            double: state.commit.clone(),
+                            commit: state.commit.clone(),
                         }),
                         None,
                     )
@@ -606,7 +611,7 @@ impl<T: Actions, C: crypto::Backend> OnDelay for Consensus<T, C> {
                             id: ID::default(), // will be overwritten in propose method
                         },
                         locked: state.locked.clone(),
-                        double: state.commit.clone(),
+                        commit: state.commit.clone(),
                     });
                     self.actions.send(Action::Propose);
                     (None, None)

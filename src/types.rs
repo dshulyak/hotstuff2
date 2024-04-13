@@ -114,7 +114,7 @@ pub struct Propose {
     pub view: View,
     pub block: Block,
     pub locked: Certificate<Vote>,
-    pub double: Certificate<Vote>,
+    pub commit: Certificate<Vote>,
 }
 
 impl ToBytes for Propose {
@@ -123,7 +123,7 @@ impl ToBytes for Propose {
         bytes.extend_from_slice(&self.view.to_bytes());
         bytes.extend_from_slice(&self.block.to_bytes());
         bytes.extend_from_slice(&self.locked.to_bytes());
-        bytes.extend_from_slice(&self.double.to_bytes());
+        bytes.extend_from_slice(&self.commit.to_bytes());
         bytes
     }
 }

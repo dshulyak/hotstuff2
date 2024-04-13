@@ -125,7 +125,7 @@ async fn update_state_change(pool: &SqlitePool, change: &StateChange) -> Result<
             .await
             .context("update voted")?;
     }
-    if let Some(locked) = &change.lock {
+    if let Some(locked) = &change.locked {
         sqlx::query("update safety set locked = ? where tag = ?")
             .bind(locked.encode_to_bytes().await?)
             .bind(SAFETY_TAG)
@@ -198,7 +198,7 @@ impl State {
         if let Some(voted) = &change.voted {
             self.voted = voted.clone();
         }
-        if let Some(locked) = &change.lock {
+        if let Some(locked) = &change.locked {
             self.locked = Some(locked.clone());
         }
         if let Some(commit) = &change.commit {

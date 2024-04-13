@@ -205,7 +205,7 @@ impl Tester {
             view,
             block: Block::new(1, GENESIS.into(), ID::from_str(id)),
             locked: self.genesis(),
-            double: self.genesis(),
+            commit: self.genesis(),
         };
         let leader = self.leader(view);
         let signature = self.sign(Domain::Propose, leader, &propose);
@@ -230,7 +230,7 @@ impl Tester {
             view,
             block,
             locked,
-            double,
+            commit: double,
         };
         let leader = self.leader(view);
         let signature = self.sign(Domain::Propose, leader, &propose);
@@ -372,7 +372,7 @@ impl Instance {
         timeout: Option<Certificate<View>>,
     ) {
         self.action(seq::Action::StateChange(StateChange {
-            lock,
+            locked: lock,
             commit,
             voted,
             timeout,

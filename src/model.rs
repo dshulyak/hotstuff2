@@ -400,7 +400,7 @@ impl Model {
             for action in consensus.sink().drain() {
                 match action {
                     Action::StateChange(change) => {
-                        if let Some(lock) = change.lock {
+                        if let Some(lock) = change.locked {
                             tracing::debug!(
                                 "{}, locking block {:?} in view {} on node {:?}",
                                 self.consecutive_advance,
@@ -412,7 +412,7 @@ impl Model {
                         }
                         if let Some(cert) = change.commit {
                             tracing::debug!(
-                                "{}: committing block {:?} in view {} on node {:?}",
+                                "{}: commiting block {:?} in view {} on node {:?}",
                                 self.consecutive_advance,
                                 cert.block,
                                 cert.inner.view,
@@ -959,6 +959,29 @@ advance 28
         }
     }
 
+    #[test]
+    fn test_liveness_extend_committed_block() {
+        init_tracing();
+        let scenario = Scenario::parse(
+            r#"advance 1
+            {0, 1, 2, 3/0} | {3/1}
+            advance 1
+            {0, 1, 2, 3/1} | {3/0}
+            advance 16
+            {1, 3/1} | {0, 2, 3/0}
+            advance 12
+            {1, 2, 3/0, 3/1} | {0}
+            advance 1
+            {0, 1, 2, 3/1} | {3/0}
+            advance 28"#,
+        );
+        let mut model = Model::new(4, 1);
+        for op in scenario.unwrap() {
+            if let Err(err) = model.step(op) {
+                assert!(false, "error: {:?}", err);
+            }
+        }
+    }
     proptest! {
         // The next line modifies the number of tests.
         #![proptest_config(ProptestConfig::with_cases(1000))]
