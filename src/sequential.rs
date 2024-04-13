@@ -42,7 +42,7 @@ impl StateChange {
         }
     }
 
-    fn is_none(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.commit.is_none() && self.lock.is_none() && self.voted.is_none()
     }
 }
@@ -198,12 +198,12 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             if commit.inner.block.prev == state.commit.inner.block.id || 
                 (commit.inner.block.id == state.commit.inner.block.id && commit.inner.view > state.commit.inner.view)  {
                 state.commit = commit;
+                change.commit = Some(state.commit.clone());
                 let next = state.commit.inner.view + 1;
                 state.enter_view(next);
-                change.commit = Some(state.commit.clone());
             }
         }
-        if !change.is_none() {
+        if !change.is_empty() {
             self.actions.send(Action::StateChange(change));
         }
         Ok(())
@@ -339,7 +339,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             state.voted = propose.inner.view;
             change.voted = Some(state.voted);
         };
-        if !change.is_none() {
+        if !change.is_empty() {
             self.actions.send(Action::StateChange(change));
         }
         self.keys.iter().for_each(|(signer, pk)| {
@@ -388,7 +388,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             state.locked = prepare.inner.certificate.clone();
             change.lock = Some(state.locked.clone());
         }
-        if !change.is_none() {
+        if !change.is_empty() {
             self.actions.send(Action::StateChange(change));
         }
 
@@ -609,13 +609,13 @@ impl<T: Actions, C: crypto::Backend> OnDelay for Consensus<T, C> {
             (None, Some(wish)) => {
                 for (signer, pk) in self.keys.iter() {
                     let signature = C::sign(pk, Domain::Wish, &wish.to_bytes());
-                    self.send_leader(
+                    // TODO this should target f+1 nodes rather then everyone
+                    self.send_all(
                         Message::Wish(Signed {
                             inner: wish.clone(),
                             signer: *signer,
                             signature,
                         }),
-                        wish.view,
                     );
                 }
             }
@@ -684,7 +684,8 @@ impl State {
     }
 
     fn enter_view(&mut self, view: View) {
-        if view <= self.view {
+        tracing::debug!(view=%view, current=%self.view, "enter view");
+        if view < self.view {
             return;
         }
         self.view = view;

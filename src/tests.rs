@@ -552,7 +552,7 @@ fn test_tick_on_epoch_boundary() {
 
         inst.on_tick();
         inst.consume_actions();
-        inst.send_one(tester.wish(3.into(), inst.signer), 3);
+        inst.send_all(tester.wish(3.into(), inst.signer));
         inst.on_message(tester.timeout(3.into(), vec![0, 1, 2]));
         let locked_b = tester.certify_vote(2.into(), 2, "a", "b", vec![1, 2, 3]);
         let double_a = tester.certify_vote2(1.into(), 1, GENESIS, "a", vec![0, 1, 2]);
@@ -675,7 +675,7 @@ fn test_repetetive_messages() {
 fn test_multi_bootstrap() {
     gentest(4, |tester, instances: &mut Instances| {
         instances.on_tick();
-        instances.for_each(|i| i.send_one(tester.wish(1.into(), i.signer), 1));
+        instances.for_each(|i| i.send_all(tester.wish(1.into(), i.signer)));
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
         instances.send_one(tester.sync_genesis(), 1);
         (0..LEADER_TIMEOUT_DELAY).for_each(|_| instances.on_delay());

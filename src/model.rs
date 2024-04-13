@@ -19,7 +19,7 @@ use crate::{
 };
 
 // LIVENESS_MAX_ROUNDS is a maximal number of rounds that are required to make a new block.
-const LIVENESS_MAX_ROUNDS: u8 = 2 * TIMEOUT + 2;
+const LIVENESS_MAX_ROUNDS: u8 = 4 * TIMEOUT;
 
 fn genesis() -> Certificate<Vote> {
     Certificate {
@@ -331,9 +331,16 @@ impl Model {
     }
 
     fn sync_from(&mut self, from: &Node, to: &Node) {
-        tracing::debug!("syncing from {:?} to {:?}", from, to);
         let from_last_commit = self.last_commit(from);
         let to_last_commit = self.last_commit(to);
+
+        tracing::debug!(
+            "syncing from {:?} to {:?}. from cert {:?} to cert {:?}",
+            from,
+            to,
+            from_last_commit,
+            to_last_commit
+        );
         for height in to_last_commit
             .map(|cert| cert.block.height + 1)
             .unwrap_or(1)
@@ -354,9 +361,11 @@ impl Model {
                     locked: None,
                     commit: Some(cert.unwrap().clone()),
                 };
-                if let Err(err) = consensus.on_message(Message::Sync(sync)) {
-                    tracing::warn!("error syncing from {:?} to {:?}: {:?}", from, to, err);
-                };
+                tracing::debug_span!("sync", node = ?to).in_scope(|| {
+                    if let Err(err) = consensus.on_message(Message::Sync(sync)) {
+                        tracing::warn!("error syncing from {:?} to {:?}: {:?}", from, to, err);
+                    };
+                });
             };
         }
     }
@@ -454,19 +463,23 @@ impl Model {
             }
         }
         for (target, inbox) in self.inboxes.iter_mut() {
-            for msg in inbox.drain(..) {
-                if let Err(err) = self.consensus.get(target).unwrap().on_message(msg.clone()) {
-                    tracing::warn!(
-                        "error processing message {:?} on node {:?}: {:?}",
-                        msg,
-                        target,
-                        err
-                    );
+            tracing::debug_span!("inbox", node = ?target).in_scope(|| {
+                for msg in inbox.drain(..) {
+                    if let Err(err) = self.consensus.get(target).unwrap().on_message(msg.clone()) {
+                        tracing::warn!(
+                            "error processing message {:?} on node {:?}: {:?}",
+                            msg,
+                            target,
+                            err
+                        );
+                    }
                 }
-            }
+            })
         }
-        for (_, consensus) in self.consensus.iter() {
-            consensus.on_delay();
+        for (node, consensus) in self.consensus.iter() {
+            tracing::debug_span!("delay", node = ?node).in_scope(|| {
+                consensus.on_delay();
+            });
         }
     }
 
@@ -775,83 +788,75 @@ advance 3
         }
     }
 
+
+    // in this test leader for epoch boundary was blocked
+    // this lead to inability to enter view as nobody could form timeout certificate
     #[test]
-    fn test_broken_liveness() {
+    fn test_liveness_blocked_views() {
         init_tracing();
         let scenario = Scenario::parse(
             r#"
-{0, 1, 2, 3/0} | {3/1}
-{0, 1, 3/0, 3/1} | {2}
-{1, 2, 3/0, 3/1} | {0}
-{0, 1, 3/0, 3/1} | {2}
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 2, 3/0} | {3/1}
-advance 7
-{1, 2, 3/0, 3/1} | {0}
-advance 2
-{0, 1, 3/0, 3/1} | {2}
-advance 10
-{0, 1, 2, 3/0} | {3/1}
-{1, 2, 3/0, 3/1} | {0}
-{0, 1, 3/0, 3/1} | {2}
-advance 8
-{0, 2, 3/0, 3/1} | {1}
-{1, 2, 3/0, 3/1} | {0}
-advance 4
-{0, 2, 3/0, 3/1} | {1}
-{0, 1, 2, 3/0} | {3/1}
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 3/0, 3/1} | {2}
-advance 1
-{0, 1, 2, 3/0} | {3/1}
-{0, 1, 2, 3/0} | {3/1}
-{1, 2, 3/0, 3/1} | {0}
-{0, 1, 3/0, 3/1} | {2}
-{1, 2, 3/0, 3/1} | {0}
-{0, 1, 2, 3/0} | {3/1}
-{0, 1, 3/0, 3/1} | {2}
-{0, 1, 3/0, 3/1} | {2}
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 3/0, 3/1} | {2}
-{0, 1, 2, 3/0} | {3/1}
-{0, 1, 2, 3/0} | {3/1}
-advance 2
-{0, 1, 2, 3/0} | {3/1}
-{0, 2, 3/0, 3/1} | {1}
-advance 8
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 3/0, 3/1} | {2}
-{0, 1, 3/0, 3/1} | {2}
-{0, 2, 3/0, 3/1} | {1}
-{0, 2, 3/0, 3/1} | {1}
-{0, 1, 2, 3/0} | {3/1}
-{0, 1, 3/0, 3/1} | {2}
-{0, 1, 2, 3/0} | {3/1}
-{1, 2, 3/0, 3/1} | {0}
-{1, 2, 3/0, 3/1} | {0}
-advance 1
-{0, 1, 2, 3/1} | {3/0}
-advance 3
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 2, 3/1} | {3/0}
-{0, 2, 3/0} | {1, 3/1}
-{0, 1, 3/0, 3/1} | {2}
-advance 14
-{1, 2, 3/0, 3/1} | {0}
-{1, 2, 3/0, 3/1} | {0}
-advance 16
-{0, 1, 2, 3/0} | {3/1}
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 3/0, 3/1} | {2}
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 3/0, 3/1} | {2}
-{0, 1, 2, 3/0} | {3/1}
-{0, 1, 3/0, 3/1} | {2}
-{0, 1, 2, 3/0} | {3/1}
-{0, 1, 2, 3/1} | {3/0}
-{0, 1, 2, 3/0} | {3/1}
+            {0, 1, 2, 3/1} | {3/0}
+            {0, 1, 3/0, 3/1} | {2}
+            {0, 2, 3/0, 3/1} | {1}
+            {1, 2} | {0, 3/0, 3/1}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 1, 2, 3/1} | {3/0}
+            advance 2
+            {1, 3/0, 3/1} | {0, 2}
+            advance 1
+            {0, 1, 2, 3/1} | {3/0}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 2, 3/0, 3/1} | {1}
+            {0, 2, 3/0, 3/1} | {1}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 1, 2, 3/1} | {3/0}
+            {0, 2, 3/0, 3/1} | {1}
+            {1, 2, 3/0, 3/1} | {0}
+            {0, 1, 3/0, 3/1} | {2}
+            {0, 1, 3/0, 3/1} | {2}
+            {0, 1, 2, 3/1} | {3/0}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 1, 2, 3/1} | {3/0}
+            {0, 1, 3/0, 3/1} | {2}
+            {0, 1, 3/0, 3/1} | {2}
+            {0, 2, 3/0, 3/1} | {1}
+            {0, 1, 3/0, 3/1} | {2}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 1, 2, 3/1} | {3/0}
+            {0, 1, 3/0, 3/1} | {2}
+            {0, 1, 2, 3/1} | {3/0}
+            {1, 2, 3/0, 3/1} | {0}
+            {0, 1, 3/0, 3/1} | {2}
+            advance 1
+            {0, 1, 2, 3/1} | {3/0}
+            {0, 1, 3/0, 3/1} | {2}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 1, 3/0, 3/1} | {2}
+            {1, 2, 3/0, 3/1} | {0}
+            {0, 1, 2, 3/0} | {3/1}
+            {0, 1, 2, 3/1} | {3/0}
+            {0, 1, 2, 3/1} | {3/0}
+            {0, 1, 2, 3/0} | {3/1}
+            {1, 2, 3/0, 3/1} | {0}
+            {0, 1, 2, 3/0} | {3/1}
+            advance 2
+            {0, 1, 2, 3/0} | {3/1}
+            {1, 2, 3/0, 3/1} | {0}
+            advance 4
+            {0, 2, 3/0, 3/1} | {1}
+            {0, 1, 2, 3/0} | {3/1}
+            advance 4
+            {0, 1, 2, 3/0} | {3/1}
+            advance 3
+            {1, 3/0} | {0, 2, 3/1}
+            {0, 1, 3/1} | {2, 3/0}
+            advance 3
+            {0, 2, 3/0, 3/1} | {1}
+            advance 28
 "#,
         );
         let mut model = Model::new(4, 1);
