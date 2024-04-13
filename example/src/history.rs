@@ -35,7 +35,8 @@ fn schema() -> &'static str {
     create table if not exists safety (
         tag integer primary key not null,
         voted integer not null,
-        locked blob not null
+        locked blob not null,
+        timeout blob
     ) without rowid;
 
     create table if not exists history (
@@ -65,8 +66,8 @@ pub(crate) async fn insert_genesis(pool: &SqlitePool, genesis: &Certificate<Vote
     Ok(())
 }
 
-pub(crate) async fn get_voted_locked(pool: &SqlitePool) -> Result<(View, Certificate<Vote>)> {
-    let row = sqlx::query("select voted, locked from safety where tag = ?")
+pub(crate) async fn get_voted_locked_timeout(pool: &SqlitePool) -> Result<(View, Certificate<Vote>, Option<Certificate<View>>)> {
+    let row = sqlx::query("select voted, locked, timeout from safety where tag = ?")
         .bind(SAFETY_TAG)
         .fetch_one(pool)
         .await
@@ -75,7 +76,14 @@ pub(crate) async fn get_voted_locked(pool: &SqlitePool) -> Result<(View, Certifi
     let locked = Certificate::decode_from_bytes(row.get(1))
         .await
         .context("decode locked")?;
-    Ok((View(voted as u64), locked))
+    let buf: &[u8] = row.get(2);
+    if buf.is_empty() {
+        return Ok((View(voted as u64), locked, None));
+    }
+    let timeout = Certificate::decode_from_bytes(buf)
+        .await
+        .context("decode timeout")?;
+    Ok((View(voted as u64), locked, Some(timeout)))
 }
 
 pub(crate) async fn get_last_commit(pool: &SqlitePool) -> Result<Option<Certificate<Vote>>> {
@@ -125,6 +133,14 @@ async fn update_state_change(pool: &SqlitePool, change: &StateChange) -> Result<
             .await
             .context("update locked")?;
     }
+    if let Some(timeout) = &change.timeout {
+        sqlx::query("update safety set timeout = ? where tag = ?")
+            .bind(timeout.encode_to_bytes().await?)
+            .bind(SAFETY_TAG)
+            .execute(&mut *tx)
+            .await
+            .context("update timeout")?;
+    }
     if let Some(commit) = &change.commit {
         sqlx::query(
             "
@@ -145,6 +161,7 @@ on conflict(height) do update set view=?1, certificate=?4;
 
 struct State {
     voted: View,
+    timeout: Option<Certificate<View>>,
     locked: Option<Certificate<Vote>>,
     committed: Option<Certificate<Vote>>,
 }
@@ -162,6 +179,9 @@ impl State {
         }
         if let Some(committed) = &self.committed {
             last = last.max(committed.inner.view);
+        }
+        if let Some(timeout) = &self.timeout {
+            last = last.max(timeout.inner);
         }
         last
     }
@@ -200,12 +220,13 @@ impl History {
                 voted: View(0),
                 locked: None,
                 committed: None,
+                timeout: None,
             }),
         }
     }
 
     pub(crate) async fn from_db(db: SqlitePool) -> Result<Self> {
-        let (voted, locked) = get_voted_locked(&db).await?;
+        let (voted, locked, timeout) = get_voted_locked_timeout(&db).await?;
         let mut committed = get_last_commit(&db).await?;
         if committed.is_none() {
             committed = Some(locked.clone());
@@ -216,12 +237,17 @@ impl History {
                 voted,
                 locked: Some(locked),
                 committed,
+                timeout,
             }),
         })
     }
 
     pub(crate) fn voted(&self) -> View {
         self.state.lock().voted()
+    }
+
+    pub(crate) fn timeout(&self) -> Option<Certificate<View>> {
+        self.state.lock().timeout.clone()
     }
 
     pub(crate) fn last_view(&self) -> View {

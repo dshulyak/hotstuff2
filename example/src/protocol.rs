@@ -5,8 +5,7 @@ use std::time::Duration;
 use bit_vec::BitVec;
 use hotstuff2::sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer};
 use hotstuff2::types::{
-    AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg, View,
-    Vote, ID,
+    AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg, Timeout, View, Vote, ID
 };
 use rand::{thread_rng, Rng};
 use tokio::select;
@@ -74,13 +73,10 @@ pub(crate) async fn sync_initiate(
     }
     loop {
         match ctx.timeout_secs(10).select(stream.recv_msg()).await {
-            Ok(Ok(Message::Sync(state))) => {
-                if let Err(err) = consensus.on_message(Message::Sync(state)) {
+            Ok(Ok(msg)) => {
+                if let Err(err) = consensus.on_message(msg) {
                     tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process sync message");
                 }
-            }
-            Ok(Ok(_msg)) => {
-                anyhow::bail!("unexpected message type");
             }
             Ok(Err(err)) => {
                 // TODO i need to check that we are on the message boundary
@@ -137,7 +133,7 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: Ms
                 last = next;
             }
             None => {
-                tracing::debug!(last = %last, remote = %stream.remote(), "nothing to sync. exiting sync protocol");
+                tracing::debug!(last = %last, remote = %stream.remote(), "finished syncing certificates");
                 break;
             }
         }
@@ -153,6 +149,26 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: Ms
             }
             Err(err) => {
                 tracing::debug!(error = ?err, "failed to send sync message");
+                return;
+            }
+        };
+    }
+    if let Some(timeout) = history.timeout() {
+        let msg = Message::Timeout(Timeout{
+            certificate: timeout,
+        });
+        match ctx
+            .timeout_secs(10)
+            .select(stream.send_msg(&msg))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::debug!(error = ?err, "failed to encode timeout message");
+                return;
+            }
+            Err(err) => {
+                tracing::debug!(error = ?err, "failed to send timeout message");
                 return;
             }
         };
