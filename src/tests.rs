@@ -4,7 +4,9 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::sequential::{self as seq, Actions, OnDelay, OnMessage, Proposer, StateChange, LEADER_TIMEOUT_DELAY};
+use crate::sequential::{
+    self as seq, Actions, OnDelay, OnMessage, Proposer, StateChange, LEADER_TIMEOUT_DELAY,
+};
 use crate::types::*;
 
 use bit_vec::BitVec;
@@ -137,6 +139,10 @@ impl Tester {
             signature: aggregated,
             signers: bitvec,
         }
+    }
+
+    fn certify_view(&self, view: View, signers: Vec<Signer>) -> Certificate<View> {
+        self.certify(Domain::Wish, signers, &view)
     }
 
     fn certify_vote(
@@ -310,6 +316,7 @@ impl Instance {
         self.on_message(tester.timeout(view, vec![0, 1, 2]));
         self.send_one(tester.sync_genesis(), 1);
         self.on_message(tester.propose_first(view, id));
+        self.timeout(tester.certify_view(view, vec![0, 1, 2]));
         self.voted(view);
         self.send_one(tester.vote(view, 1, GENESIS, id, self.signer), 1);
         self.on_message(tester.prepare(view, 1, GENESIS, id, vec![0, 1, 2]));
@@ -362,24 +369,30 @@ impl Instance {
         lock: Option<Certificate<Vote>>,
         commit: Option<Certificate<Vote>>,
         voted: Option<View>,
+        timeout: Option<Certificate<View>>,
     ) {
         self.action(seq::Action::StateChange(StateChange {
             lock,
             commit,
             voted,
+            timeout,
         }));
     }
 
     fn lock(&mut self, lock: Certificate<Vote>) {
-        self.state_change(Some(lock), None, None)
+        self.state_change(Some(lock), None, None, None)
     }
 
     fn commit(&mut self, commit: Certificate<Vote>) {
-        self.state_change(None, Some(commit), None)
+        self.state_change(None, Some(commit), None, None)
     }
 
     fn voted(&mut self, view: View) {
-        self.state_change(None, None, Some(view))
+        self.state_change(None, None, Some(view), None)
+    }
+
+    fn timeout(&mut self, cert: Certificate<View>) {
+        self.state_change(None, None, None, Some(cert))
     }
 
     fn propose(&mut self) {
@@ -454,6 +467,12 @@ impl Instances {
         self.0.iter_mut().for_each(|instance| instance.voted(view));
     }
 
+    fn timeout(&mut self, cert: Certificate<View>) {
+        self.0
+            .iter_mut()
+            .for_each(|instance| instance.timeout(cert.clone()));
+    }
+
     fn send_all(&mut self, message: Message) {
         self.0
             .iter_mut()
@@ -522,6 +541,7 @@ fn test_commit_one() {
             None,
             Some(tester.certify_vote2(1.into(), 1, GENESIS, "a", vec![0, 1, 2])),
             Some(2.into()),
+            None,
         );
         inst.send_one(tester.vote(2.into(), 2, "a", "b", inst.signer), 2);
     });
@@ -544,6 +564,7 @@ fn test_tick_on_epoch_boundary() {
             None,
             Some(tester.certify_vote2(1.into(), 1, GENESIS, "a", vec![0, 1, 2])),
             Some(View(2)),
+            None,
         );
         inst.drain_actions();
         inst.on_message(tester.prepare(2.into(), 2, "a", "b", vec![1, 2, 3]));
@@ -561,6 +582,7 @@ fn test_tick_on_epoch_boundary() {
             3,
         );
         (0..LEADER_TIMEOUT_DELAY).for_each(|_| inst.on_delay());
+        inst.timeout(tester.certify_view(3.into(), vec![0, 1, 2]));
         inst.send_all(tester.propose(3.into(), 2, "a", "b", locked_b.clone(), double_a.clone()));
         inst.on_message(tester.propose(3.into(), 2, "a", "b", locked_b.clone(), double_a.clone()));
         inst.voted(3.into());
@@ -679,6 +701,7 @@ fn test_multi_bootstrap() {
         instances.on_message(tester.timeout(1.into(), vec![0, 1, 3]));
         instances.send_one(tester.sync_genesis(), 1);
         (0..LEADER_TIMEOUT_DELAY).for_each(|_| instances.on_delay());
+        instances.timeout(tester.certify_view(1.into(), vec![0, 1, 3]));
         instances.leader(1.into()).propose();
 
         instances.no_actions();

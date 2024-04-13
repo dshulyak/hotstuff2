@@ -14,7 +14,7 @@ use crate::{
     sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer, TIMEOUT},
     types::{
         AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg,
-        Vote, ID,
+        Timeout, View, Vote, ID,
     },
 };
 
@@ -232,6 +232,7 @@ pub struct Model {
     public_key_to_node: HashMap<PublicKey, Vec<Node>>,
     commits: HashMap<Node, BTreeMap<u64, Certificate<Vote>>>,
     locks: HashMap<Node, Certificate<Vote>>,
+    timeouts: HashMap<Node, Certificate<View>>,
     proposals_counter: HashMap<Node, u64>,
     installed_partition: Vec<Vec<Node>>,
     routes: HashMap<Node, HashSet<Node>>,
@@ -295,6 +296,7 @@ impl Model {
             public_key_to_node: by_public,
             commits: HashMap::new(),
             locks: HashMap::new(),
+            timeouts: HashMap::new(),
             proposals_counter: HashMap::new(),
             inboxes: inboxes,
             installed_partition: vec![],
@@ -318,6 +320,9 @@ impl Model {
                 for _ in 0..n {
                     self.consecutive_advance += 1;
                     self.advance();
+                    if self.consecutive_advance == 1 {
+                        self.sync();
+                    }
                 }
             }
         }
@@ -335,11 +340,11 @@ impl Model {
         let to_last_commit = self.last_commit(to);
 
         tracing::debug!(
-            "syncing from {:?} to {:?}. from cert {:?} to cert {:?}",
+            "syncing from {:?} to {:?}. certs from={:?} to ={:?}",
             from,
             to,
             from_last_commit,
-            to_last_commit
+            to_last_commit,
         );
         for height in to_last_commit
             .map(|cert| cert.block.height + 1)
@@ -367,6 +372,24 @@ impl Model {
                     };
                 });
             };
+        }
+        self.sync_timeouts(from, to)
+    }
+
+    fn sync_timeouts(&mut self, from: &Node, to: &Node) {
+        let from_timeout = self.timeouts.get(from).map_or(0.into(), |cert| cert.inner);
+        let to_timeout = self.timeouts.get(to).map_or(0.into(), |cert| cert.inner);
+        if from_timeout > to_timeout {
+            if let Some(consensus) = self.consensus.get(to) {
+                let timeout = self.timeouts.get(from).unwrap().clone();
+                tracing::debug_span!("sync timeout", node = ?to).in_scope(|| {
+                    if let Err(err) = consensus.on_message(Message::Timeout(Timeout {
+                        certificate: timeout,
+                    })) {
+                        tracing::warn!("error on timeout from {:?} to {:?}: {:?}", from, to, err);
+                    };
+                });
+            }
         }
     }
 
@@ -400,6 +423,15 @@ impl Model {
                                 .or_insert_with(BTreeMap::new)
                                 .insert(cert.block.height, cert);
                             self.tracking_progress.insert(*id);
+                        }
+                        if let Some(timeout) = change.timeout {
+                            tracing::debug!(
+                                "{}: timeout for view {} on node {:?}",
+                                self.consecutive_advance,
+                                timeout.inner,
+                                id
+                            );
+                            self.timeouts.insert(*id, timeout);
                         }
                     }
                     Action::Send(msg, target) => {
@@ -524,7 +556,7 @@ impl Model {
         if self.consecutive_advance >= LIVENESS_MAX_ROUNDS as usize {
             for side in self.installed_partition.iter() {
                 let unique = side.iter().map(|n| n.key()).collect::<HashSet<_>>();
-                if unique.len() >= self.total * 2 / 3 + 1 {
+                if unique.len() == self.total {
                     tracing::debug!(
                         "checking liveness for side {:?} in {} advances {:?}",
                         side,
@@ -546,13 +578,6 @@ impl Model {
 
     fn paritition(&mut self, partition: Vec<Vec<Node>>) {
         tracing::debug!("updating to partition {:?}", partition);
-
-        for side in partition.iter() {
-            for pair in side.iter().permutations(2) {
-                self.sync_from(&pair[0], &pair[1]);
-            }
-        }
-
         self.installed_partition = partition.clone();
         self.routes = Op::Routes(partition).to_routes().unwrap();
         tracing::debug!(
@@ -560,6 +585,15 @@ impl Model {
             self.routes,
             self.installed_partition
         );
+        self.sync();
+    }
+
+    fn sync(&mut self) {
+        for side in self.installed_partition.clone().iter() {
+            for pair in side.iter().permutations(2) {
+                self.sync_from(&pair[0], &pair[1]);
+            }
+        }
     }
 }
 
@@ -788,10 +822,9 @@ advance 3
         }
     }
 
-
+    #[test]
     // in this test leader for epoch boundary was blocked
     // this lead to inability to enter view as nobody could form timeout certificate
-    #[test]
     fn test_liveness_blocked_views() {
         init_tracing();
         let scenario = Scenario::parse(
@@ -857,6 +890,65 @@ advance 3
             advance 3
             {0, 2, 3/0, 3/1} | {1}
             advance 28
+"#,
+        );
+        let mut model = Model::new(4, 1);
+        for op in scenario.unwrap() {
+            if let Err(err) = model.step(op) {
+                assert!(false, "error: {:?}", err);
+            }
+        }
+    }
+
+    #[test]
+    // in this test participants in the first partition generated timeout certificates and moved to the further round
+    // when node 1 rejoins partition it is still in the previous view.
+    // so whole cluster is blocked as new timeout certificates can't be formed by {2, 3/0, 3/1}
+    fn test_liveness_lost_timeout() {
+        init_tracing();
+        let scenario = Scenario::parse(
+            r#"
+{0, 2, 3/0, 3/1} | {1}
+advance 11
+{0, 1, 2, 3/0, 3/1}
+advance 16
+"#,
+        );
+        let mut model = Model::new(4, 1);
+        for op in scenario.unwrap() {
+            if let Err(err) = model.step(op) {
+                assert!(false, "error: {:?}", err);
+            }
+        }
+    }
+
+    #[test]
+    // in this test timeout cerrtificate is generated by partition {1, 2, 3/1} and not persisted
+    // when partition is fixed.
+    // nodes 3/0 and 1 are consecutive leaders and therefore no progress for 2 views
+    // after that nodes are casting wishes for different epochs (f+1 segments)
+    // due to protocol bug we have partition {0, 3/0} that casts votes for view 7
+    // and partition {1, 2} that casts correct votes for view 9
+    fn test_liveness_timeout_delivered_before_partition() {
+        init_tracing();
+        let scenario = Scenario::parse(
+            r#"
+{0, 1, 3/0, 3/1} | {2}
+advance 2
+{1, 2, 3/0, 3/1} | {0}
+advance 4
+{0, 1, 2, 3/1} | {3/0}
+advance 9
+{3/0, 3/1} | {0, 1, 2}
+advance 19
+{0, 1, 2, 3/0} | {3/1}
+advance 2
+{0, 1, 3/0, 3/1} | {2}
+advance 12
+{1, 2, 3/1} | {0, 3/0}
+advance 4
+{0, 1, 2, 3/0} | {3/1}
+advance 28
 "#,
         );
         let mut model = Model::new(4, 1);

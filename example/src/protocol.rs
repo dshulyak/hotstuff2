@@ -487,6 +487,7 @@ mod tests {
             voted: None,
             lock: Some(genesis_test()),
             commit: Some(genesis_test()),
+            timeout: None,
         };
         history.update(&change).await.unwrap();
 
@@ -518,6 +519,7 @@ mod tests {
             voted: None,
             lock: Some(genesis_test()),
             commit: Some(genesis_test()),
+            timeout: None,
         };
         history.update(&change).await.unwrap();
         let cnt = Counter::new();
