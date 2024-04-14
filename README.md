@@ -45,6 +45,16 @@ All state is stored in /tmp/example. Delete directory to reset it.
 sudo rm -rf /tmp/example
 ```
 
+5. Known issues with running playground
+- arp cache threshing, can be diagnosed by looking at dmesg
+```
+sudo sysctl -w net.ipv4.neigh.default.gc_thresh3=204800
+```
+- docker interfering with other bridges
+```
+sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
+```
+
 ## Tests
 
 1. `cargo install cargo-nextest --locked`
