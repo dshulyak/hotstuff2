@@ -653,12 +653,12 @@ mod tests {
 
         let fut = gossip_accept(&ctx, &router, stream);
         let mut stream = Box::pin(fut.into_stream());
-        futures::poll!(stream.next());
+        _ = futures::poll!(stream.next());
         for msg in to_send.iter() {
             router.send_all(msg.clone());
         }
         for _ in to_send.iter() {
-            futures::poll!(stream.next());
+            _ = futures::poll!(stream.next());
         }
     }
 }

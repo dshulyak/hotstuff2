@@ -1,5 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use anyhow::Context;
 use hotstuff2::types::{Message, PublicKey};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Result};
@@ -38,6 +39,17 @@ impl Connection {
 
     pub(crate) fn remote(&self) -> SocketAddr {
         self.0.remote_address()
+    }
+
+    pub(crate) fn cert(&self) -> anyhow::Result<rustls::Certificate> {
+        self.0
+            .peer_identity()
+            .context("peer didn't return identity")?
+            .downcast::<Vec<rustls::Certificate>>()
+            .map_err(|_| anyhow::anyhow!("invalid certificate"))?
+            .into_iter()
+            .next()
+            .context("no certificate in returned")
     }
 }
 

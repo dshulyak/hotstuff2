@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -61,6 +61,13 @@ all public keys will be stored in a file named public_keys."
         help = "number of keys to generate"
     )]
     count: usize,
+
+    #[clap(
+        long = "cidr",
+        default_value = "10.0.0.0/24",
+        help = "subnet where nodes will be running. the assumption is that each node will run on its own ip starting from the second"
+    )]
+    cidr: ipnet::IpNet,
 }
 
 #[derive(Debug, Parser)]
@@ -83,6 +90,12 @@ struct Run {
 
     #[clap(long, short = 'c', help = "list of peers to connect with")]
     connect: Vec<SocketAddr>,
+
+    #[clap(
+        long = "peer-list",
+        help = "file with list of peers to connect with. every line is expected to be an address."
+    )]
+    peer_list: PathBuf,
 
     #[clap(
         long = "participants",
@@ -119,6 +132,22 @@ impl Run {
             })
             .collect()
     }
+
+    fn full_peer_list(&self) -> Result<Vec<SocketAddr>> {
+        let mut peers = self.connect.clone();
+        if self.peer_list.exists() {
+            let content = std::fs::read_to_string(&self.peer_list)?;
+            let new_peers = content
+                .lines()
+                .map(|line| {
+                    SocketAddr::from_str(str::trim(line))
+                        .map_err(|err| anyhow::anyhow!("{:?}", err))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            peers.extend(new_peers);
+        }
+        Ok(peers)
+    }
 }
 
 #[tokio::main]
@@ -135,7 +164,10 @@ async fn main() {
             .with_trace_config(
                 sdk::trace::config()
                     .with_sampler(sdk::trace::Sampler::AlwaysOn)
-                    .with_resource(Resource::new(vec![KeyValue::new("service.name", opts.id.clone())])),
+                    .with_resource(Resource::new(vec![KeyValue::new(
+                        "service.name",
+                        opts.id.clone(),
+                    )])),
             )
             .install_batch(sdk::runtime::Tokio)
             .expect("install simple");
@@ -192,7 +224,19 @@ fn generate(opt: Generate) {
             .join("\n"),
     )
     .unwrap();
-    tracing::info!(path = %public_path.display(), "wrote public keys");
+
+    let mut hosts = opt.cidr.hosts();
+    hosts.next(); // drain first ip
+    let connect_list = publics
+        .iter()
+        .zip(hosts)
+        .map(|(_, host)| SocketAddr::new(host, 9000).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let connect_path = opt.dir.join("peer_list");
+    std::fs::write(&connect_path, connect_list).unwrap();
+
+    tracing::info!(path = %public_path.display(), connect_list = %connect_path.display(), "wrote public keys and peers connect list");
 }
 
 async fn run(opt: Run) {
@@ -205,6 +249,13 @@ async fn run(opt: Run) {
         Ok(privates) => privates,
         Err(err) => {
             tracing::error!(error = %err, "failed to load private keys");
+            std::process::exit(1);
+        }
+    };
+    let peer_list = match opt.full_peer_list() {
+        Ok(peer_list) => peer_list,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load peer list");
             std::process::exit(1);
         }
     };
@@ -244,7 +295,7 @@ async fn run(opt: Run) {
         "example",
         participants.into_boxed_slice(),
         privates.into_boxed_slice(),
-        opt.connect,
+        peer_list,
         opt.network_delay.into(),
     )
     .await

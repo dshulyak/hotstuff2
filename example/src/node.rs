@@ -21,6 +21,7 @@ use crate::protocol::{self, TokioConsensus, TokioSink};
 async fn initiate(
     ctx: &Context,
     endpoint: &quinn::Endpoint,
+    local_cert: &rustls::Certificate,
     peer: SocketAddr,
     history: &History,
     proofs: &[ProofOfPossesion],
@@ -41,6 +42,10 @@ async fn initiate(
             anyhow::bail!("task to establish connection: {}", err);
         }
     };
+    let remote_cert = conn.cert()?;
+    if remote_cert == *local_cert {
+        return Ok(());
+    }
     tracing::debug!(remote = %conn.remote(), "established connection");
     protocol::sync_initiate(
         ctx,
@@ -68,13 +73,20 @@ async fn connect(
     peer: SocketAddr,
     reconnect_interval: Duration,
     endpoint: &quinn::Endpoint,
+    local_cert: &rustls::Certificate,
     history: &History,
     proofs: &Box<[ProofOfPossesion]>,
     consensus: &protocol::TokioConsensus,
 ) {
     loop {
-        if let Err(err) = initiate(ctx, endpoint, peer, history, proofs, consensus).await {
-            tracing::warn!(error = ?err, "failed to connect to peer");
+        match initiate(ctx, endpoint, local_cert, peer, history, proofs, consensus).await {
+            Ok(_) => {
+                tracing::info!(peer = %peer, "connected to self");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, "failed to connect to peer");
+            }
         }
         match ctx.select(sleep(reconnect_interval)).await {
             Some(_) => {}
@@ -86,12 +98,7 @@ async fn connect(
     }
 }
 
-async fn accept(
-    ctx: &Context,
-    endpoint: &quinn::Endpoint,
-    history: &History,
-    router: &Router,
-) {
+async fn accept(ctx: &Context, endpoint: &quinn::Endpoint, history: &History, router: &Router) {
     tracing::info!(local = %endpoint.local_addr().unwrap(), "accepting connections");
     let mut s = unsafe { TokioScope::create(Default::default()) };
     while let Some(Some(conn)) = ctx.select(endpoint.accept()).await {
@@ -127,20 +134,20 @@ async fn accept(
     s.collect().await;
 }
 
-fn ensure_cert(dir: &Path) -> Result<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
+fn ensure_cert(dir: &Path) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
     let cert_path = dir.join("cert.der");
     let key_path = dir.join("key.der");
     if cert_path.exists() && key_path.exists() {
         let cert = std::fs::read(cert_path)?;
         let key = std::fs::read(key_path)?;
-        Ok((vec![rustls::Certificate(cert)], rustls::PrivateKey(key)))
+        Ok((rustls::Certificate(cert), rustls::PrivateKey(key)))
     } else {
         let selfsigned = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
         let key = selfsigned.serialize_private_key_der();
         let cert = selfsigned.serialize_der()?;
         std::fs::write(&cert_path, &cert)?;
         std::fs::write(&key_path, &key)?;
-        Ok((vec![rustls::Certificate(cert)], rustls::PrivateKey(key)))
+        Ok((rustls::Certificate(cert), rustls::PrivateKey(key)))
     }
 }
 
@@ -152,6 +159,7 @@ pub struct Node {
     consensus: TokioConsensus,
     receiver: mpsc::UnboundedReceiver<Action>,
     endpoint: quinn::Endpoint,
+    local_cert: rustls::Certificate,
     network_delay: Duration,
 }
 
@@ -189,11 +197,10 @@ impl Node {
             TokioSink::new(sender),
         );
         let (cert, key) = ensure_cert(&dir)?;
-
         let server_crypto = rustls::ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
-            .with_single_cert(cert, key)?;
+            .with_single_cert(vec![cert.clone()], key)?;
         let client_crypto = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(SkipServerVerification::new())
@@ -210,6 +217,7 @@ impl Node {
             consensus: consensus,
             receiver: receiver,
             endpoint: endpoint,
+            local_cert: cert,
             network_delay: network_delay,
             proofs: protocol::generate_proofs(&keys),
         })
@@ -244,6 +252,7 @@ impl Node {
                 *peer,
                 Duration::from_secs(1),
                 &self.endpoint,
+                &self.local_cert,
                 &self.history,
                 &self.proofs,
                 &self.consensus,
@@ -318,25 +327,23 @@ mod tests {
             .map(|_| tempfile::TempDir::with_prefix("test_sanity").unwrap())
             .collect::<Vec<_>>();
         let mut nodes = vec![];
-        for i in range { 
-                let listener = listeners[i - 1];
-                let pk = [pks[i - 1].clone()];
-                let node = node::Node::init(
-                    tempdirs[i - 1].path(),
-                    inmemory().await.unwrap(),
-                    listener,
-                    "test_sanity",
-                    participants.clone().into(),
-                    Box::new(pk),
-                    listeners
-                        .iter()
-                        .filter(|sock| listener != **sock)
-                        .copied()
-                        .collect(),
-                    Duration::from_millis(50),
-                ).await.unwrap();
-                nodes.push(node);
-            };
+        for i in range {
+            let listener = listeners[i - 1];
+            let pk = [pks[i - 1].clone()];
+            let node = node::Node::init(
+                tempdirs[i - 1].path(),
+                inmemory().await.unwrap(),
+                listener,
+                "test_sanity",
+                participants.clone().into(),
+                Box::new(pk),
+                listeners.clone(),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+            nodes.push(node);
+        }
 
         {
             let ctx = context::Context::new();
