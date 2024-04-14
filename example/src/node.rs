@@ -134,7 +134,7 @@ async fn accept(ctx: &Context, endpoint: &quinn::Endpoint, history: &History, ro
     s.collect().await;
 }
 
-fn ensure_cert(dir: &Path) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
+fn ensure_cert(dir: &Path, listen: &SocketAddr) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
     let cert_path = dir.join("cert.der");
     let key_path = dir.join("key.der");
     if cert_path.exists() && key_path.exists() {
@@ -142,7 +142,7 @@ fn ensure_cert(dir: &Path) -> Result<(rustls::Certificate, rustls::PrivateKey)> 
         let key = std::fs::read(key_path)?;
         Ok((rustls::Certificate(cert), rustls::PrivateKey(key)))
     } else {
-        let selfsigned = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        let selfsigned = rcgen::generate_simple_self_signed(vec![listen.to_string().into()])?;
         let key = selfsigned.serialize_private_key_der();
         let cert = selfsigned.serialize_der()?;
         std::fs::write(&cert_path, &cert)?;
@@ -196,7 +196,7 @@ impl Node {
             &keys,
             TokioSink::new(sender),
         );
-        let (cert, key) = ensure_cert(&dir)?;
+        let (cert, key) = ensure_cert(&dir, &listen)?;
         let server_crypto = rustls::ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()

@@ -23,13 +23,27 @@ cargo build --manifest-path=./example/Cargo.toml
 ```
 ./target/debug/example generate -d /tmp/example
 ```
-3. Run 4 nodes cluster
+3. Run cluster 
 ```
-sudo ./play_4.sh
+sudo ./play.sh
 ```
 
-It will `example` binary in 4 isolated namespaces, with 20 ms delay between them.
+By default script will run 4 nodes cluster. Size can controlled by the SIZE env variable:
+```
+sudo SIZE=31 ./play.sh
+```
+
+The delay between nodes will be 40 ms.
 Logs will be available in target directory, which is `/tmp/example` in the example above. 
+
+Playground can be restarted as long as the protocol configuration didn't change between restarts.
+
+4. Reset state
+
+All state is stored in /tmp/example. Delete directory to reset it.
+```
+sudo rm -rf /tmp/example
+```
 
 ## Tests
 
