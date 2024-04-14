@@ -21,6 +21,7 @@ pub async fn sqlite(url: &str) -> Result<SqlitePool> {
         Sqlite::create_database(url).await.context("create db")?;
     }
     let pool = SqlitePool::connect(url).await.context("pool connect")?;
+    tracing::info!("connected to db");
     sqlx::query(schema())
         .execute(&pool)
         .await
@@ -45,7 +46,7 @@ fn schema() -> &'static str {
         block char(32) not null,
         certificate blob not null
     );
-    create unique index history_by_view on history(view asc);
+    create unique index if not exists history_by_view on history(view asc);
     "#
 }
 

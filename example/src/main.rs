@@ -264,7 +264,6 @@ async fn run(opt: Run) {
         tracing::error!(error = %err, "failed to set interrupt handler");
         std::process::exit(1);
     };
-    // pass error up the stack
     node.run(ctx).await;
-    tracing::info!("node exited");
+    tracing::info!("exited");
 }
