@@ -198,7 +198,13 @@ async fn consume_messages(
     consensus: &impl OnMessage,
 ) -> anyhow::Result<()> {
     loop {
-        let msg = ctx.timeout_secs(10).select(stream.recv_msg()).await??;
+        let msg = match ctx.select(stream.recv_msg()).await {
+            None => {
+                return Ok(());
+            }
+            Some(msg) => msg?,
+        };
+        
         let start = Instant::now();
         let id = msg.short_id().await.unwrap();
         tracing::debug!(id = %id, remote = ?stream.remote(), msg = %msg, "on gossip message");
