@@ -312,7 +312,8 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 state.locked = propose.inner.locked.clone();
                 change.locked = Some(state.locked.clone());
             }
-            ensure!(propose.inner.locked == state.locked);
+            ensure!(propose.inner.locked.block == state.locked.block, 
+                "{:?} != {:?}", propose.inner.locked.block, state.locked.block);
 
             if propose.inner.commit.inner.view > state.commit.inner.view {
                 state.commit = propose.inner.commit.clone();
@@ -325,7 +326,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
 
             ensure!(
                 propose.inner.view == state.view,
-                "node {} must be in the same round as propose {}",
+                "node view {} must be in the same round as propose {}",
                 state.view, propose.inner.view,
             );
             ensure!(
