@@ -44,7 +44,7 @@ async fn initiate(
     };
     let remote_cert = conn.cert()?;
     if remote_cert == *local_cert {
-        return Ok(());
+        anyhow::bail!("connected to self");
     }
     tracing::debug!(remote = %conn.remote(), "established connection");
     protocol::sync_initiate(
@@ -79,14 +79,14 @@ async fn connect(
     consensus: &protocol::TokioConsensus,
 ) {
     loop {
-        match initiate(ctx, endpoint, local_cert, peer, history, proofs, consensus).await {
-            Ok(_) => {
-                tracing::info!(peer = %peer, "connected to self");
+        if let Err(err) =
+            initiate(ctx, endpoint, local_cert, peer, history, proofs, consensus).await
+        {
+            if err.to_string().contains("connected to self") {
+                tracing::info!("connected to self");
                 return;
             }
-            Err(err) => {
-                tracing::warn!(error = ?err, "failed to connect to peer");
-            }
+            tracing::warn!(error = ?err, peer = ?peer, "failed to connect to peer");
         }
         match ctx.select(sleep(reconnect_interval)).await {
             Some(_) => {}
@@ -134,7 +134,10 @@ async fn accept(ctx: &Context, endpoint: &quinn::Endpoint, history: &History, ro
     s.collect().await;
 }
 
-fn ensure_cert(dir: &Path, listen: &SocketAddr) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
+fn ensure_cert(
+    dir: &Path,
+    listen: &SocketAddr,
+) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
     let cert_path = dir.join("cert.der");
     let key_path = dir.join("key.der");
     if cert_path.exists() && key_path.exists() {
