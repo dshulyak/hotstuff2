@@ -8,6 +8,7 @@ use anyhow::Result;
 use async_scoped::TokioScope;
 use hotstuff2::sequential::Action;
 use hotstuff2::types::{PrivateKey, PublicKey};
+use quinn::TransportConfig;
 use sqlx::SqlitePool;
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
@@ -33,13 +34,13 @@ async fn initiate(
             anyhow::bail!("failed to connect to peer {}: {}", peer, err);
         }
     };
-    let conn = match ctx.timeout_secs(10).select(conn).await {
-        Ok(Ok(conn)) => Connection::new(conn),
-        Ok(Err(err)) => {
-            anyhow::bail!("establish connection: {}", err);
+    let conn = match ctx.select(conn).await {
+        Some(Ok(conn)) => Connection::new(conn),
+        Some(Err(err)) => {
+            anyhow::bail!("failed to connect to peer {}: {}", peer, err);
         }
-        Err(err) => {
-            anyhow::bail!("task to establish connection: {}", err);
+        None => {
+            anyhow::bail!("task to connect to peer {} is cancelled", peer);
         }
     };
     let remote_cert = conn.cert()?;
@@ -103,17 +104,18 @@ async fn accept(ctx: &Context, endpoint: &quinn::Endpoint, history: &History, ro
     let mut s = unsafe { TokioScope::create(Default::default()) };
     while let Some(Some(conn)) = ctx.select(endpoint.accept()).await {
         s.spawn(async {
-            let conn = match ctx.timeout_secs(10).select(conn).await {
-                Ok(Ok(conn)) => Connection::new(conn),
-                Ok(Err(err)) => {
-                    tracing::debug!(error = ?err, "failed to accept connection");
+            let conn = match ctx.select(conn).await {
+                Some(Ok(conn)) => Connection::new(conn),
+                Some(Err(err)) => {
+                    tracing::warn!(error = ?err, "failed to accept connection");
                     return;
                 }
-                Err(err) => {
-                    tracing::debug!(error = ?err, "task failed");
+                None => {
+                    tracing::debug!("task to accept connection is cancelled");
                     return;
                 }
             };
+            tracing::debug!(remote = %conn.remote(), "accepted connection");
             let mut s = unsafe { TokioScope::create(Default::default()) };
             while let Some(Ok(stream)) = ctx.select(conn.accept()).await {
                 match stream.protocol() {
@@ -212,7 +214,13 @@ impl Node {
             quinn::ServerConfig::with_crypto(Arc::new(server_crypto)),
             listen,
         )?;
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(client_crypto)));
+        let mut cfg = TransportConfig::default();
+        cfg.keep_alive_interval(Some(Duration::from_secs(1)));
+        endpoint.set_default_client_config(
+            quinn::ClientConfig::new(Arc::new(client_crypto))
+                .transport_config(Arc::new(cfg))
+                .clone(),
+        );
         Ok(Self {
             peers,
             history: history,

@@ -262,7 +262,7 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
         match router.register(stream.remote(), proofs.clone().into_iter()) {
             Ok(msgs) => msgs,
             Err(err) => {
-                tracing::warn!(error = ?err, "failed to register peer");
+                tracing::warn!(error = ?err, peer = %stream.remote(), "failed to register peer");
                 return;
             }
         }
