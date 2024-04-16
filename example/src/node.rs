@@ -7,13 +7,12 @@ use std::time::Duration;
 use anyhow::Result;
 use async_scoped::TokioScope;
 use hotstuff2::sequential::Action;
-use hotstuff2::types::{PrivateKey, PublicKey};
+use hotstuff2::types::{PrivateKey, ProofOfPossession, PublicKey};
 use quinn::TransportConfig;
 use sqlx::SqlitePool;
 use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
 
-use crate::codec::ProofOfPossesion;
 use crate::context::Context;
 use crate::history::{self, History};
 use crate::net::{Connection, Router};
@@ -25,7 +24,7 @@ async fn initiate(
     local_cert: &rustls::Certificate,
     peer: SocketAddr,
     history: &History,
-    proofs: &[ProofOfPossesion],
+    proofs: &[ProofOfPossession],
     consensus: &protocol::TokioConsensus,
 ) -> anyhow::Result<()> {
     let conn = match endpoint.connect(peer, "localhost") {
@@ -76,7 +75,7 @@ async fn connect(
     endpoint: &quinn::Endpoint,
     local_cert: &rustls::Certificate,
     history: &History,
-    proofs: &Box<[ProofOfPossesion]>,
+    proofs: &Box<[ProofOfPossession]>,
     consensus: &protocol::TokioConsensus,
 ) {
     loop {
@@ -160,7 +159,7 @@ pub struct Node {
     peers: Vec<SocketAddr>,
     history: History,
     router: Router,
-    proofs: Box<[ProofOfPossesion]>,
+    proofs: Box<[ProofOfPossession]>,
     consensus: TokioConsensus,
     receiver: mpsc::UnboundedReceiver<Action>,
     endpoint: quinn::Endpoint,

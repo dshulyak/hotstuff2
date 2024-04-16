@@ -70,7 +70,7 @@ pub(crate) fn gen_genesis() -> Certificate<Vote> {
             block: Block::new(0, ID::default(), GENESIS.into()),
         },
         signature: AggregateSignature::empty(),
-        signers: BitVec::new(),
+        signers: BitVec::new().into(),
     }
 }
 
@@ -137,7 +137,7 @@ impl Tester {
         Certificate {
             inner: message.clone(),
             signature: aggregated,
-            signers: bitvec,
+            signers: bitvec.into(),
         }
     }
 
@@ -1091,7 +1091,7 @@ fn cert_strat<T: ToBytes + Debug>(
         let aggregated = AggregateSignature::aggregate(&signatures).expect("failed to aggregate");
         Certificate {
             inner: msg,
-            signers: bits,
+            signers: bits.into(),
             signature: aggregated,
         }
     })

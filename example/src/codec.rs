@@ -1,8 +1,7 @@
 use async_trait::async_trait;
-use bit_vec::BitVec;
 use hotstuff2::types::{
-    Block, Certificate, Message, Prepare, Propose, PublicKey, Signature, Signed, Sync as SyncMsg,
-    Timeout, ToBytes, View, Vote, Wish, PUBLIC_KEY_SIZE, SIGNATURE_SIZE,
+    Block, Certificate, Message, Prepare, Propose, Signature, Signed, Sync as SyncMsg,
+    Timeout, ToBytes, View, Vote, Wish, SIGNATURE_SIZE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter, Error, ErrorKind, Result};
 
@@ -161,7 +160,7 @@ impl<T: AsyncDecode + ToBytes + Send> AsyncDecode for Certificate<T> {
             signature: Signature::from_bytes(&signature)
                 .map_err(|_| Error::new(ErrorKind::InvalidData, "failed to parse signature"))?
                 .into(),
-            signers: BitVec::from_bytes(&signers),
+            signers: signers.as_slice().into(),
         })
     }
 }
@@ -353,60 +352,6 @@ impl AsyncDecode for Protocol {
     async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self> {
         let v = r.read_u16().await?;
         Ok(Protocol(v))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProofOfPossesion {
-    pub(crate) key: PublicKey,
-    pub(crate) signature: Signature,
-}
-
-#[async_trait]
-impl AsyncEncode for ProofOfPossesion {
-    async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
-        let pubk = self.key.to_bytes();
-        w.write_all(&pubk).await?;
-        w.write_all(self.signature.to_bytes()).await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl AsyncDecode for ProofOfPossesion {
-    async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self> {
-        let mut pubk = [0u8; PUBLIC_KEY_SIZE];
-        r.read_exact(&mut pubk).await?;
-        let key = PublicKey::from_bytes(&pubk).map_err(|err| {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("invalid public key: {}", err),
-            )
-        })?;
-        let mut sig = [0u8; SIGNATURE_SIZE];
-        r.read_exact(&mut sig).await?;
-        let signature = Signature::from_bytes(&sig).map_err(|err| {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("invalid signature: {}", err),
-            )
-        })?;
-        Ok(ProofOfPossesion { key, signature })
-    }
-}
-
-pub(crate) struct Hello<'a> {
-    pub(crate) proofs: &'a [ProofOfPossesion],
-}
-
-#[async_trait]
-impl<'a> AsyncEncode for Hello<'a> {
-    async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
-        Len(self.proofs.len() as u16).encode(w).await?;
-        for proof in self.proofs {
-            proof.encode(w).await?;
-        }
-        Ok(())
     }
 }
 

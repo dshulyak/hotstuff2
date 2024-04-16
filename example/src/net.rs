@@ -1,12 +1,15 @@
+use std::io::{Error, ErrorKind};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use hotstuff2::types::{Message, PublicKey};
 use parking_lot::Mutex;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Result};
+use prost::{decode_length_delimiter, Message as ProstMessage};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Result};
 use tokio::sync::mpsc;
 
 use crate::codec::{AsyncDecode, AsyncEncode, Protocol};
+use crate::proto::{self, protocol};
 
 pub(crate) struct Connection(quinn::Connection);
 
@@ -18,23 +21,23 @@ impl Connection {
     pub(crate) async fn open(&self, proto: Protocol) -> Result<MsgStream> {
         let (mut send, recv) = self.0.open_bi().await?;
         proto.encode(&mut send).await?;
-        Ok(MsgStream {
-            protocol: proto,
-            remote: self.0.remote_address(),
-            send: BufWriter::new(Box::new(send)),
-            recv: BufReader::new(Box::new(recv)),
-        })
+        Ok(MsgStream::new(
+            proto,
+            self.0.remote_address(),
+            Box::new(send),
+            Box::new(recv),
+        ))
     }
 
     pub(crate) async fn accept(&self) -> Result<MsgStream> {
         let (send, mut recv) = self.0.accept_bi().await?;
         let proto = Protocol::decode(&mut recv).await?;
-        Ok(MsgStream {
-            protocol: proto,
-            remote: self.0.remote_address(),
-            send: BufWriter::new(Box::new(send)),
-            recv: BufReader::new(Box::new(recv)),
-        })
+        Ok(MsgStream::new(
+            proto,
+            self.0.remote_address(),
+            Box::new(send),
+            Box::new(recv),
+        ))
     }
 
     pub(crate) fn remote(&self) -> SocketAddr {
@@ -56,7 +59,9 @@ impl Connection {
 pub(crate) struct MsgStream {
     protocol: Protocol,
     remote: SocketAddr,
+    send_buf: bytes::BytesMut,
     send: BufWriter<Box<dyn AsyncWrite + Unpin + Send>>,
+    recv_buf: bytes::BytesMut,
     recv: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
 }
 
@@ -70,7 +75,9 @@ impl MsgStream {
         Self {
             protocol,
             remote,
+            send_buf: bytes::BytesMut::with_capacity(4096),
             send: BufWriter::new(send),
+            recv_buf: bytes::BytesMut::with_capacity(4096),
             recv: BufReader::new(recv),
         }
     }
@@ -83,21 +90,43 @@ impl MsgStream {
         self.remote
     }
 
-    pub(crate) async fn send<T: AsyncEncode>(&mut self, msg: &T) -> Result<()> {
-        msg.encode(&mut self.send).await?;
-        self.send.flush().await
+    pub(crate) async fn send_payload(&mut self, payload: protocol::Payload) -> Result<()> {
+        let protocol_message = proto::Protocol {
+            payload: Some(payload),
+            headers: None,
+        };
+        self.send_message(&protocol_message).await
     }
 
-    pub(crate) async fn recv<T: AsyncDecode>(&mut self) -> Result<T> {
-        T::decode(&mut self.recv).await
+    pub(crate) async fn recv_payload(&mut self) -> Result<protocol::Payload> {
+        let protocol_message = self.recv_message::<proto::Protocol>().await?;
+        protocol_message
+            .payload
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing payload"))
     }
 
-    pub(crate) async fn send_msg(&mut self, msg: &Message) -> Result<()> {
-        self.send(msg).await
+    pub(crate) async fn send_message<T: ProstMessage>(&mut self, msg: &T) -> Result<()> {
+        self.send_buf.resize(0, 0);
+        msg.encode_length_delimited(&mut self.send_buf)?;
+        self.send.write_all(&self.send_buf).await?;
+        self.send.flush().await?;
+        Ok(())
     }
 
-    pub(crate) async fn recv_msg(&mut self) -> Result<Message> {
-        self.recv().await
+    pub(crate) async fn recv_message<T: ProstMessage + Default>(&mut self) -> Result<T> {
+        let n = {
+            for i in 0..10 {
+                self.recv_buf.resize(i + 1, 0);
+                self.recv.read_exact(&mut self.recv_buf[i..i + 1]).await?;
+                if *self.recv_buf.last().unwrap() < 0x80 {
+                    break;
+                }
+            }
+            decode_length_delimiter(&self.recv_buf[..])?
+        };
+        self.recv_buf.resize(n, 0);
+        self.recv.read_exact(&mut self.recv_buf[..n]).await?;
+        T::decode(&mut self.recv_buf).map_err(|err| Error::new(ErrorKind::InvalidData, err))
     }
 }
 

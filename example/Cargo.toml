@@ -36,3 +36,8 @@ tokio-util = "0.7.10"
 tracing = "0.1.40"
 tracing-opentelemetry = "0.23.0"
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
+prost = "0.12.4"
+bytes = "1.6.0"
+
+[build-dependencies]
+prost-build = "0.5"

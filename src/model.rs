@@ -28,7 +28,7 @@ fn genesis() -> Certificate<Vote> {
             block: Block::new(0, ID::empty(), "genesis".into()),
         },
         signature: AggregateSignature::empty(),
-        signers: BitVec::new(),
+        signers: BitVec::new().into(),
     }
 }
 

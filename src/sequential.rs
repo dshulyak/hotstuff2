@@ -246,7 +246,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                     inner: wishes.message().view,
                     signature: C::aggregate(wishes.signatures())
                         .expect("failed to aggregate signatures"),
-                    signers: wishes.signers(),
+                    signers: wishes.signers().into(),
                 },
             }));
         }
@@ -464,7 +464,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 certificate: Certificate {
                     inner: votes.message(),
                     signature: signature.clone(),
-                    signers: votes.signers(),
+                    signers: votes.signers().into(),
                 },
             };
             let signature = C::sign(pk, Domain::Prepare, &cert.to_bytes());
@@ -522,7 +522,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 inner: votes.message().inner.clone(),
                 signature: C::aggregate(votes.signatures())
                     .expect("failed to aggregate signatures"),
-                signers: votes.signers(),
+                signers: votes.signers().into(),
             };
             self.state.lock().proposal = Some(Propose {
                 view: cert.view + 1,

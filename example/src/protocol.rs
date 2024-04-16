@@ -1,21 +1,23 @@
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bit_vec::BitVec;
+use anyhow::Result;
 use hotstuff2::sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer};
 use hotstuff2::types::{
-    AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg, Timeout, View, Vote, ID
+    AggregateSignature, Bitfield, Block, Certificate, Message, PrivateKey, ProofOfPossession, PublicKey, Sync as SyncMsg, Timeout, View, Vote, ID
 };
 use rand::{thread_rng, Rng};
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::time::{interval, Instant};
 
-use crate::codec::{AsyncEncode, Hello, Len, ProofOfPossesion, Protocol};
+use crate::codec::{AsyncEncode, Protocol};
 use crate::context::Context;
 use crate::history::History;
 use crate::net::{MsgStream, Router};
+use crate::proto::{self, protocol};
 
 pub(crate) const GOSSIP_PROTOCOL: Protocol = Protocol::new(1);
 pub(crate) const SYNC_PROTOCOL: Protocol = Protocol::new(2);
@@ -46,7 +48,7 @@ pub(crate) fn genesis(genesis: &str) -> Certificate<Vote> {
             block: Block::new(0, ID::default(), genesis.into()),
         },
         signature: AggregateSignature::empty(),
-        signers: BitVec::new(),
+        signers: Bitfield::new(),
     }
 }
 
@@ -64,7 +66,7 @@ pub(crate) async fn sync_initiate(
     };
     match ctx
         .timeout_secs(10)
-        .select(stream.send_msg(&Message::Sync(state)))
+        .select(stream.send_payload(Message::Sync(state).borrow().into()))
         .await
     {
         Ok(Ok(())) => {}
@@ -72,9 +74,9 @@ pub(crate) async fn sync_initiate(
         Err(err) => anyhow::bail!("task to sync message: {}", err),
     }
     loop {
-        match ctx.timeout_secs(10).select(stream.recv_msg()).await {
-            Ok(Ok(msg)) => {
-                if let Err(err) = consensus.on_message(msg) {
+        match ctx.timeout_secs(10).select(stream.recv_payload()).await {
+            Ok(Ok(payload)) => {
+                if let Err(err) = consensus.on_message(payload.borrow().try_into()?) {
                     tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process sync message");
                 }
             }
@@ -95,8 +97,8 @@ pub(crate) async fn sync_initiate(
 }
 
 pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: MsgStream) {
-    let state = match ctx.timeout_secs(10).select(stream.recv_msg()).await {
-        Ok(Ok(Message::Sync(state))) => state,
+    let state = match ctx.timeout_secs(10).select(stream.recv_payload()).await {
+        Ok(Ok(protocol::Payload::Sync(state))) => state,
         Ok(Ok(msg)) => {
             tracing::debug!(message = ?msg, "unexpected message");
             return;
@@ -113,7 +115,7 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: Ms
     let mut last = state
         .commit
         .as_ref()
-        .map(|v| v.inner.view + 1)
+        .map(|v| View(v.view + 1))
         .unwrap_or(View(1));
     tracing::debug!(from_view = %last, remote = %stream.remote(), "requested sync");
     loop {
@@ -139,7 +141,7 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: Ms
         }
         match ctx
             .timeout_secs(10)
-            .select(stream.send_msg(&sync_msg))
+            .select(stream.send_payload(sync_msg.borrow().into()))
             .await
         {
             Ok(Ok(())) => {}
@@ -154,12 +156,12 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: Ms
         };
     }
     if let Some(timeout) = history.timeout() {
-        let msg = Message::Timeout(Timeout{
+        let msg = Message::Timeout(Timeout {
             certificate: timeout,
         });
         match ctx
             .timeout_secs(10)
-            .select(stream.send_msg(&msg))
+            .select(stream.send_payload(msg.borrow().into()))
             .await
         {
             Ok(Ok(())) => {}
@@ -178,11 +180,13 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: Ms
 pub(crate) async fn gossip_initiate(
     ctx: &Context,
     consensus: &impl OnMessage,
-    proofs: &[ProofOfPossesion],
+    proofs: &[ProofOfPossession],
     mut stream: MsgStream,
 ) -> anyhow::Result<()> {
     ctx.timeout_secs(10)
-        .select(stream.send(&Hello { proofs: proofs }))
+        .select(stream.send_payload(protocol::Payload::Hello(proto::Hello {
+            proofs: proofs.iter().map(|pop| pop.into()).collect::<Vec<_>>(),
+        })))
         .await??;
     tracing::debug!(remote = ?stream.remote(), "gossip initiating stream");
     if let Err(err) = consume_messages(ctx, &mut stream, consensus).await {
@@ -198,13 +202,12 @@ async fn consume_messages(
     consensus: &impl OnMessage,
 ) -> anyhow::Result<()> {
     loop {
-        let msg = match ctx.select(stream.recv_msg()).await {
+        let msg: Message = match ctx.select(stream.recv_payload()).await {
             None => {
                 return Ok(());
             }
-            Some(msg) => msg?,
+            Some(msg) => msg?.borrow().try_into()?,
         };
-        
         let start = Instant::now();
         let id = msg.short_id().await.unwrap();
         tracing::debug!(id = %id, remote = ?stream.remote(), msg = %msg, "on gossip message");
@@ -221,8 +224,23 @@ async fn consume_messages(
 }
 
 pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: MsgStream) {
-    let proofs_count = match ctx.timeout_secs(10).select(stream.recv::<Len>()).await {
-        Ok(Ok(count)) => count,
+    let proofs: Vec<ProofOfPossession> = match ctx.timeout_secs(10).select(stream.recv_payload()).await {
+        Ok(Ok(protocol::Payload::Hello(hello))) => {
+            let rst = hello.proofs.iter()
+                .map(|pop| pop.try_into()).collect::<Result<Vec<_>>>();
+            match rst {
+                Ok(proofs) => proofs,
+                Err(err) => {
+                    tracing::warn!(error = ?err, remote = %stream.remote(), "failed to decode proofs");
+                    return;
+                }
+            }
+
+        },
+        Ok(Ok(_)) => {
+            tracing::warn!(remote = %stream.remote(), "unexpected message");
+            return;
+        }
         Ok(Err(err)) => {
             tracing::warn!(error = ?err, remote = %stream.remote(), "failed to read proofs count");
             return;
@@ -233,33 +251,16 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
         }
     };
 
-    let mut proofs = Vec::with_capacity(proofs_count.into());
-    for _ in 0..proofs_count.into() {
-        match ctx
-            .timeout_secs(10)
-            .select(stream.recv::<ProofOfPossesion>())
-            .await
-        {
-            Ok(Ok(proof)) => {
-                if let Err(err) = proof.signature.verify_possesion(&proof.key) {
-                    tracing::warn!(error = ?err, remote = %stream.remote(), "invalid proof of possesion");
-                    return;
-                };
-                proofs.push(proof.key);
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(error = ?err, remote = %stream.remote(), "failed to read proof");
-                return;
-            }
-            Err(err) => {
-                tracing::warn!(error = ?err, remote = %stream.remote(), "failed to read proof");
-                return;
-            }
+    for pop in proofs.iter() {
+        if let Err(err) = pop.verify() {
+            tracing::warn!(error = ?err, remote = %stream.remote(), "invalid proof of possession");
+            return;
         }
     }
+    let publics = proofs.iter().map(|pop| pop.public_key.clone()).collect::<Vec<_>>();
 
     let mut msgs = {
-        match router.register(stream.remote(), proofs.clone().into_iter()) {
+        match router.register(stream.remote(), publics.clone().into_iter()) {
             Ok(msgs) => msgs,
             Err(err) => {
                 tracing::warn!(error = ?err, peer = %stream.remote(), "failed to register peer");
@@ -272,7 +273,7 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
         tracing::debug!(error = ?err, remote = %stream.remote(), "error in gossip stream");
     }
     tracing::debug!(remote = %stream.remote(), "closing gossip stream");
-    router.remove(&stream.remote(), proofs.iter());
+    router.remove(&stream.remote(), publics.iter());
 }
 
 async fn gossip_messages(
@@ -282,7 +283,9 @@ async fn gossip_messages(
 ) -> anyhow::Result<()> {
     while let Some(Some(msg)) = ctx.select(msgs.recv()).await {
         tracing::debug!(remote = %stream.remote(), "sending gossip message");
-        ctx.timeout_secs(10).select(stream.send_msg(&msg)).await??;
+        ctx.timeout_secs(10)
+            .select(stream.send_payload(msg.as_ref().into()))
+            .await??;
     }
     Ok(())
 }
@@ -385,10 +388,10 @@ pub(crate) async fn process_actions(
     }
 }
 
-pub(crate) fn generate_proofs(keys: &[PrivateKey]) -> Box<[ProofOfPossesion]> {
+pub(crate) fn generate_proofs(keys: &[PrivateKey]) -> Box<[ProofOfPossession]> {
     keys.iter()
-        .map(|key| ProofOfPossesion {
-            key: key.public(),
+        .map(|key| ProofOfPossession {
+            public_key: key.public(),
             signature: key.prove_possession(),
         })
         .collect::<Vec<_>>()
@@ -409,12 +412,23 @@ mod tests {
         sequential::StateChange,
         types::{Signature, Signed, Sync as SyncMsg, Wish, SIGNATURE_SIZE},
     };
+    use prost::Message as ProtestMessage;
     use tokio::time::{self, timeout};
     use tokio_test::{assert_ok, io::Builder};
 
     use crate::history::inmemory;
 
     use super::*;
+
+    fn empty_headers_message(payload: protocol::Payload) -> Vec<u8> {
+        let buf = proto::Protocol {
+            payload: Some(payload),
+            headers: None,
+        }
+        .encode_length_delimited_to_vec();
+        tracing::trace!(message = ?buf, "encoded message");
+        buf
+    }
 
     fn genesis_test() -> Certificate<Vote> {
         genesis("test")
@@ -427,7 +441,7 @@ mod tests {
                 block: Block::new(view.into(), ID::default(), ID::from_str(&view.to_string())),
             },
             signature: AggregateSignature::empty(),
-            signers: BitVec::new(),
+            signers: Bitfield::new(),
         }
     }
 
@@ -547,34 +561,31 @@ mod tests {
         let cnt = Counter::new();
 
         let mut reader = Builder::new();
-        reader.read(
-            &Message::Sync(SyncMsg {
+        reader.read(&empty_headers_message(
+            Message::Sync(SyncMsg {
                 locked: None,
                 commit: Some(cert_from_view(1.into())),
             })
-            .encode_to_bytes()
-            .await
-            .unwrap(),
-        );
-        reader.read(
-            &Message::Sync(SyncMsg {
+            .borrow()
+            .into(),
+        ));
+        reader.read(&empty_headers_message(
+            Message::Sync(SyncMsg {
                 locked: None,
-                commit: Some(cert_from_view(3.into())),
+                commit: Some(cert_from_view(2.into())),
             })
-            .encode_to_bytes()
-            .await
-            .unwrap(),
-        );
+            .borrow()
+            .into(),
+        ));
         let mut writer = Builder::new();
-        writer.write(
-            &Message::Sync(SyncMsg {
+        writer.write(&empty_headers_message(
+            Message::Sync(SyncMsg {
                 locked: None,
                 commit: Some(history.last_commit()),
             })
-            .encode_to_bytes()
-            .await
-            .unwrap(),
-        );
+            .borrow()
+            .into(),
+        ));
 
         let stream = MsgStream::new(
             SYNC_PROTOCOL,

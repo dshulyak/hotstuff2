@@ -3,7 +3,7 @@ use bit_vec::BitVec;
 use blst::min_pk as blst;
 use std::fmt::{self, Debug, Display};
 use std::hash::{Hash, Hasher};
-use std::ops::{Add, AddAssign, Deref, Rem};
+use std::ops::{Add, AddAssign, Deref, DerefMut, Rem};
 
 pub trait ToBytes {
     fn to_bytes(&self) -> Vec<u8>;
@@ -47,6 +47,23 @@ impl Display for ID {
 impl From<&str> for ID {
     fn from(id: &str) -> Self {
         ID::from_str(id)
+    }
+}
+
+impl Into<Vec<u8>> for ID {
+    fn into(self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+}
+
+impl TryInto<ID> for &[u8] {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<ID> {
+        anyhow::ensure!(self.len() == 32, "invalid id size");
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(self);
+        Ok(ID::new(bytes))
     }
 }
 
@@ -141,11 +158,46 @@ impl ToBytes for Prepare {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bitfield(BitVec);
+
+impl Bitfield {
+    pub fn new() -> Self {
+        Bitfield(BitVec::new())
+    }
+}
+
+impl Deref for Bitfield {
+    type Target = BitVec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Bitfield {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<BitVec> for Bitfield {
+    fn from(bits: BitVec) -> Self {
+        Bitfield(bits)
+    }
+}
+
+impl Into<Bitfield> for &[u8] {
+    fn into(self) -> Bitfield {
+        Bitfield(BitVec::from_bytes(self))
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Certificate<T: ToBytes> {
     pub inner: T,
     pub signature: AggregateSignature,
-    pub signers: BitVec,
+    pub signers: Bitfield,
 }
 
 impl<T: ToBytes> Deref for Certificate<T> {
@@ -357,6 +409,24 @@ impl PublicKey {
     }
 }
 
+impl From<&PublicKey> for Vec<u8> {
+    fn from(pk: &PublicKey) -> Vec<u8> {
+        pk.to_bytes().to_vec()
+    }
+
+}
+
+impl TryInto<PublicKey> for &[u8] {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<PublicKey, Self::Error> {
+        anyhow::ensure!(self.len() == PUBLIC_KEY_SIZE, "invalid public key size");
+        let mut bytes = [0; PUBLIC_KEY_SIZE];
+        bytes.copy_from_slice(self);
+        Ok(PublicKey(blst::PublicKey::from_bytes(&bytes).map_err(|_| anyhow!("invalid public key"))?))
+    }
+}
+
 impl Display for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", &hex::encode(self.to_bytes())[..8])
@@ -427,6 +497,23 @@ impl AggregateSignature {
             ::blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
             err => Err(anyhow!("failed to verify signature: {:?}", err)),
         }
+    }
+}
+
+impl Into<Vec<u8>> for &AggregateSignature {
+    fn into(self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+}
+
+impl TryInto<AggregateSignature> for &[u8] {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<AggregateSignature, Self::Error> {
+        anyhow::ensure!(self.len() == SIGNATURE_SIZE, "invalid signature size");
+        let mut bytes = [0; SIGNATURE_SIZE];
+        bytes.copy_from_slice(self);
+        Ok(AggregateSignature(bytes))
     }
 }
 
@@ -505,6 +592,23 @@ impl Into<AggregateSignature> for Signature {
     }
 }
 
+impl Into<Vec<u8>> for &Signature {
+    fn into(self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+}
+
+impl TryInto<Signature> for &[u8] {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<Signature, Self::Error> {
+        anyhow::ensure!(self.len() == SIGNATURE_SIZE, "invalid signature size");
+        let mut bytes = [0; SIGNATURE_SIZE];
+        bytes.copy_from_slice(self);
+        Ok(Signature(bytes))
+    }
+}
+
 impl PartialEq for Signature {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
@@ -559,6 +663,18 @@ impl Signature {
 impl Debug for Signature {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", hex::encode(&self.0))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProofOfPossession {
+    pub public_key: PublicKey,
+    pub signature: Signature,
+}
+
+impl ProofOfPossession {
+    pub fn verify(&self) -> Result<()> {
+        self.signature.verify_possesion(&self.public_key)
     }
 }
 
