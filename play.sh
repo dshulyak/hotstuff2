@@ -1,18 +1,21 @@
 #!/bin/bash
 
-RUST_LOG=${RUST_LOG:-info}
+APP_LOG=${APP_LOG:-info}
 RELEASE=${RELEASE:-release}
 BINARY_PATH=${BINARY_PATH:-$(pwd)/target/$RELEASE}
 SIZE=${SIZE:-4}
+LATENCY=${LATENCY:-40ms}
 
 # the following options can be used to collect events into local opentelemetry-compatible collector
-# -i node{index} -t http://10.0.0.1:4317
+# 10.0.0.1 is the ip address of the bridge configured by playground
+# on 4317 i expect to run a jaeger instance
+# example -i node{index} -t http://10.0.0.1:4317 run
 
 RUST_LOG=$RUST_LOG PATH=$PATH:$BINARY_PATH play run \
-    -e RUST_LOG=$RUST_LOG \
+    -e RUST_LOG=$APP_LOG \
     -w /tmp/example \
     -p exmp \
     --redirect \
-    --netem='delay 40ms' \
+    --netem="delay ${LATENCY}" \
     -n $SIZE \
-    -c 'example run -d dir{index} -k {index}.key -p public_keys --peer-list peer_list'
+    -c 'example -i node{index} -t http://10.0.0.1:4317 run -d dir{index} -k {index}.key -p public_keys --peer-list peer_list'

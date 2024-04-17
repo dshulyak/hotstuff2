@@ -12,6 +12,7 @@ use rand::{thread_rng, Rng};
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::time::{interval, Instant};
+use tracing::Instrument;
 
 use crate::context::Context;
 use crate::history::History;
@@ -201,23 +202,26 @@ async fn consume_messages(
     consensus: &impl OnMessage,
 ) -> anyhow::Result<()> {
     loop {
-        let msg: Message = match ctx.select(stream.recv_payload()).await {
+        let span = tracing::debug_span!("recv gossip", remote=%stream.remote());
+        let msg: Message = match ctx.select(stream.recv_payload().instrument(span.clone())).await {
             None => {
                 return Ok(());
             }
             Some(msg) => msg?.borrow().try_into()?,
         };
-        let start = Instant::now();
-        tracing::debug!(remote = ?stream.remote(), msg = %msg, "on gossip message");
-        if let Err(err) = consensus.on_message(msg) {
-            tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process gossip message");
-        }
-        let elapsed = start.elapsed();
-        if elapsed > Duration::from_millis(10) {
-            tracing::warn!(remote = ?stream.remote(), elapsed = ?elapsed, "slow gossip message processing");
-        } else {
-            tracing::debug!(remote = ?stream.remote(), elapsed = ?elapsed, "processed gossip message");
-        }
+        span.in_scope(|| {
+            let start = Instant::now();
+            tracing::debug!(remote = ?stream.remote(), msg = %msg, "on gossip message");
+            if let Err(err) = consensus.on_message(msg) {
+                tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process gossip message");
+            }
+            let elapsed = start.elapsed();
+            if elapsed > Duration::from_millis(10) {
+                tracing::warn!(remote = ?stream.remote(), elapsed = ?elapsed, "slow gossip message processing");
+            } else {
+                tracing::debug!(remote = ?stream.remote(), elapsed = ?elapsed, "processed gossip message");
+            }
+        });
     }
 }
 
@@ -227,7 +231,13 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
             let rst = hello.proofs.iter()
                 .map(|pop| pop.try_into()).collect::<Result<Vec<_>>>();
             match rst {
-                Ok(proofs) => proofs,
+                Ok(proofs) => {
+                    if let Err(err) = proofs.iter().map(|pop: &ProofOfPossession| pop.verify()).collect::<Result<()>>() {
+                        tracing::warn!(error = ?err, remote = %stream.remote(), "invalid proof of possession");
+                        return;
+                    };
+                    proofs
+                },
                 Err(err) => {
                     tracing::warn!(error = ?err, remote = %stream.remote(), "failed to decode proofs");
                     return;
@@ -249,14 +259,7 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
         }
     };
 
-    for pop in proofs.iter() {
-        if let Err(err) = pop.verify() {
-            tracing::warn!(error = ?err, remote = %stream.remote(), "invalid proof of possession");
-            return;
-        }
-    }
     let publics = proofs.iter().map(|pop| pop.public_key.clone()).collect::<Vec<_>>();
-
     let mut msgs = {
         match router.register(stream.remote(), publics.clone().into_iter()) {
             Ok(msgs) => msgs,
@@ -280,9 +283,9 @@ async fn gossip_messages(
     stream: &mut MsgStream,
 ) -> anyhow::Result<()> {
     while let Some(Some(msg)) = ctx.select(msgs.recv()).await {
-        tracing::debug!(remote = %stream.remote(), "sending gossip message");
+        let span = tracing::debug_span!("send gossip", remote = %stream.remote());
         ctx.timeout_secs(10)
-            .select(stream.send_payload(msg.as_ref().into()))
+            .select(stream.send_payload(msg.as_ref().into()).instrument(span))
             .await??;
     }
     Ok(())

@@ -1,15 +1,19 @@
+use std::borrow::Borrow;
 use std::io::{Error, ErrorKind};
+use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use hotstuff2::types::{Message, PublicKey};
+use opentelemetry::trace::TraceContextExt;
 use parking_lot::Mutex;
 use prost::{decode_length_delimiter, Message as ProstMessage};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Result};
 use tokio::sync::mpsc;
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::proto::{self, protocol};
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Protocol(u16);
@@ -112,13 +116,30 @@ impl MsgStream {
     pub(crate) async fn send_payload(&mut self, payload: protocol::Payload) -> Result<()> {
         let protocol_message = proto::Protocol {
             payload: Some(payload),
-            headers: None,
+            headers: Some(proto::Headers {
+                sent_millis: since_unix_epoch().as_millis() as u64,
+                traceparent: Some(Span::current().context().borrow().into()),
+            }),
         };
         self.send_message(&protocol_message).await
     }
 
     pub(crate) async fn recv_payload(&mut self) -> Result<protocol::Payload> {
         let protocol_message = self.recv_message::<proto::Protocol>().await?;
+        if let Some(headers) = protocol_message.headers {
+            tracing::debug!(
+                latency = ?since_unix_epoch().saturating_sub(Duration::from_millis(headers.sent_millis)),
+            );
+            if let Some(traceparent) = headers.traceparent {
+                let remote = Span::current().context().with_remote_span_context(
+                    traceparent
+                        .borrow()
+                        .try_into()
+                        .map_err(|err| Error::new(ErrorKind::InvalidData, err))?,
+                );
+                Span::current().set_parent(remote);
+            }
+        }
         protocol_message
             .payload
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing payload"))
@@ -225,4 +246,10 @@ impl Router {
         }
         Ok(())
     }
+}
+
+fn since_unix_epoch() -> Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("infallible")
 }

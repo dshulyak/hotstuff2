@@ -4,6 +4,10 @@ use std::borrow::Borrow;
 
 use anyhow::Result;
 use hotstuff2::types;
+use opentelemetry::{
+    trace::{SpanContext, TraceContextExt, TraceFlags, TraceState},
+    Context,
+};
 
 impl From<&types::Signed<types::Vote>> for Vote {
     fn from(vote: &types::Signed<types::Vote>) -> Self {
@@ -308,5 +312,35 @@ impl TryInto<types::Message> for &protocol::Payload {
             protocol::Payload::Sync(sync) => Ok(types::Message::Sync(sync.try_into()?)),
             _ => Err(anyhow::anyhow!("invalid payload")),
         }
+    }
+}
+
+impl From<&Context> for TraceParent {
+    fn from(span: &Context) -> Self {
+        let span = span.span();
+        let span_context = span.span_context();
+        let traceid = span_context.trace_id();
+        let spanid = u64::from_be_bytes(span_context.span_id().to_bytes());
+        let flags = span_context.trace_flags() & TraceFlags::SAMPLED;
+        TraceParent {
+            version: 0,
+            trace_id: traceid.to_bytes().to_vec(),
+            parent_id: spanid,
+            trace_flags: flags.to_u8().into(),
+        }
+    }
+}
+
+impl TryInto<SpanContext> for &TraceParent {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> Result<SpanContext> {
+        Ok(SpanContext::new(
+            u128::from_be_bytes(self.trace_id.as_slice().try_into()?).into(),
+            self.parent_id.into(),
+            TraceFlags::new(self.trace_flags.try_into()?),
+            true,
+            TraceState::default(),
+        ))
     }
 }

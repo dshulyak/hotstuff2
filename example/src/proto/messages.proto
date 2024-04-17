@@ -4,9 +4,9 @@ package hotstuff.messages;
 
 message TraceParent {
     uint32 version = 1;
-    bytes traceid = 2;
-    bytes parentid = 3;
-    uint32 traceflags = 4;
+    bytes trace_id = 2;
+    uint64 parent_id = 3;
+    uint32 trace_flags = 4;
 }
 
 message Headers {
