@@ -13,10 +13,9 @@ use tokio::select;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::time::{interval, Instant};
 
-use crate::codec::{AsyncEncode, Protocol};
 use crate::context::Context;
 use crate::history::History;
-use crate::net::{MsgStream, Router};
+use crate::net::{MsgStream, Router, Protocol};
 use crate::proto::{self, protocol};
 
 pub(crate) const GOSSIP_PROTOCOL: Protocol = Protocol::new(1);
@@ -209,16 +208,15 @@ async fn consume_messages(
             Some(msg) => msg?.borrow().try_into()?,
         };
         let start = Instant::now();
-        let id = msg.short_id().await.unwrap();
-        tracing::debug!(id = %id, remote = ?stream.remote(), msg = %msg, "on gossip message");
+        tracing::debug!(remote = ?stream.remote(), msg = %msg, "on gossip message");
         if let Err(err) = consensus.on_message(msg) {
-            tracing::warn!(id = %id, error = ?err, remote = ?stream.remote(), "failed to process gossip message");
+            tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process gossip message");
         }
         let elapsed = start.elapsed();
         if elapsed > Duration::from_millis(10) {
-            tracing::warn!(id = %id, remote = ?stream.remote(), elapsed = ?elapsed, "slow gossip message processing");
+            tracing::warn!(remote = ?stream.remote(), elapsed = ?elapsed, "slow gossip message processing");
         } else {
-            tracing::debug!(id = %id, remote = ?stream.remote(), elapsed = ?elapsed, "processed gossip message");
+            tracing::debug!(remote = ?stream.remote(), elapsed = ?elapsed, "processed gossip message");
         }
     }
 }
@@ -326,11 +324,10 @@ pub(crate) async fn process_actions(
     while let Some(Some(action)) = ctx.select(receiver.recv()).await {
         match action {
             Action::Send(msg, to) => {
-                let id = msg.short_id().await.unwrap();
                 if let Some(to) = &to {
-                    tracing::debug!(id = %id, msg = %msg, to=%to, "sent direct message");
+                    tracing::debug!(msg = %msg, to=%to, "sent direct message");
                 } else {
-                    tracing::debug!(id = %id, msg = %msg, "sent message");
+                    tracing::debug!(msg = %msg, "sent message");
                 }
                 match to {
                     None => {
@@ -532,7 +529,7 @@ mod tests {
             commit: Some(history.last_commit()),
         });
         let mut reader = Builder::new();
-        reader.read(&msg.encode_to_bytes().await.unwrap());
+        reader.read(&empty_headers_message(msg.borrow().into()));
         let mut writer = Builder::new();
 
         let stream = MsgStream::new(
@@ -615,20 +612,17 @@ mod tests {
 
         let mut reader = Builder::new();
         let mut writer = Builder::new();
-
-        writer.write(&Hello { proofs: &proofs }.encode_to_bytes().await.unwrap());
+        
+        let hello = protocol::Payload::Hello(proto::Hello {
+            proofs: proofs.iter().map(|pop| pop.into()).collect::<Vec<_>>(),
+        });
+        writer.write(&empty_headers_message(hello));
 
         reader.read(
-            &Message::Wish(wish(1.into(), 1))
-                .encode_to_bytes()
-                .await
-                .unwrap(),
+            &empty_headers_message(Message::Wish(wish(1.into(), 1)).borrow().into())
         );
         reader.read(
-            &Message::Wish(wish(1.into(), 2))
-                .encode_to_bytes()
-                .await
-                .unwrap(),
+            &empty_headers_message(Message::Wish(wish(1.into(), 2)).borrow().into())
         );
 
         let stream = MsgStream::new(
@@ -649,14 +643,14 @@ mod tests {
         let mut reader = Builder::new();
         let mut writer = Builder::new();
 
-        reader.read(&Len::new(0).encode_to_bytes().await.unwrap());
+        reader.read(&empty_headers_message(protocol::Payload::Hello(proto::Hello::default())));
 
         let to_send = (1..=3)
             .into_iter()
             .map(|i| Message::Wish(wish(1.into(), i)))
             .collect::<Vec<_>>();
         for msg in to_send.iter() {
-            writer.write(&msg.encode_to_bytes().await.unwrap());
+            writer.write(&empty_headers_message(msg.into()));
         }
 
         let router = Router::new(100);

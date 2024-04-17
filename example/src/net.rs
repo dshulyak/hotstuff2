@@ -8,8 +8,27 @@ use prost::{decode_length_delimiter, Message as ProstMessage};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, Result};
 use tokio::sync::mpsc;
 
-use crate::codec::{AsyncDecode, AsyncEncode, Protocol};
 use crate::proto::{self, protocol};
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Protocol(u16);
+
+impl Protocol {
+    pub(crate) const fn new(v: u16) -> Self {
+        Protocol(v)
+    }
+
+    async fn encode<W: AsyncWriteExt + Unpin + Send>(&self, w: &mut W) -> Result<()> {
+        w.write_u16(self.0).await?;
+        Ok(())
+    }
+
+    async fn decode<R: AsyncReadExt + Unpin + Send>(r: &mut R) -> Result<Self> {
+        let v = r.read_u16().await?;
+        Ok(Protocol(v))
+    }
+}
 
 pub(crate) struct Connection(quinn::Connection);
 

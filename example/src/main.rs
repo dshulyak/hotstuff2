@@ -14,7 +14,6 @@ use sdk::Resource;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod proto;
-mod codec;
 mod context;
 mod history;
 mod net;

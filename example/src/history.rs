@@ -4,9 +4,7 @@ use hotstuff2::{
     types::{Certificate, ToBytes, View, Vote},
 };
 use parking_lot::Mutex;
-use sqlx::{migrate::MigrateDatabase, Row, Sqlite, SqlitePool};
-
-use crate::codec::{AsyncDecode, AsyncEncode};
+use sqlx::{migrate::MigrateDatabase, sqlite::SqliteRow, Row, Sqlite, SqlitePool};
 
 pub(crate) async fn inmemory() -> Result<SqlitePool> {
     sqlite("sqlite::memory:").await
@@ -36,15 +34,24 @@ fn schema() -> &'static str {
     create table if not exists safety (
         tag integer primary key not null,
         voted integer not null,
-        locked blob not null,
-        timeout blob
+        locked_height integer not null,
+        locked_view integer not null,
+        locked_block_id char(32) not null,
+        locked_prev char(32) not null,
+        locked_signature blob not null,
+        locked_signers blob not null,
+        timeout_view integer,
+        timeout_signature blob,
+        timeout_signers blob
     ) without rowid;
 
     create table if not exists history (
         height integer primary key not null,
         view integer not null,
-        block char(32) not null,
-        certificate blob not null
+        block_id char(32) not null,
+        block_prev char(32) not null,
+        signature blob not null,
+        signers blob not null
     );
     create unique index if not exists history_by_view on history(view asc);
     "#
@@ -57,63 +64,122 @@ pub(crate) async fn insert_genesis(pool: &SqlitePool, genesis: &Certificate<Vote
     if count == 1 {
         return Ok(());
     }
-    sqlx::query("insert into safety (tag, voted, locked) values (?, ?, ?)")
+    sqlx::query("insert into safety 
+        (tag, voted, locked_height, locked_view, locked_block_id, locked_prev, locked_signature, locked_signers) 
+        values (?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(SAFETY_TAG)
         .bind(genesis.inner.view.0 as i64)
-        .bind(genesis.encode_to_bytes().await?)
+        .bind(genesis.inner.height as i64)
+        .bind(genesis.inner.view.0 as i64)
+        .bind(genesis.inner.block.id.as_bytes())
+        .bind(genesis.inner.block.prev.as_bytes())
+        .bind(genesis.signature.to_bytes())
+        .bind(genesis.signers.to_bytes())
         .execute(pool)
         .await
         .context("insert genesis")?;
     Ok(())
 }
 
-pub(crate) async fn get_voted_locked_timeout(pool: &SqlitePool) -> Result<(View, Certificate<Vote>, Option<Certificate<View>>)> {
-    let row = sqlx::query("select voted, locked, timeout from safety where tag = ?")
-        .bind(SAFETY_TAG)
-        .fetch_one(pool)
-        .await
-        .context("fetch safety")?;
+pub(crate) async fn get_voted_locked_timeout(
+    pool: &SqlitePool,
+) -> Result<(View, Certificate<Vote>, Option<Certificate<View>>)> {
+    let row = sqlx::query(
+        "select voted, 
+        locked_height, locked_view, locked_block_id, locked_prev, locked_signature, locked_signers, 
+        timeout_view, timeout_signature, timeout_signers 
+        from safety where tag = ?",
+    )
+    .bind(SAFETY_TAG)
+    .fetch_one(pool)
+    .await
+    .context("fetch safety")?;
+
     let voted: i64 = row.get(0);
-    let locked = Certificate::decode_from_bytes(row.get(1))
-        .await
-        .context("decode locked")?;
-    let buf: &[u8] = row.get(2);
-    if buf.is_empty() {
-        return Ok((View(voted as u64), locked, None));
-    }
-    let timeout = Certificate::decode_from_bytes(buf)
-        .await
-        .context("decode timeout")?;
-    Ok((View(voted as u64), locked, Some(timeout)))
+    let locked = {
+        let locked_height: i64 = row.get(1);
+        let locked_view: i64 = row.get(2);
+        let locked_id: &[u8] = row.get(3);
+        let locked_prev: &[u8] = row.get(4);
+        let signature: &[u8] = row.get(5);
+        let signers: &[u8] = row.get(6);
+        Certificate::<Vote> {
+            inner: Vote {
+                view: View(locked_view as u64),
+                block: hotstuff2::types::Block {
+                    height: locked_height as u64,
+                    id: locked_id.try_into().context("locked id")?,
+                    prev: locked_prev.try_into().context("locked prev")?,
+                },
+            },
+            signature: signature.try_into().context("locked signature")?,
+            signers: signers.try_into().context("locked signers")?,
+        }
+    };
+    let timeout = {
+        let timeout_view: Option<i64> = row.get(7);
+        match timeout_view {
+            None => None,
+            Some(view) => {
+                let timeout_signature: &[u8] = row.get(8);
+                let timeout_signers: &[u8] = row.get(9);
+                Some(Certificate::<View> {
+                    inner: View(view as u64),
+                    signature: timeout_signature.try_into().context("timeout signature")?,
+                    signers: timeout_signers.try_into().context("timeout signers")?,
+                })
+            }
+        }
+    };
+    Ok((View(voted as u64), locked, timeout))
+}
+
+fn decode_row_into_cert(rst: Option<SqliteRow>) -> Option<Certificate<Vote>> {
+    rst.map(|row| {
+        let height: i64 = row.get(0);
+        let view: i64 = row.get(1);
+        let block_id: &[u8] = row.get(2);
+        let block_prev: &[u8] = row.get(3);
+        let signature: &[u8] = row.get(4);
+        let signers: &[u8] = row.get(5);
+        Certificate::<Vote> {
+            inner: Vote {
+                view: View(view as u64),
+                block: hotstuff2::types::Block {
+                    height: height as u64,
+                    id: block_id.try_into().context("block id").unwrap(),
+                    prev: block_prev.try_into().context("block prev").unwrap(),
+                },
+            },
+            signature: signature.try_into().context("signature").unwrap(),
+            signers: signers.try_into().context("signers").unwrap(),
+        }
+    })
 }
 
 pub(crate) async fn get_last_commit(pool: &SqlitePool) -> Result<Option<Certificate<Vote>>> {
-    let rst = sqlx::query("select certificate from history order by view desc limit 1")
-        .fetch_optional(pool).await
+    let rst = sqlx::query("
+    select height, view, block_id, block_prev, signature, signers 
+    from history order by view desc limit 1")
+        .fetch_optional(pool)
+        .await
         .context("fetch last commit")?;
-    if let Some(row) = rst {
-        let buf: &[u8] = row.get(0);
-        Ok(Some(Certificate::decode_from_bytes(buf).await?))
-    } else {
-        Ok(None)
-    }
+    Ok(decode_row_into_cert(rst))
 }
 
 async fn first_commit_after_view(
     pool: &SqlitePool,
     view: View,
 ) -> Result<Option<Certificate<Vote>>> {
-    let rst = sqlx::query("select certificate from history where view >= ? order by view asc limit 1")
-        .bind(view.0 as i64)
-        .fetch_optional(pool)
-        .await
-        .context("fetch first commit after view")?;
-    if let Some(row) = rst {
-        let buf: &[u8] = row.get(0);
-        Ok(Some(Certificate::decode_from_bytes(buf).await?))
-    } else {
-        Ok(None)
-    }
+    let rst = sqlx::query(
+        "select height, view, block_id, block_prev, signature, signers
+            from history where view >= ? order by view asc limit 1",
+    )
+    .bind(view.0 as i64)
+    .fetch_optional(pool)
+    .await
+    .context("fetch first commit after view")?;
+    Ok(decode_row_into_cert(rst))
 }
 
 async fn update_state_change(pool: &SqlitePool, change: &StateChange) -> Result<()> {
@@ -127,34 +193,60 @@ async fn update_state_change(pool: &SqlitePool, change: &StateChange) -> Result<
             .context("update voted")?;
     }
     if let Some(locked) = &change.locked {
-        sqlx::query("update safety set locked = ? where tag = ?")
-            .bind(locked.encode_to_bytes().await?)
-            .bind(SAFETY_TAG)
-            .execute(&mut *tx)
-            .await
-            .context("update locked")?;
+        sqlx::query(
+            "update safety set 
+            locked_height = ?, 
+            locked_view = ?, 
+            locked_block_id = ?, 
+            locked_prev = ?, 
+            locked_signature = ?, 
+            locked_signers =? 
+            where tag = ?",
+        )
+        .bind(locked.inner.block.height as i64)
+        .bind(locked.inner.view.0 as i64)
+        .bind(locked.inner.block.id.as_bytes())
+        .bind(locked.inner.block.prev.as_bytes())
+        .bind(locked.signature.to_bytes())
+        .bind(locked.signers.to_bytes())
+        .bind(SAFETY_TAG)
+        .execute(&mut *tx)
+        .await
+        .context("update locked")?;
     }
     if let Some(timeout) = &change.timeout {
-        sqlx::query("update safety set timeout = ? where tag = ?")
-            .bind(timeout.encode_to_bytes().await?)
-            .bind(SAFETY_TAG)
-            .execute(&mut *tx)
-            .await
-            .context("update timeout")?;
+        sqlx::query(
+            "update safety set 
+            timeout_view = ?,
+            timeout_signature = ?, 
+            timeout_signers = ? 
+            where tag = ?",
+        )
+        .bind(timeout.inner.0 as i64)
+        .bind(timeout.signature.to_bytes())
+        .bind(timeout.signers.to_bytes())
+        .bind(SAFETY_TAG)
+        .execute(&mut *tx)
+        .await
+        .context("update timeout")?;
     }
     if let Some(commit) = &change.commit {
         sqlx::query(
             "
-insert into history (view, height, block, certificate) values (?1, ?2, ?3, ?4)
-on conflict(height) do update set view=?1, certificate=?4;            
-        ")
-            .bind(commit.inner.view.0 as i64)
-            .bind(commit.inner.height as i64)
-            .bind(commit.inner.block.to_bytes())
-            .bind(commit.encode_to_bytes().await?)
-            .execute(&mut *tx)
-            .await
-            .context("insert commit")?;
+insert or replace into history 
+(view, height, block_id, block_prev, signature, signers) 
+values (?1, ?2, ?3, ?4, ?5, ?6);            
+        ",
+        )
+        .bind(commit.inner.view.0 as i64)
+        .bind(commit.inner.height as i64)
+        .bind(commit.inner.block.id.as_bytes())
+        .bind(commit.inner.block.prev.as_bytes())
+        .bind(commit.signature.to_bytes())
+        .bind(commit.signers.to_bytes())
+        .execute(&mut *tx)
+        .await
+        .context("insert commit")?;
     }
     tx.commit().await.context("commit tx")?;
     Ok(())
@@ -166,7 +258,6 @@ struct State {
     locked: Option<Certificate<Vote>>,
     committed: Option<Certificate<Vote>>,
 }
-
 
 impl State {
     pub(crate) fn voted(&self) -> View {
@@ -210,7 +301,7 @@ impl State {
 
 pub(crate) struct History {
     db: SqlitePool,
-    state: Mutex<State>
+    state: Mutex<State>,
 }
 
 impl History {
