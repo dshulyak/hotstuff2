@@ -179,8 +179,66 @@ sequenceDiagram
     N1->>N3: vote view=7
     N2->>N3: vote view=7
     N3->>N3: vote view=7
-    N4->>N4: vote view=7
+    N4->>N3: vote view=7
 ```
+
+### Pipelined
+
+#### Happy path
+
+```mermaid
+sequenceDiagram
+    participant N1
+    participant N2
+    participant N3
+    participant N4
+
+    N1->>N1: propose view=1 lock=0 commit=0
+    N1->>N2: propose view=1 lock=0 commit=0
+    N1->>N3: propose view=1 lock=0 commit=0
+    N1->>N4: propose view=1 lock=0 commit=0
+
+    N1->>N2: vote view=1
+    N2->>N2: vote view=1
+    N3->>N2: vote view=1
+    N4->>N2: vote view=1
+
+    N2->>N1: propose view=2 lock=1 commit=0
+    N2->>N2: propose view=2 lock=1 commit=0
+    N2->>N3: propose view=2 lock=1 commit=0
+    N2->>N4: propose view=2 lock=1 commit=0
+
+    
+
+    N1->>N3: vote view=2
+    N2->>N3: vote view=2
+    N3->>N3: vote view=2
+    N4->>N3: vote view=2
+
+    N3->>N1: propose view=3 lock=2 commit=1
+    N3->>N3: propose view=3 lock=2 commit=1
+    N3->>N4: propose view=3 lock=2 commit=1
+
+    %% optimistic delay 1
+
+    N1->>N4: vote view=3
+    N3->>N4: vote view=3
+    N4->>N4: vote view=3
+
+    %% optimistic delay 2
+
+    N4->>N2: propose view=4 lock=3 commit=2
+    N4->>N3: propose view=4 lock=3 commit=2
+    N4->>N4: propose view=4 lock=3 commit=2
+
+    N2->>N1: vote view=4
+```
+
+#### Why propose message carries a commit certificate?
+
+On the example above i illustrated condition where N3 failed to deliver proposal to N2. Message from N4 would be rejected by N2 if commit certificate wasn't attached.
+
+The other way to think about it is that I would expect that single round of communication between N3 to N2 is shorter then 2 minimal (optimistic delays). This seems to be a bit more strict then assumptions in sequential version.
 
 ## Useful links
 

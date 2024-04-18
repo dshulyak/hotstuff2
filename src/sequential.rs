@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::ops::Index;
 
 use anyhow::{anyhow, ensure, Ok, Result};
-use bit_vec::BitVec;
 use parking_lot::Mutex;
 
 use crate::{crypto, types::*};
+use crate::common::{Signers, Votes};
 
 // TIMEOUT should be sufficient to:
 // - 2 delays for a leader to receive latest lock 
@@ -109,7 +108,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             })
             .collect();
         Self {
-            participants: Signers(participants),
+            participants: Signers::new(participants),
             keys,
             actions: actions,
             state: Mutex::new(State {
@@ -550,7 +549,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
     }
 
     #[tracing::instrument(skip(self, signed, signature, signers))]
-    fn verify_certificate(&self, domain: Domain, signed: &impl ToBytes, signature: &AggregateSignature, signers: &BitVec) -> Result<()> {
+    fn verify_certificate(&self, domain: Domain, signed: &impl ToBytes, signature: &AggregateSignature, signers: &Bitfield) -> Result<()> {
         ensure!(
             signers.iter().filter(|b| *b).count() == self.participants.honest_majority(),
             "must be signed by honest majority"
@@ -731,85 +730,5 @@ impl State {
             self.ticks,
         );
         Ok(proposal)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Signers(Box<[PublicKey]>);
-
-impl Signers {
-    fn decode<'a>(&'a self, bits: &'a BitVec) -> impl IntoIterator<Item = &'a PublicKey> {
-        bits.iter()
-            .enumerate()
-            .filter(|(_, b)| *b)
-            .map(|(i, _)| &self.0[i])
-    }
-
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    fn atleast_one_honest(&self) -> usize {
-        self.0.len() / 3 + 1
-    }
-
-    fn honest_majority(&self) -> usize {
-        self.0.len() * 2 / 3 + 1
-    }
-
-    fn leader(&self, view: View) -> Signer {
-        let i = view % self.0.len() as u64;
-        i as Signer
-    }
-
-    fn leader_pub_key(&self, view: View) -> PublicKey {
-        self[self.leader(view)].clone()
-    }
-}
-
-impl Index<u16> for Signers {
-    type Output = PublicKey;
-    fn index(&self, index: u16) -> &Self::Output {
-        &self.0[index as usize]
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Votes<T: ToBytes + Clone + Debug> {
-    signers: BitVec,
-    votes: Vec<Signed<T>>,
-}
-
-impl<T: ToBytes + Clone + Debug> Votes<T> {
-    fn new(n: usize) -> Self {
-        Self {
-            signers: BitVec::from_elem(n, false),
-            votes: Vec::new(),
-        }
-    }
-
-    fn voted(&self, signer: Signer) -> bool {
-        self.signers.get(signer as usize).map_or(false, |b| b)
-    }
-
-    fn add(&mut self, vote: Signed<T>) {
-        self.signers.set(vote.signer as usize, true);
-        self.votes.push(vote);
-    }
-
-    fn count(&self) -> usize {
-        self.signers().iter().filter(|b| *b).count()
-    }
-
-    fn signers(&self) -> BitVec {
-        self.signers.clone()
-    }
-
-    fn signatures<'a>(&'a self) -> impl IntoIterator<Item = &'a Signature> {
-        self.votes.iter().map(|v| &v.signature)
-    }
-
-    fn message(&self) -> T {
-        self.votes[0].inner.clone()
     }
 }

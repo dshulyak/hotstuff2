@@ -165,6 +165,10 @@ impl Bitfield {
     pub fn new() -> Self {
         Bitfield(BitVec::new())
     }
+
+    pub fn from_elem(n: usize, elem: bool) -> Self {
+        Bitfield(BitVec::from_elem(n, elem))
+    }
 }
 
 impl Deref for Bitfield {
