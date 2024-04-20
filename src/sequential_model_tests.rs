@@ -11,7 +11,7 @@ use itertools::Itertools;
 
 use crate::{
     crypto,
-    sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer, TIMEOUT},
+    sequential::{Event, Events, Consensus, OnDelay, OnMessage, Proposer, TIMEOUT},
     types::{
         AggregateSignature, Block, Certificate, Message, PrivateKey, PublicKey, Sync as SyncMsg,
         Timeout, View, Vote, ID,
@@ -33,20 +33,20 @@ fn genesis() -> Certificate<Vote> {
 }
 
 #[derive(Debug)]
-struct Sink(RefCell<Vec<Action>>);
+struct Sink(RefCell<Vec<Event>>);
 
 impl Sink {
     fn new() -> Self {
         Sink(RefCell::new(vec![]))
     }
 
-    fn drain(&self) -> Vec<Action> {
+    fn drain(&self) -> Vec<Event> {
         self.0.borrow_mut().drain(..).collect()
     }
 }
 
-impl Actions for Sink {
-    fn send(&self, action: Action) {
+impl Events for Sink {
+    fn send(&self, action: Event) {
         self.0.borrow_mut().push(action);
     }
 }
@@ -397,9 +397,9 @@ impl Model {
         let mut queue = self.consensus.keys().collect::<Vec<_>>();
         while let Some(id) = queue.pop() {
             let consensus = self.consensus.get(id).unwrap();
-            for action in consensus.sink().drain() {
+            for action in consensus.events().drain() {
                 match action {
-                    Action::StateChange(change) => {
+                    Event::StateChange(change) => {
                         if let Some(lock) = change.locked {
                             tracing::debug!(
                                 "{}, locking block {:?} in view {} on node {:?}",
@@ -434,7 +434,7 @@ impl Model {
                             self.timeouts.insert(*id, timeout);
                         }
                     }
-                    Action::Send(msg, target) => {
+                    Event::Send(msg, target) => {
                         if let Some(target) = target {
                             if let Some(route) = self.public_key_to_node.get(&target) {
                                 let targets = route
@@ -482,7 +482,7 @@ impl Model {
                             self.inboxes.get_mut(id).unwrap().push(msg);
                         }
                     }
-                    Action::Propose => {
+                    Event::Propose => {
                         let nonce = self.proposals_counter.get(id).unwrap_or(&0);
                         let mut block_id = [0u8; 32];
                         block_id[0..8].copy_from_slice(&nonce.to_be_bytes());

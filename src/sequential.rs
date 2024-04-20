@@ -6,7 +6,7 @@ use anyhow::{anyhow, ensure, Ok, Result};
 use parking_lot::Mutex;
 
 use crate::{crypto, types::*};
-use crate::common::{Signers, Votes};
+use crate::common::{Participants, Votes};
 
 // TIMEOUT should be sufficient to:
 // - 2 delays for a leader to receive latest lock 
@@ -50,7 +50,7 @@ impl StateChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
+pub enum Event {
     StateChange(StateChange),
 
     // send message, optionally include participant that should receive this message.
@@ -73,22 +73,22 @@ pub trait Proposer {
     fn propose(&self, block: ID) -> Result<()>;
 }
 
-pub trait Actions: Debug {
-    fn send(&self, action: Action);
+pub trait Events: Debug {
+    fn send(&self, action: Event);
 }
 
 #[derive(Debug)]
-pub struct Consensus<T: Actions, C: crypto::Backend = crypto::BLSTBackend> {
+pub struct Consensus<T: Events, C: crypto::Backend = crypto::BLSTBackend> {
     // participants must be sorted lexicographically across all participating nodes.
     // used to decode public keys by reference.
-    participants: Signers,
+    participants: Participants,
     keys: HashMap<Signer, PrivateKey>,
-    actions: T,
+    events: T,
     state: Mutex<State>,
     crypto: PhantomData<C>,
 }
 
-impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
+impl<T: Events, C: crypto::Backend> Consensus<T, C> {
     pub fn new(
         view: View,
         participants: Box<[PublicKey]>,
@@ -108,9 +108,9 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             })
             .collect();
         Self {
-            participants: Signers::new(participants),
+            participants: participants.into(),
             keys,
-            actions: actions,
+            events: actions,
             state: Mutex::new(State {
                 view,
                 voted,
@@ -131,8 +131,8 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
         self.keys.iter().map(|(signer, key)| (*signer, key.public()))
     }
 
-    pub fn sink(&self) -> &T {
-        &self.actions
+    pub fn events(&self) -> &T {
+        &self.events
     }
 
     pub(crate) fn is_leader(&self, view: View) -> bool {
@@ -146,11 +146,11 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
     }
 
     fn send_all(&self, msg: Message) {
-        self.actions.send(Action::Send(msg, None));
+        self.events.send(Event::Send(msg, None));
     }
 
     fn send_leader(&self, msg: Message, view: View) {
-        self.actions.send(Action::Send(
+        self.events.send(Event::Send(
             msg,
             Some(self.participants.leader_pub_key(view)),
         ));
@@ -205,7 +205,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             }
         }
         if !change.is_empty() {
-            self.actions.send(Action::StateChange(change));
+            self.events.send(Event::StateChange(change));
         }
         Ok(())
     }
@@ -225,13 +225,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 .timeouts
                 .entry(wish.inner.view)
                 .or_insert_with(|| Votes::new(self.participants.len()));
-            ensure!(
-                !wishes.voted(wish.signer),
-                "signer {} already casted wish for view {:?}",
-                wish.signer,
-                wish.inner.view,
-            );
-            wishes.add(wish);
+            wishes.add(wish)?;
             if wishes.count() == self.participants.honest_majority() {
                 Some(wishes.clone())
             } else {
@@ -275,7 +269,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             }),
             state.view,
         );
-        self.actions.send(Action::StateChange(StateChange {
+        self.events.send(Event::StateChange(StateChange {
             timeout: Some(timeout.certificate),
             ..StateChange::new()
         }));
@@ -355,7 +349,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             change.voted = Some(state.voted);
         };
         if !change.is_empty() {
-            self.actions.send(Action::StateChange(change));
+            self.events.send(Event::StateChange(change));
         }
         self.keys.iter().for_each(|(signer, pk)| {
             let vote = Vote {
@@ -405,7 +399,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
             change.locked = Some(state.locked.clone());
         }
         if !change.is_empty() {
-            self.actions.send(Action::StateChange(change));
+            self.events.send(Event::StateChange(change));
         }
 
         let locked: Certificate<Vote> = prepare.inner.certificate;
@@ -444,11 +438,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 .votes
                 .entry((vote.inner.view, vote.inner.block.clone()))
                 .or_insert_with(|| Votes::new(self.participants.len()));
-            ensure!(
-                !votes.voted(vote.signer),
-                "signer {} already voted", vote.signer,
-            );
-            votes.add(vote.clone());
+            votes.add(vote.clone())?;
             if votes.count() == self.participants.honest_majority() {
                 Some(votes.clone())
             } else {
@@ -504,12 +494,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 .votes2
                 .entry((vote.inner.view, vote.inner.block.clone()))
                 .or_insert_with(|| Votes::new(self.participants.len()));
-            ensure!(
-                !votes.voted(vote.signer),
-                "signer {} already voted",
-                vote.signer
-            );
-            votes.add(vote);
+            votes.add(vote)?;
             if votes.count() == self.participants.honest_majority() {
                 Some(votes.clone())
             } else {
@@ -533,7 +518,7 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
                 locked: votes.message().clone(),
                 commit: cert,
             });
-            self.actions.send(Action::Propose);
+            self.events.send(Event::Propose);
         }
         Ok(())
     }
@@ -551,14 +536,14 @@ impl<T: Actions, C: crypto::Backend> Consensus<T, C> {
     #[tracing::instrument(skip(self, signed, signature, signers))]
     fn verify_certificate(&self, domain: Domain, signed: &impl ToBytes, signature: &AggregateSignature, signers: &Bitfield) -> Result<()> {
         ensure!(
-            signers.iter().filter(|b| *b).count() == self.participants.honest_majority(),
+            signers.count() == self.participants.honest_majority(),
             "must be signed by honest majority"
         );
-        C::verify_aggregated(domain, self.participants.decode(&signers),signature, &signed.to_bytes())
+        C::verify_aggregated(domain, self.participants.decode(&signers), signature, &signed.to_bytes())
     }
 }
 
-impl<T: Actions, C: crypto::Backend> OnDelay for Consensus<T, C> {
+impl<T: Events, C: crypto::Backend> OnDelay for Consensus<T, C> {
     fn on_delay(&self) {
         let rst = {
             let mut state = self.state.lock();
@@ -613,7 +598,7 @@ impl<T: Actions, C: crypto::Backend> OnDelay for Consensus<T, C> {
                         locked: state.locked.clone(),
                         commit: state.commit.clone(),
                     });
-                    self.actions.send(Action::Propose);
+                    self.events.send(Event::Propose);
                     (None, None)
                 }
             } else {
@@ -640,7 +625,7 @@ impl<T: Actions, C: crypto::Backend> OnDelay for Consensus<T, C> {
     }
 }
 
-impl<T: Actions, C: crypto::Backend> OnMessage for Consensus<T, C> {
+impl<T: Events, C: crypto::Backend> OnMessage for Consensus<T, C> {
     fn on_message(&self, message: Message) -> Result<()> {
         match message {
             Message::Sync(sync) => self.on_sync(sync),
@@ -654,17 +639,14 @@ impl<T: Actions, C: crypto::Backend> OnMessage for Consensus<T, C> {
     }
 }
 
-impl<T: Actions, C: crypto::Backend> Proposer for Consensus<T, C> {
+impl<T: Events, C: crypto::Backend> Proposer for Consensus<T, C> {
     #[tracing::instrument(
         skip(self), 
         fields(id = %id),
     )]
     fn propose(&self, id: ID) -> Result<()> {
-        let proposal = {
-            let mut proposal = self.state.lock().take_proposal()?;
-            proposal.block.id = id;
-            Ok(proposal)
-        }?;
+        let mut proposal = self.state.lock().take_proposal()?;
+        proposal.block.id = id;
         self.send_proposal(proposal);
         Ok(())
     }

@@ -106,13 +106,25 @@ impl Block {
 
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} prev={} id={}", self.height, self.prev.short_id(), self.id.short_id(),)
+        write!(
+            f,
+            "{} prev={} id={}",
+            self.height,
+            self.prev.short_id(),
+            self.id.short_id(),
+        )
     }
 }
 
 impl Debug for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} prev={} id={}", self.height, self.prev.short_id(), self.id.short_id(),)
+        write!(
+            f,
+            "{} prev={} id={}",
+            self.height,
+            self.prev.short_id(),
+            self.id.short_id(),
+        )
     }
 }
 
@@ -168,6 +180,10 @@ impl Bitfield {
 
     pub fn from_elem(n: usize, elem: bool) -> Self {
         Bitfield(BitVec::from_elem(n, elem))
+    }
+
+    pub fn count(&self) -> u64 {
+        self.iter().filter(|b| *b).count() as u64
     }
 }
 
@@ -417,7 +433,6 @@ impl From<&PublicKey> for Vec<u8> {
     fn from(pk: &PublicKey) -> Vec<u8> {
         pk.to_bytes().to_vec()
     }
-
 }
 
 impl TryInto<PublicKey> for &[u8] {
@@ -427,7 +442,9 @@ impl TryInto<PublicKey> for &[u8] {
         anyhow::ensure!(self.len() == PUBLIC_KEY_SIZE, "invalid public key size");
         let mut bytes = [0; PUBLIC_KEY_SIZE];
         bytes.copy_from_slice(self);
-        Ok(PublicKey(blst::PublicKey::from_bytes(&bytes).map_err(|_| anyhow!("invalid public key"))?))
+        Ok(PublicKey(
+            blst::PublicKey::from_bytes(&bytes).map_err(|_| anyhow!("invalid public key"))?,
+        ))
     }
 }
 
@@ -488,12 +505,12 @@ impl AggregateSignature {
         &self,
         domain: Domain,
         message: &[u8],
-        public_keys: impl IntoIterator<Item = &'a PublicKey>,
+        public_keys: impl IntoIterator<Item = Option<&'a PublicKey>>,
     ) -> Result<()> {
         let pks = public_keys
             .into_iter()
-            .map(|key| &key.0)
-            .collect::<Vec<_>>();
+            .map(|key| key.map_or_else(|| anyhow::bail!("invalid public key"), |key| Ok(&key.0)))
+            .collect::<Result<Vec<_>>>()?;
         match self
             .to_signature()?
             .fast_aggregate_verify(true, message, domain.into(), &pks)
@@ -637,7 +654,12 @@ impl Signature {
         }
     }
 
-    pub fn verify_with_pk(&self, domain: Domain, message: &[u8], public_key: &PublicKey) -> Result<()> {
+    pub fn verify_with_pk(
+        &self,
+        domain: Domain,
+        message: &[u8],
+        public_key: &PublicKey,
+    ) -> Result<()> {
         match self
             .to_blst()?
             .verify(true, message, domain.into(), &[], &public_key.0, true)

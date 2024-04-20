@@ -13,7 +13,7 @@ pub trait Backend {
 
     fn verify_aggregated<'a>(
         domain: Domain,
-        pubks: impl IntoIterator<Item = &'a PublicKey>,
+        pubks: impl IntoIterator<Item = Option<&'a PublicKey>>,
         sig: &AggregateSignature,
         msg: &[u8],
     ) -> Result<()>;
@@ -41,7 +41,7 @@ impl Backend for BLSTBackend {
 
     fn verify_aggregated<'a>(
         domain: Domain,
-        public_keys: impl IntoIterator<Item = &'a PublicKey>,
+        public_keys: impl IntoIterator<Item = Option<&'a PublicKey>>,
         sig: &AggregateSignature,
         msg: &[u8],
     ) -> Result<()> {
@@ -68,7 +68,7 @@ impl Backend for NoopBackend {
 
     fn verify_aggregated<'a>(
         _domain: Domain,
-        _pubks: impl IntoIterator<Item = &'a PublicKey>,
+        _pubks: impl IntoIterator<Item = Option<&'a PublicKey>>,
         _sig: &AggregateSignature,
         _msg: &[u8],
     ) -> Result<()> {

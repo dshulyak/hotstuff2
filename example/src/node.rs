@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_scoped::TokioScope;
-use hotstuff2::sequential::Action;
+use hotstuff2::sequential::Event;
 use hotstuff2::types::{PrivateKey, ProofOfPossession, PublicKey};
 use quinn::TransportConfig;
 use sqlx::SqlitePool;
@@ -161,7 +161,7 @@ pub struct Node {
     router: Router,
     proofs: Box<[ProofOfPossession]>,
     consensus: TokioConsensus,
-    receiver: mpsc::UnboundedReceiver<Action>,
+    receiver: mpsc::UnboundedReceiver<Event>,
     endpoint: quinn::Endpoint,
     local_cert: rustls::Certificate,
     network_delay: Duration,

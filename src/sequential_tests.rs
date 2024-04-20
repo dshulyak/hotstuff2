@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::rc::Rc;
 
 use crate::sequential::{
-    self as seq, Actions, OnDelay, OnMessage, Proposer, StateChange, LEADER_TIMEOUT_DELAY,
+    self as seq, Events, OnDelay, OnMessage, Proposer, StateChange, LEADER_TIMEOUT_DELAY,
 };
 use crate::types::*;
 
@@ -18,7 +18,7 @@ use rand::thread_rng;
 
 #[derive(Debug)]
 struct DequeSink {
-    pub actions: Mutex<Vec<seq::Action>>,
+    pub actions: Mutex<Vec<seq::Event>>,
 }
 
 impl DequeSink {
@@ -28,13 +28,13 @@ impl DequeSink {
         }
     }
 
-    fn drain(&self) -> Vec<seq::Action> {
+    fn drain(&self) -> Vec<seq::Event> {
         self.actions.lock().drain(..).collect()
     }
 }
 
-impl Actions for Rc<DequeSink> {
-    fn send(&self, action: seq::Action) {
+impl Events for Rc<DequeSink> {
+    fn send(&self, action: seq::Event) {
         self.actions.lock().push(action);
     }
 }
@@ -307,7 +307,7 @@ impl Tester {
 struct Instance {
     consensus: Consensus,
     signer: Signer,
-    actions: Vec<seq::Action>,
+    actions: Vec<seq::Event>,
 }
 
 impl Instance {
@@ -356,12 +356,12 @@ impl Instance {
     }
 
     fn send_all(&mut self, message: Message) {
-        self.action(seq::Action::Send(message, None));
+        self.action(seq::Event::Send(message, None));
     }
 
     fn send_one(&mut self, message: Message, to: Signer) {
         let public = self.consensus.c.public_key_by_index(to);
-        self.action(seq::Action::Send(message, Some(public)));
+        self.action(seq::Event::Send(message, Some(public)));
     }
 
     fn state_change(
@@ -371,7 +371,7 @@ impl Instance {
         voted: Option<View>,
         timeout: Option<Certificate<View>>,
     ) {
-        self.action(seq::Action::StateChange(StateChange {
+        self.action(seq::Event::StateChange(StateChange {
             locked: lock,
             commit,
             voted,
@@ -396,7 +396,7 @@ impl Instance {
     }
 
     fn propose(&mut self) {
-        self.action(seq::Action::Propose);
+        self.action(seq::Event::Propose);
     }
 
     fn consume_actions(&mut self) {
@@ -405,12 +405,12 @@ impl Instance {
         }
     }
 
-    fn action(&mut self, action: seq::Action) {
+    fn action(&mut self, action: seq::Event) {
         self.consume_actions();
         assert_eq!(self.actions.drain(0..1).next(), Some(action));
     }
 
-    fn actions(&mut self) -> Vec<seq::Action> {
+    fn actions(&mut self) -> Vec<seq::Event> {
         self.consume_actions();
         self.actions.drain(..).collect()
     }
@@ -451,7 +451,7 @@ impl Instances {
         self.0.iter_mut().for_each(|instance| instance.on_delay());
     }
 
-    fn action(&mut self, action: seq::Action) {
+    fn action(&mut self, action: seq::Event) {
         self.0
             .iter_mut()
             .for_each(|instance| instance.action(action.clone()));
@@ -791,14 +791,14 @@ impl SimState {
         for a in inst.actions() {
             acted = false;
             match a {
-                seq::Action::Send(m, _) => {
+                seq::Event::Send(m, _) => {
                     send_random_messages(m, tester, i as Signer, &mut self.inputs, runner)
                 }
                 // seq::Action::WaitDelay => self.wait_delay[i] = true,
-                seq::Action::Propose => {
+                seq::Event::Propose => {
                     self.propose[i] = Some(thread_rng().gen::<[u8; 32]>());
                 }
-                seq::Action::StateChange(change) => {
+                seq::Event::StateChange(change) => {
                     if let Some(commit) = change.commit {
                         self.commits[i].push(commit);
                     }
@@ -814,14 +814,14 @@ impl SimState {
         for a in inst.actions() {
             acted = false;
             match a {
-                seq::Action::Send(m, _) => self
+                seq::Event::Send(m, _) => self
                     .inputs
                     .iter_mut()
                     .for_each(|input| input.push(m.clone())),
-                seq::Action::Propose => {
+                seq::Event::Propose => {
                     self.propose[i] = Some(thread_rng().gen::<[u8; 32]>());
                 }
-                seq::Action::StateChange(change) => {
+                seq::Event::StateChange(change) => {
                     if let Some(commit) = change.commit {
                         self.commits[i].push(commit);
                     }

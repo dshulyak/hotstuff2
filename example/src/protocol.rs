@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use hotstuff2::sequential::{Action, Actions, Consensus, OnDelay, OnMessage, Proposer};
+use hotstuff2::sequential::{Event, Events, Consensus, OnDelay, OnMessage, Proposer};
 use hotstuff2::types::{
     AggregateSignature, Bitfield, Block, Certificate, Message, PrivateKey, ProofOfPossession, PublicKey, Sync as SyncMsg, Timeout, View, Vote, ID
 };
@@ -25,16 +25,16 @@ pub(crate) const SYNC_PROTOCOL: Protocol = Protocol::new(2);
 pub(crate) type TokioConsensus = Consensus<TokioSink>;
 
 #[derive(Debug)]
-pub(crate) struct TokioSink(mpsc::UnboundedSender<Action>);
+pub(crate) struct TokioSink(mpsc::UnboundedSender<Event>);
 
 impl TokioSink {
-    pub(crate) fn new(sender: mpsc::UnboundedSender<Action>) -> Self {
+    pub(crate) fn new(sender: mpsc::UnboundedSender<Event>) -> Self {
         Self(sender)
     }
 }
 
-impl Actions for TokioSink {
-    fn send(&self, action: Action) {
+impl Events for TokioSink {
+    fn send(&self, action: Event) {
         self.0
             .send(action)
             .expect("consumer should never be dropped before producer");
@@ -320,13 +320,13 @@ pub(crate) async fn process_actions(
     router: &Router,
     local: HashSet<PublicKey>,
     consensus: &(impl Proposer + OnMessage),
-    receiver: &mut mpsc::UnboundedReceiver<Action>,
+    receiver: &mut mpsc::UnboundedReceiver<Event>,
 ) {
     let mut average_latency: f64 = 0.0;
     let mut last = Instant::now();
     while let Some(Some(action)) = ctx.select(receiver.recv()).await {
         match action {
-            Action::Send(msg, to) => {
+            Event::Send(msg, to) => {
                 if let Some(to) = &to {
                     tracing::debug!(msg = %msg, to=%to, "sent direct message");
                 } else {
@@ -352,7 +352,7 @@ pub(crate) async fn process_actions(
                     }
                 }
             }
-            Action::StateChange(change) => {
+            Event::StateChange(change) => {
                 if let Some(commit) = &change.commit {
                     tracing::info_span!("on_block", 
                         view = %commit.inner.view, 
@@ -378,7 +378,7 @@ pub(crate) async fn process_actions(
                     tracing::error!(error = ?err, "state change");
                 };
             }
-            Action::Propose => {
+            Event::Propose => {
                 let id = ID::new(thread_rng().gen::<[u8; 32]>());
                 if let Err(err) = consensus.propose(id) {
                     tracing::error!(error = ?err, "propose block");
