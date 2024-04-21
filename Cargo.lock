@@ -910,7 +910,6 @@ dependencies = [
  "anyhow",
  "bit-vec",
  "blst",
- "ctrlc",
  "hex",
  "itertools 0.12.1",
  "parking_lot",

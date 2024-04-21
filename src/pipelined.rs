@@ -3,7 +3,7 @@ use std::{
     marker::PhantomData,
 };
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use parking_lot::Mutex;
 
 use crate::{
@@ -26,6 +26,7 @@ pub(crate) const TIMEOUT: u8 = 5;
 // after two delays we expect to receive highest certificate and will be ready to create proposal
 pub(crate) const LEADER_TIMEOUT_DELAY: u8 = 2;
 
+#[derive(Debug)]
 pub enum Message {
     Certificate(Certificate<Vote>),
     Propose(Signed<Propose>),
@@ -34,6 +35,7 @@ pub enum Message {
     Timeout(Certificate<View>),
 }
 
+#[derive(Debug)]
 pub enum Event {
     StateChange {
         voted: Option<View>,
@@ -55,10 +57,16 @@ pub trait Events {
 
 #[derive(Debug, Clone)]
 pub struct Propose {
-    view: View,
-    block: Block,
-    lock: Certificate<Vote>,
-    commit: Certificate<Vote>,
+    pub(crate) view: View,
+    pub(crate) block: Block,
+    pub(crate) lock: Certificate<Vote>,
+    pub(crate) commit: Certificate<Vote>,
+}
+
+impl Propose {
+    pub fn block(&self) -> &Block {
+        &self.block
+    }
 }
 
 impl ToBytes for Propose {
@@ -73,7 +81,7 @@ impl ToBytes for Propose {
 }
 
 #[derive(Debug)]
-struct Consensus<EVENTS: Events, CRYPTO: crypto::Backend = crypto::BLSTBackend> {
+pub struct Consensus<EVENTS: Events, CRYPTO: crypto::Backend = crypto::BLSTBackend> {
     participants: Participants,
     keys: HashMap<Signer, PrivateKey>,
     state: Mutex<State>,
@@ -133,16 +141,16 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         fields(view = ?cert.view, height = cert.block.height),
     )]
     pub fn on_synced_certificate(&self, cert: Certificate<Vote>) -> Result<()> {
-        ensure!(cert.height > self.state.lock().chain_height());
+        ensure!(cert.view > self.state.lock().chain_view());
         self.verify_certificate(Domain::Vote, &cert, &cert.signature, &cert.signers)?;
 
         let mut state = self.state.lock();
-        let last_cert = state.chain.last_key_value().map(|(_, cert)| cert).unwrap();
+        let last_cert: &Certificate<Vote> = state.chain.last_key_value().map(|(_, cert)| cert).unwrap();
         ensure!(cert.block.height == last_cert.block.height + 1);
         ensure!(cert.block.prev == last_cert.block.id);
-        
-        let commit = if cert.height == last_cert.height + 1 {
-            Some(cert.height)
+    
+        let commit = if cert.view == last_cert.view + 1 && last_cert.view != View(0) {
+            Some(last_cert.height)
         } else {
             None
         };
@@ -154,6 +162,9 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
                 chain: vec![cert.clone()],
             }
         );
+        if cert.view + 1 > state.view {
+            state.enter_view(cert.view+1);
+        }
         state.update_chain(cert, commit);
         Ok(())
     }
@@ -163,9 +174,7 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         fields(view = ?propose.view, signer = propose.signer, height = propose.block.height),
     )]
     pub fn on_propose(&self, propose: Signed<Propose>) -> Result<()> {
-        ensure!(propose.view >= self.state.lock().view);
         ensure!(propose.signer == self.participants.leader(propose.view));
-
         self.verify_one(Domain::Propose, &propose.inner, &propose.signature, propose.signer)?;
         if propose.block.height > 1 {
             ensure!(propose.block.height == propose.lock.height + 1);
@@ -179,35 +188,34 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
                 self.verify_certificate(Domain::Vote, &propose.commit, &propose.commit.signature, &propose.commit.signers)?;
             }
         }
-        let mut commit = None;
-        let mut update = vec![];
-        {
-            let mut state = self.state.lock();
-            let last_cert = state.chain.last_key_value().map(|(_, cert)| cert).unwrap();
-            if last_cert == &propose.commit {
-                ensure!(propose.lock.height == last_cert.height + 1);
-                ensure!(propose.lock.block.prev == last_cert.block.id);
-                if last_cert.view + 1 == propose.lock.view {
-                    commit = Some(propose.lock.height);
-                };
-                update.push(propose.lock.clone());
-                state.update_chain(propose.lock.clone(), None);
-            } else {
-                ensure!(propose.lock.height == propose.commit.height + 1);
-                ensure!(propose.lock.block.prev == propose.commit.block.id);
-                update.push(propose.commit.clone());
-                update.push(propose.lock.clone());
-                if propose.commit.view + 1 == propose.lock.view {
-                    commit = Some(propose.lock.height);
-                };
-                state.update_chain(propose.commit.clone(), None);
-                state.update_chain(propose.lock.clone(), commit);
-            }
+        
+        let (commit, update) = {
+            let mut state = self.state.lock();        
+            
             if propose.lock.view + 1 > state.view {
                 state.enter_view(propose.lock.view + 1);
             }
             ensure!(propose.view == state.view);
-        }
+            ensure!(propose.view > state.voted);
+            
+            let mut update = vec![];
+            if propose.commit.view > View(2) && !state.is_known_cert(&propose.commit) {
+                update.push(propose.commit.clone());
+                state.update_chain(propose.commit.clone(), None);
+            }
+            let commit = if propose.commit.view + 1 == propose.lock.view {
+                Some(propose.commit.height)
+            } else {
+                None
+            };
+            if propose.lock.view > View(1) {
+                update.push(propose.lock.clone());
+                state.update_chain(propose.lock.clone(), commit.clone());
+            }
+
+            state.voted = propose.view;
+            (commit, update)
+        };
         self.events.send(
             Event::StateChange {
                 voted: Some(propose.view),
@@ -216,17 +224,18 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
                 timeout: None,
             }
         );
+
+        let vote = Vote {
+            view: propose.view,
+            block: propose.block.clone(),
+        };
+        let to_sign = &vote.to_bytes();
         self.keys.iter().for_each(|(signer, pk)| {
-            let vote = Vote {
-                view: propose.view,
-                block: propose.block.clone(),
-            };
-            let signature = CRYPTO::sign(pk, Domain::Vote, &vote.to_bytes());
             self.send_leader(
                 Message::Vote(Signed {
-                    inner: vote,
+                    inner: vote.clone(),
                     signer: *signer,
-                    signature,
+                    signature: CRYPTO::sign(pk, Domain::Vote, to_sign),
                 }),
                 propose.view,
             );
@@ -239,25 +248,30 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         fields(view = ?vote.inner.view, signer = vote.signer, height = vote.inner.height),
     )]
     pub fn on_vote(&self, vote: Signed<Vote>) -> Result<()> {
-        ensure!(vote.view > self.state.lock().view);
+        ensure!(vote.view == self.state.lock().view);
         self.verify_one(Domain::Vote, &vote.inner, &vote.signature, vote.signer)?;
 
         let votes = {
             let mut state = self.state.lock();
-            let votes = state
+            
+            let last_cert = state.chain.last_key_value().map(|(_, cert)| cert).unwrap();
+            ensure!(vote.block.height == last_cert.block.height + 1);
+            ensure!(vote.block.prev == last_cert.block.id);
+
+            let entry = state
                 .votes
                 .entry((vote.view, vote.block.clone()))
                 .or_insert_with(|| Some(Votes::new(self.participants.len())));
-            let take = if let Some(votes) = votes {
-                votes.add(vote)?;
-                votes.count() == self.participants.honest_majority()
-            } else {
-                false
-            };
-            if take {
-                votes.take()
-            } else {
-                None
+            match entry {
+                Some(votes) => {
+                    votes.add(vote)?;
+                    if votes.count() == self.participants.honest_majority() {
+                        entry.take()
+                    } else {
+                        None
+                    }
+                },
+                None => bail!("votes for view {:?} were already aggregated", vote.view),
             }
         };
     
@@ -289,35 +303,28 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         self.verify_one(Domain::Wish, &wish.inner, &wish.signature, wish.signer)?;
         let wishes = {
             let mut state = self.state.lock();
-            let wishes = state
+            let entry = state
                 .timeouts
                 .entry(wish.inner)
                 .or_insert_with(|| Some(Votes::new(self.participants.len())));
-            let cnt = if let Some(wishes) = wishes {
-                wishes.add(wish)?;
-                wishes.count() == self.participants.honest_majority()
-            } else {
-                false
-            };
-            if cnt {
-                wishes.take()
-            } else {
-                None
+            match entry {
+                None => bail!("timeout for view {:?} was already aggregated", wish.inner),
+                Some(wishes) => {
+                    wishes.add(wish)?;
+                    if wishes.count() == self.participants.honest_majority() {
+                        entry.take()
+                    } else {
+                        None
+                    }
+                },
             }
         };
         if let Some(wishes) = wishes {
-            let timeout = Certificate {
+            self.send_all(Message::Timeout(Certificate {
                 inner: wishes.message(),
                 signature: CRYPTO::aggregate(wishes.signatures()).expect("aggregate signatures"),
                 signers: wishes.signers().into(),
-            };
-            self.events.send(Event::StateChange{
-                timeout: Some(timeout.clone()),
-                voted: None,
-                commit: None,
-                chain: vec![],
-            });
-            self.send_all(Message::Timeout(timeout));
+            }));
         }
         Ok(())
     }
@@ -335,6 +342,12 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         } else {
             self.send_certs_to_leader(&mut state);
         }
+        self.events.send(Event::StateChange{
+            timeout: Some(timeout.clone()),
+            voted: None,
+            commit: None,
+            chain: vec![],
+        });
         Ok(())
     }
 
@@ -378,12 +391,13 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
             }
         };
         if let Some(view) = action {
+            // we do it here so that signing is done without holding the state lock
+            let to_sign = &view.to_bytes();
             self.keys.iter().for_each(|(signer, pk)| {
-                let signature = CRYPTO::sign(pk, Domain::Wish, &view.to_bytes());
                 self.send_all(Message::Wish(Signed {
                     inner: view,
                     signer: *signer,
-                    signature,
+                    signature: CRYPTO::sign(pk, Domain::Wish, to_sign),
                 }));
             });
         }
@@ -528,16 +542,18 @@ impl State {
         }
     }
 
-    fn chain_height(&self) -> u64 {
-        self.chain.last_key_value().map_or(0, |(height, _)| *height)
+    fn chain_view(&self) -> View {
+        self.chain.last_key_value().map_or(View(0), |(_, cert)| cert.view)
     }
 
     fn update_chain(&mut self, cert: Certificate<Vote>, commit: Option<u64>) {
-        self.chain.insert(cert.height, cert);
+        let cert_height = cert.height;
+        self.chain.insert(cert_height, cert);
         if let Some(commit) = commit {
             self.committed = commit;
             self.chain.retain(|height, _| height >= &commit);
         }
+        self.chain.retain(|height, _| height <= &height);
     }
 
     fn is_known_cert(&self, cert: &Certificate<Vote>) -> bool {

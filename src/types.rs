@@ -171,7 +171,7 @@ impl ToBytes for Prepare {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bitfield(BitVec);
+pub struct Bitfield(pub(crate) BitVec);
 
 impl Bitfield {
     pub fn new() -> Self {

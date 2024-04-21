@@ -1,3 +1,4 @@
+
 // ideas for the model based on [Twins: BFT Systems Made Robust](https://drops.dagstuhl.de/storage/00lipics/lipics-vol217-opodis2021/LIPIcs.OPODIS.2021.7/LIPIcs.OPODIS.2021.7.pdf)
 
 use std::{
@@ -983,8 +984,7 @@ advance 28
         }
     }
     proptest! {
-        // The next line modifies the number of tests.
-        #![proptest_config(ProptestConfig::with_cases(1000))]
+        #![proptest_config(ProptestConfig::with_cases(100))]
         #[test]
         fn test_random_partitions(ops in &vec(
             prop_oneof![

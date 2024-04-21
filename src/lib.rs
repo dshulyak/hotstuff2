@@ -8,3 +8,5 @@ pub mod types;
 mod sequential_model_tests;
 #[cfg(test)]
 mod sequential_tests;
+#[cfg(test)]
+mod pipelined_tests;
