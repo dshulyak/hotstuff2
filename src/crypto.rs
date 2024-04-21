@@ -36,7 +36,7 @@ impl Backend for BLSTBackend {
     ) -> Result<AggregateSignature> {
         // Aggregate the signatures
         AggregateSignature::aggregate(signatures)
-            .map_err(|err| anyhow::anyhow!("invalid signature: {:?}", err))
+            .map_err(|err: blst::BLST_ERROR| anyhow::anyhow!("invalid signature: {:?}", err))
     }
 
     fn verify_aggregated<'a>(
@@ -68,10 +68,14 @@ impl Backend for NoopBackend {
 
     fn verify_aggregated<'a>(
         _domain: Domain,
-        _pubks: impl IntoIterator<Item = Option<&'a PublicKey>>,
+        pubks: impl IntoIterator<Item = Option<&'a PublicKey>>,
         _sig: &AggregateSignature,
         _msg: &[u8],
     ) -> Result<()> {
+        let _ = pubks
+            .into_iter()
+            .map(|key| key.map_or_else(|| anyhow::bail!("invalid public key"), |key| Ok(key)))
+            .collect::<Result<Vec<_>>>()?;
         Ok(())
     }
 }

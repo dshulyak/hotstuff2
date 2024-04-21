@@ -3,7 +3,7 @@ use std::{
     marker::PhantomData,
 };
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use parking_lot::Mutex;
 
 use crate::{
@@ -26,6 +26,7 @@ pub(crate) const TIMEOUT: u8 = 5;
 // after two delays we expect to receive highest certificate and will be ready to create proposal
 pub(crate) const LEADER_TIMEOUT_DELAY: u8 = 2;
 
+#[derive(Debug)]
 pub enum Message {
     Certificate(Certificate<Vote>),
     Propose(Signed<Propose>),
@@ -34,6 +35,7 @@ pub enum Message {
     Timeout(Certificate<View>),
 }
 
+#[derive(Debug)]
 pub enum Event {
     StateChange {
         voted: Option<View>,
@@ -73,7 +75,7 @@ impl ToBytes for Propose {
 }
 
 #[derive(Debug)]
-struct Consensus<EVENTS: Events, CRYPTO: crypto::Backend = crypto::BLSTBackend> {
+pub struct Consensus<EVENTS: Events, CRYPTO: crypto::Backend = crypto::BLSTBackend> {
     participants: Participants,
     keys: HashMap<Signer, PrivateKey>,
     state: Mutex<State>,
@@ -163,8 +165,12 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         fields(view = ?propose.view, signer = propose.signer, height = propose.block.height),
     )]
     pub fn on_propose(&self, propose: Signed<Propose>) -> Result<()> {
-        ensure!(propose.view >= self.state.lock().view);
         ensure!(propose.signer == self.participants.leader(propose.view));
+        {
+            let state = self.state.lock();
+            ensure!(propose.view >= state.view);
+            ensure!(propose.view > state.voted);
+        }
 
         self.verify_one(Domain::Propose, &propose.inner, &propose.signature, propose.signer)?;
         if propose.block.height > 1 {
@@ -293,31 +299,25 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
                 .timeouts
                 .entry(wish.inner)
                 .or_insert_with(|| Some(Votes::new(self.participants.len())));
-            let cnt = if let Some(wishes) = wishes {
-                wishes.add(wish)?;
-                wishes.count() == self.participants.honest_majority()
-            } else {
-                false
+            let enough = match wishes {
+                None => bail!("timeout for view {:?} was already aggregated", wish.inner),
+                Some(wishes) => {
+                    wishes.add(wish)?;
+                    wishes.count() == self.participants.honest_majority()
+                },
             };
-            if cnt {
+            if enough {
                 wishes.take()
             } else {
                 None
             }
         };
         if let Some(wishes) = wishes {
-            let timeout = Certificate {
+            self.send_all(Message::Timeout(Certificate {
                 inner: wishes.message(),
                 signature: CRYPTO::aggregate(wishes.signatures()).expect("aggregate signatures"),
                 signers: wishes.signers().into(),
-            };
-            self.events.send(Event::StateChange{
-                timeout: Some(timeout.clone()),
-                voted: None,
-                commit: None,
-                chain: vec![],
-            });
-            self.send_all(Message::Timeout(timeout));
+            }));
         }
         Ok(())
     }
@@ -335,6 +335,12 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         } else {
             self.send_certs_to_leader(&mut state);
         }
+        self.events.send(Event::StateChange{
+            timeout: Some(timeout.clone()),
+            voted: None,
+            commit: None,
+            chain: vec![],
+        });
         Ok(())
     }
 
