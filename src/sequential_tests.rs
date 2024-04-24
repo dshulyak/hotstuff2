@@ -1,81 +1,29 @@
 #![allow(dead_code)]
 
 use std::fmt::Debug;
-use std::rc::Rc;
 
+use crate::sequential::testing::GENESIS;
 use crate::sequential::{
-    self as seq, Events, OnDelay, OnMessage, Proposer, StateChange, LEADER_TIMEOUT_DELAY,
+    self as seq, OnDelay, OnMessage, Proposer, StateChange, LEADER_TIMEOUT_DELAY,
 };
 use crate::types::*;
 
 use bit_vec::BitVec;
-use parking_lot::Mutex;
 use proptest::prelude::*;
 use rand::thread_rng;
 
-#[derive(Debug)]
-struct DequeSink {
-    pub actions: Mutex<Vec<seq::Event>>,
-}
-
-impl DequeSink {
-    fn new() -> Self {
-        Self {
-            actions: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn drain(&self) -> Vec<seq::Event> {
-        self.actions.lock().drain(..).collect()
-    }
-}
-
-impl Events for Rc<DequeSink> {
-    fn send(&self, action: seq::Event) {
-        self.actions.lock().push(action);
-    }
-}
-
-#[derive(Debug)]
-struct Consensus {
-    c: seq::Consensus<Rc<DequeSink>>,
-    sink: Rc<DequeSink>,
-}
+type Consensus = seq::Consensus<seq::testing::Sink>;
 
 struct Tester {
     keys: Vec<PrivateKey>,
     genesis: Certificate<Vote>,
 }
 
-pub(crate) fn gen_keys(n: usize) -> Vec<PrivateKey> {
-    let mut keys: Vec<_> = (0..n)
-        .map(|_| {
-            let seed = thread_rng().gen::<[u8; 32]>();
-            PrivateKey::from_seed(&seed)
-        })
-        .collect();
-    keys.sort_by(|a, b| a.public().cmp(&b.public()));
-    keys
-}
-
-const GENESIS: &str = "genesis";
-
-pub(crate) fn gen_genesis() -> Certificate<Vote> {
-    Certificate {
-        inner: Vote {
-            view: 0.into(),
-            block: Block::new(0, ID::default(), GENESIS.into()),
-        },
-        signature: AggregateSignature::empty(),
-        signers: BitVec::new().into(),
-    }
-}
-
 impl Tester {
     fn new(n: usize) -> Self {
         Self {
-            keys: gen_keys(n),
-            genesis: gen_genesis(),
+            keys: seq::testing::privates(n),
+            genesis: seq::testing::genesis(),
         }
     }
 
@@ -88,17 +36,15 @@ impl Tester {
     }
 
     fn active(&self, i: usize) -> Consensus {
-        let deq = Rc::new(DequeSink::new());
-        let c = seq::Consensus::new(
+        seq::Consensus::new(
             View(0),
             self.publics(),
             self.genesis(),
             self.genesis(),
             View(0),
             &self.keys[i..i + 1],
-            deq.clone(),
-        );
-        Consensus { c, sink: deq }
+            seq::testing::Sink::new(),
+        )
     }
 
     fn leader(&self, view: View) -> Signer {
@@ -326,16 +272,15 @@ impl Instance {
     }
 
     fn is_leader(&self, view: View) -> bool {
-        self.consensus.c.is_leader(view)
+        self.consensus.is_leader(view)
     }
 
     fn on_message(&mut self, message: Message) {
-        self.consensus.c.on_message(message).expect("message:");
+        self.consensus.on_message(message).expect("message:");
     }
 
     fn on_message_err(&mut self, message: Message) {
         self.consensus
-            .c
             .on_message(message)
             .expect_err("expected to fail");
     }
@@ -345,11 +290,11 @@ impl Instance {
     }
 
     fn on_delay(&mut self) {
-        self.consensus.c.on_delay();
+        self.consensus.on_delay();
     }
 
     fn on_propose(&mut self, id: &str) {
-        self.consensus.c.propose(ID::from_str(id)).expect("ERROR");
+        self.consensus.propose(ID::from_str(id)).expect("ERROR");
     }
 
     fn send_all(&mut self, message: Message) {
@@ -357,7 +302,7 @@ impl Instance {
     }
 
     fn send_one(&mut self, message: Message, to: Signer) {
-        let public = self.consensus.c.public_key_by_index(to);
+        let public = self.consensus.public_key_by_index(to);
         self.action(seq::Event::Send(message, Some(public)));
     }
 
@@ -397,7 +342,7 @@ impl Instance {
     }
 
     fn consume_actions(&mut self) {
-        for action in self.consensus.sink.drain() {
+        for action in self.consensus.events().drain() {
             self.actions.push(action);
         }
     }
@@ -801,13 +746,13 @@ impl SimState {
         {
             let msgs = &mut self.inputs[i];
             msgs.iter().for_each(|m| {
-                _ = inst.consensus.c.on_message(m.clone());
+                _ = inst.consensus.on_message(m.clone());
             });
             msgs.clear();
         }
         inst.on_delay();
         if let Some(p) = self.propose[i].take() {
-            inst.consensus.c.propose(ID::new(p)).expect("no error");
+            inst.consensus.propose(ID::new(p)).expect("no error");
         }
     }
 }

@@ -714,3 +714,50 @@ impl State {
         Ok(proposal)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    pub(crate) const GENESIS: &str = "genesis";
+
+    pub(crate) fn genesis() -> Certificate<Vote> {
+        Certificate {
+            inner: Vote {
+                view: 0.into(),
+                block: Block::new(0, ID::empty(), GENESIS.into()),
+            },
+            signature: AggregateSignature::empty(),
+            signers: Bitfield::new().into(),
+        }
+    }
+    
+    #[derive(Debug)]
+    pub(crate) struct Sink(RefCell<Vec<Event>>);
+    
+    impl Sink {
+        pub(crate) fn new() -> Self {
+            Sink(RefCell::new(vec![]))
+        }
+    
+        pub(crate) fn drain(&self) -> Vec<Event> {
+            self.0.borrow_mut().drain(..).collect()
+        }
+    }
+    
+    impl Events for Sink {
+        fn send(&self, action: Event) {
+            self.0.borrow_mut().push(action);
+        }
+    }
+    
+    pub(crate) fn privates(n: usize) -> Vec<PrivateKey> {
+        let mut keys = (0..n)
+            .map(|i| PrivateKey::from_seed(&[i as u8; 32]))
+            .collect::<Vec<_>>();
+        keys.sort_by(|a, b| a.public().cmp(&b.public()));
+        keys
+    }
+}
