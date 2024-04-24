@@ -26,7 +26,7 @@ pub(crate) const TIMEOUT: u8 = 5;
 // after two delays we expect to receive highest certificate and will be ready to create proposal
 pub(crate) const LEADER_TIMEOUT_DELAY: u8 = 2;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Message {
     Certificate(Certificate<Vote>),
     Propose(Signed<Propose>),
@@ -132,25 +132,42 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         }
     }
 
+    pub fn public_keys(&self) -> impl IntoIterator<Item = (Signer, PublicKey)> + '_ {
+        self.keys.iter().map(|(signer, key)| (*signer, key.public()))
+    }
+
     pub fn events(&self) -> &EVENTS {
         &self.events
+    }
+
+    pub fn on_message(&self, msg: Message) -> Result<()> {
+        match msg {
+            Message::Certificate(cert) => self.on_synced_certificate(cert),
+            Message::Propose(propose) => self.on_propose(propose),
+            Message::Vote(vote) => self.on_vote(vote),
+            Message::Wish(wish) => self.on_wish(wish),
+            Message::Timeout(timeout) => self.on_timeout(timeout),
+        }
     }
 
     #[tracing::instrument(
         skip(self, cert), 
         fields(view = ?cert.view, height = cert.block.height),
     )]
-    pub fn on_synced_certificate(&self, cert: Certificate<Vote>) -> Result<()> {
+    pub(crate) fn on_synced_certificate(&self, cert: Certificate<Vote>) -> Result<()> {
         ensure!(cert.view > self.state.lock().chain_view());
         self.verify_certificate(Domain::Vote, &cert, &cert.signature, &cert.signers)?;
 
         let mut state = self.state.lock();
         let last_cert: &Certificate<Vote> = state.chain.last_key_value().map(|(_, cert)| cert).unwrap();
-        ensure!(cert.block.height == last_cert.block.height + 1);
-        ensure!(cert.block.prev == last_cert.block.id);
-    
-        let commit = if cert.view == last_cert.view + 1 && last_cert.view != View(0) {
-            Some(last_cert.height)
+        ensure!(cert.view > last_cert.view);
+        let dependency = state.chain.get(&(cert.height - 1));
+        ensure!(dependency.is_some());
+        let dependency = dependency.unwrap();
+        ensure!(dependency.block.id == cert.block.prev);
+
+        let commit = if cert.view == dependency.view + 1 && dependency.view != View(0) {
+            Some(dependency.height)
         } else {
             None
         };
@@ -173,7 +190,8 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         skip(self, propose), 
         fields(view = ?propose.view, signer = propose.signer, height = propose.block.height),
     )]
-    pub fn on_propose(&self, propose: Signed<Propose>) -> Result<()> {
+    pub(crate) fn on_propose(&self, propose: Signed<Propose>) -> Result<()> {
+        tracing::debug!(propose = ?propose, "received propose");
         ensure!(propose.signer == self.participants.leader(propose.view));
         self.verify_one(Domain::Propose, &propose.inner, &propose.signature, propose.signer)?;
         if propose.block.height > 1 {
@@ -190,14 +208,17 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         }
         
         let (commit, update) = {
-            let mut state = self.state.lock();        
-            
+            let mut state = self.state.lock();
+
             if propose.lock.view + 1 > state.view {
                 state.enter_view(propose.lock.view + 1);
             }
             ensure!(propose.view == state.view);
             ensure!(propose.view > state.voted);
             
+            let last_cert = state.chain.last_key_value().map(|(_, cert)| cert).unwrap();
+            ensure!(propose.lock.view >= last_cert.view);
+
             let mut update = vec![];
             if propose.commit.view > View(2) && !state.is_known_cert(&propose.commit) {
                 update.push(propose.commit.clone());
@@ -237,7 +258,7 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
                     signer: *signer,
                     signature: CRYPTO::sign(pk, Domain::Vote, to_sign),
                 }),
-                propose.view,
+                propose.view + 1,
             );
         });
         Ok(())
@@ -247,13 +268,13 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         skip(self, vote), 
         fields(view = ?vote.inner.view, signer = vote.signer, height = vote.inner.height),
     )]
-    pub fn on_vote(&self, vote: Signed<Vote>) -> Result<()> {
+    pub(crate) fn on_vote(&self, vote: Signed<Vote>) -> Result<()> {
         ensure!(vote.view == self.state.lock().view);
         self.verify_one(Domain::Vote, &vote.inner, &vote.signature, vote.signer)?;
 
         let votes = {
             let mut state = self.state.lock();
-            
+
             let last_cert = state.chain.last_key_value().map(|(_, cert)| cert).unwrap();
             ensure!(vote.block.height == last_cert.block.height + 1);
             ensure!(vote.block.prev == last_cert.block.id);
@@ -286,6 +307,13 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
                 .get(&(cert.height - 1))
                 .expect("commit certificate is never pruned from the chain")
                 .clone();
+
+            tracing::debug!(
+                view=%cert.inner.view, height=%cert.height, 
+                prev=%prev_cert.inner.view, prev_height=%prev_cert.height, 
+                "aggregated certificate",
+            );
+
             state.proposal = Some(Propose{
                 view: cert.view + 1,
                 block: Block { height: cert.block.height+1, prev: cert.block.id, id: ID::default() },
@@ -330,7 +358,7 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
     }
 
     #[tracing::instrument(skip(self, timeout), fields(view = ?timeout.inner))]
-    pub fn on_timeout(&self, timeout: Certificate<View>) -> Result<()> {
+    pub(crate) fn on_timeout(&self, timeout: Certificate<View>) -> Result<()> {
         ensure!(timeout.inner > self.state.lock().view);
         self.verify_certificate(Domain::Wish, &timeout.inner, &timeout.signature, &timeout.signers)?;
 

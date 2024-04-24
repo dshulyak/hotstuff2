@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Range,
 };
 
@@ -8,7 +8,8 @@ use proptest::{collection::vec, prelude::*, proptest, sample::subsequence};
 
 use crate::{
     crypto::NoopBackend,
-    pipelined::{self, Event, Events, Message, Propose},
+    pipelined::{self as pipe, Consensus, Event, Events, Message, Propose},
+    twins,
     types::{
         AggregateSignature, Bitfield, Block, Certificate, PrivateKey, Signature, Signed, Signer,
         View, Vote, ID, SIGNATURE_SIZE,
@@ -16,6 +17,12 @@ use crate::{
 };
 
 struct VecEvents(RefCell<Vec<Event>>);
+
+impl VecEvents {
+    fn drain(&self) -> Vec<Event> {
+        self.0.borrow_mut().drain(..).collect()
+    }
+}
 
 impl Events for VecEvents {
     fn new() -> Self {
@@ -46,7 +53,7 @@ fn pks(n: u8) -> Vec<PrivateKey> {
     (0..n).map(|i| PrivateKey::from_seed(&[i; 32])).collect()
 }
 
-type Node = pipelined::Consensus<VecEvents, NoopBackend>;
+type Node = pipe::Consensus<VecEvents, NoopBackend>;
 
 fn node(n: u8, private_range: Range<usize>) -> Node {
     let privates = pks(n);
@@ -411,6 +418,370 @@ proptest! {
                     },
                     _ => {},
                 }
+            }
+        }
+    }
+}
+
+pub(crate) struct Model {
+    twins: twins::Twins,
+
+    consecutive_advance: usize,
+    tracking_progress: HashSet<twins::Node>,
+
+    consensus: HashMap<twins::Node, Node>,
+    commit: HashMap<twins::Node, u64>,
+    chain: HashMap<twins::Node, BTreeMap<u64, Certificate<Vote>>>,
+    timeouts: HashMap<twins::Node, Certificate<View>>,
+    inboxes: HashMap<twins::Node, Vec<Message>>,
+}
+
+impl Model {
+    pub fn new(total: usize, twins: usize) -> Self {
+        let twins = twins::Twins::new(total, twins);
+        let nodes = twins
+            .nodes
+            .iter()
+            .map(|(n, key)| {
+                (
+                    *n,
+                    Consensus::new(
+                        &twins.publics,
+                        &[key.clone()],
+                        0.into(),
+                        0.into(),
+                        &vec![genesis()],
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut by_public = HashMap::new();
+        for (pun, node) in nodes
+            .iter()
+            .flat_map(|(n, c)| c.public_keys().into_iter().map(|(_, public)| (public, *n)))
+        {
+            by_public.entry(pun).or_insert_with(Vec::new).push(node);
+        }
+        let inboxes = nodes.keys().map(|n| (*n, vec![])).collect();
+        let mut model = Self {
+            twins: twins,
+            consensus: nodes,
+            commit: HashMap::new(),
+            chain: HashMap::new(),
+            timeouts: HashMap::new(),
+            inboxes: inboxes,
+            consecutive_advance: 0,
+            tracking_progress: HashSet::new(),
+        };
+        model
+            .step(twins::Op::Advance(pipe::TIMEOUT as usize))
+            .unwrap();
+        model
+    }
+
+    pub fn step(&mut self, op: twins::Op) -> anyhow::Result<()> {
+        tracing::trace!("step: {:?}", op);
+        match op {
+            twins::Op::Routes(partition) => {
+                self.twins.install_partition(partition);
+                self.sync();
+                self.consecutive_advance = 0;
+                self.tracking_progress.clear();
+            }
+            twins::Op::Advance(n) => {
+                for _ in 0..n {
+                    self.consecutive_advance += 1;
+                    self.advance();
+                    if self.consecutive_advance == 1 {
+                        self.sync();
+                    }
+                }
+            }
+        }
+        self.verify()
+    }
+
+    fn last_commit(&self, node: &twins::Node) -> Option<&Certificate<Vote>> {
+        let commit = self.commit.get(node).unwrap_or(&0);
+        self.chain.get(node).and_then(|chain| chain.get(commit))
+    }
+
+    fn sync_from(&mut self, from: &twins::Node, to: &twins::Node) {
+        let from_last_commit = self.last_commit(from);
+        let to_last_commit = self.last_commit(to);
+
+        tracing::debug!(
+            "syncing from {:?} to {:?}. certs from={:?} to ={:?}",
+            from,
+            to,
+            from_last_commit,
+            to_last_commit,
+        );
+        for height in to_last_commit
+            .map(|cert| cert.block.height + 1)
+            .unwrap_or(1)
+            ..=from_last_commit.map(|cert| cert.block.height).unwrap_or(1)
+        {
+            let cert = self.chain.get(from).and_then(|certs| certs.get(&height));
+            if cert.is_none() {
+                continue;
+            }
+            tracing::trace!(
+                "uploading certificate for height {:?} from {:?} to {:?}",
+                cert,
+                from,
+                to
+            );
+            if let Some(consensus) = self.consensus.get(to) {
+                tracing::debug_span!("sync", node = ?to).in_scope(|| {
+                    if let Err(err) =
+                        consensus.on_message(Message::Certificate(cert.unwrap().clone()))
+                    {
+                        tracing::warn!("error syncing from {:?} to {:?}: {:?}", from, to, err);
+                    };
+                });
+            };
+        }
+        let from_timeout = self.timeouts.get(from).map_or(0.into(), |cert| cert.inner);
+        let to_timeout = self.timeouts.get(to).map_or(0.into(), |cert| cert.inner);
+        if from_timeout > to_timeout {
+            if let Some(consensus) = self.consensus.get(to) {
+                let timeout = self.timeouts.get(from).unwrap().clone();
+                tracing::debug_span!("sync timeout", node = ?to).in_scope(|| {
+                    if let Err(err) = consensus.on_message(Message::Timeout(timeout)) {
+                        tracing::warn!("error on timeout from {:?} to {:?}: {:?}", from, to, err);
+                    };
+                });
+            }
+        }
+    }
+
+    fn advance(&mut self) {
+        let mut queue = self.consensus.keys().collect::<Vec<_>>();
+        while let Some(id) = queue.pop() {
+            let consensus = self.consensus.get(id).unwrap();
+            for event in consensus.events().drain() {
+                match event {
+                    Event::StateChange {
+                        voted: _,
+                        commit,
+                        timeout,
+                        chain,
+                    } => {
+                        if let Some(commit) = commit {
+                            tracing::debug!(
+                                "{}: node {:?}: commiting {:?}",
+                                self.consecutive_advance,
+                                id,
+                                commit,
+                            );
+                            self.commit.insert(*id, commit);
+                            self.tracking_progress.insert(*id);
+                        }
+                        if let Some(timeout) = timeout {
+                            tracing::debug!(
+                                "{}: node {:?}: timeout for view {}",
+                                self.consecutive_advance,
+                                id,
+                                timeout.inner,
+                            );
+                            self.timeouts.insert(*id, timeout);
+                        }
+                        for update in chain {
+                            tracing::debug!(
+                                "{}: node {:?}: updating chain {:?}",
+                                self.consecutive_advance,
+                                id,
+                                update,
+                            );
+                            self.chain
+                                .entry(*id)
+                                .or_insert_with(BTreeMap::new)
+                                .insert(update.height, update.clone());
+                        }
+                    }
+                    Event::Send(msg, target) => {
+                        let is_broadcast = target.is_empty();
+                        if !is_broadcast {
+                            for target in target {
+                                for target in
+                                    self.twins.route_to_public_key(id, &target).into_iter()
+                                {
+                                    tracing::trace!(
+                                        "{}: routed {:?} => {:?}: {:?}",
+                                        self.consecutive_advance,
+                                        id,
+                                        target,
+                                        msg,
+                                    );
+                                    self.inboxes.get_mut(target).unwrap().push(msg.clone());
+                                }
+                            }
+                        } else {
+                            for linked in self.twins.broadcast(id) {
+                                tracing::trace!(
+                                    "{}: unrouted {:?} => {:?}: {:?}",
+                                    self.consecutive_advance,
+                                    id,
+                                    linked,
+                                    msg,
+                                );
+                                self.inboxes.get_mut(linked).unwrap().push(msg.clone());
+                            }
+                        }
+                    }
+                    Event::ReadyPropose => {
+                        tracing::debug!(
+                            "{}: proposing block at node {:?}",
+                            self.consecutive_advance,
+                            id
+                        );
+                        _ = consensus.propose(self.twins.unique_proposal(id));
+                        queue.push(id);
+                    }
+                }
+            }
+        }
+        for (target, inbox) in self.inboxes.iter_mut() {
+            tracing::debug_span!("inbox", node = ?target).in_scope(|| {
+                for msg in inbox.drain(..) {
+                    if let Err(err) = self.consensus.get(target).unwrap().on_message(msg.clone()) {
+                        tracing::warn!(
+                            "error processing message {:?} on node {:?}: {:?}",
+                            msg,
+                            target,
+                            err
+                        );
+                    }
+                }
+            })
+        }
+        for (node, consensus) in self.consensus.iter() {
+            tracing::debug_span!("delay", node = ?node).in_scope(|| {
+                let _ = consensus.on_delay();
+            });
+        }
+    }
+
+    fn verify(&self) -> anyhow::Result<()> {
+        let certs = self.commit.iter().map(|(node, height)| {
+            if height == &0 {
+                return (0, genesis());
+            }
+            let cert = self
+                .chain
+                .get(node)
+                .expect("btree must be initialized")
+                .get(&height)
+                .unwrap();
+            (*height, cert.clone())
+        });
+        let mut by_height: HashMap<u64, Certificate<Vote>> = HashMap::new();
+        for (height, cert) in certs {
+            if let Some(by_height) = by_height.get(&height) {
+                anyhow::ensure!(
+                    by_height.block == cert.block,
+                    "inconsistent commits {:?} != {:?}",
+                    by_height,
+                    cert
+                );
+            } else {
+                by_height.insert(height, cert.clone());
+            }
+        }
+
+        if self.consecutive_advance >= 8 * pipe::TIMEOUT as usize {
+            for side in self.twins.installed_partition() {
+                let unique = side.iter().map(|n| n.key()).collect::<HashSet<_>>();
+                if unique.len() == self.twins.total() {
+                    tracing::debug!(
+                        "checking liveness for side {:?} in {} advances {:?}",
+                        side,
+                        self.consecutive_advance,
+                        self.tracking_progress
+                    );
+                    for id in side {
+                        anyhow::ensure!(
+                            self.tracking_progress.get(id).is_some(),
+                            "liveness violation on node {:?}",
+                            id,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sync(&mut self) {
+        let pairs = &self.twins.pair_routes().collect::<Vec<_>>();
+        for (from, to) in pairs {
+            self.sync_from(&from, &to);
+        }
+    }
+}
+
+fn init_tracing() {
+    let rst = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    assert!(rst.is_ok());
+}
+
+#[test]
+fn test_debug() {
+    init_tracing();
+    let scenario = twins::Scenario::parse(
+        r#"
+        {0, 1, 3/0, 3/1} | {2}
+        advance 3
+        {0, 1, 2, 3/1} | {3/0}
+        advance 3
+        {0, 2, 3/0, 3/1} | {1}
+        advance 1
+        {0, 1, 2, 3/0} | {3/1}
+        advance 3
+        {3/0, 3/1} | {0, 1, 2}
+        advance 5
+        {1, 2, 3/0, 3/1} | {0}
+        advance 5
+        {0, 2, 3/0, 3/1} | {1}
+        advance 2
+        {0, 1, 3/0, 3/1} | {2}
+        advance 7
+        {0, 2, 3/0, 3/1} | {1}
+        advance 3
+        {0, 1, 2, 3/0} | {3/1}
+        advance 2
+        {0, 1, 3/0} | {2, 3/1}
+        advance 15
+        {0, 1, 2, 3/1} | {3/0}
+        advance 40
+        "#,
+    )
+    .unwrap();
+    let mut model = Model::new(4, 1);
+    for op in scenario {
+        if let Err(err) = model.step(op) {
+            assert!(false, "error: {:?}", err);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    #[test]
+    fn test_random_partitions(ops in &vec(
+        prop_oneof![
+            1 => twins::two_sided_partition(twins::Twins::nodes(4, 1)),
+            4 => (1..4usize).prop_map(twins::Op::Advance),
+        ],
+        100,
+    ).prop_map(|ops| twins::Scenario::new(ops))) {
+        let mut model = Model::new(4, 1);
+        for op in ops {
+            if let Err(err) = model.step(op) {
+                assert!(false, "error: {:?}", err);
             }
         }
     }

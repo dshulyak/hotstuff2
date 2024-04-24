@@ -2,65 +2,40 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use itertools::Itertools;
-
 use crate::{
     crypto,
     sequential::{self as seq, Consensus, Event, OnDelay, OnMessage, Proposer, TIMEOUT},
-    twins::{self, Node, Op},
-    types::{Certificate, Message, PublicKey, Sync as SyncMsg, Timeout, View, Vote},
+    twins::{self, Node, Op, Twins},
+    types::{Certificate, Message, Sync as SyncMsg, Timeout, View, Vote},
 };
 
 // LIVENESS_MAX_ROUNDS is a maximal number of rounds that are required to make a new block.
 const LIVENESS_MAX_ROUNDS: u8 = 4 * TIMEOUT;
 
-pub struct Model {
-    total: usize,
-    consensus: HashMap<Node, Consensus<seq::testing::Sink, crypto::NoopBackend>>,
-    public_key_to_node: HashMap<PublicKey, Vec<Node>>,
-    commits: HashMap<Node, BTreeMap<u64, Certificate<Vote>>>,
-    locks: HashMap<Node, Certificate<Vote>>,
-    timeouts: HashMap<Node, Certificate<View>>,
-    proposals_counter: HashMap<Node, u64>,
-    installed_partition: Vec<Vec<Node>>,
-    routes: HashMap<Node, HashSet<Node>>,
-    inboxes: HashMap<Node, Vec<Message>>,
+pub(crate) struct Model {
+    twins: Twins,
+
     consecutive_advance: usize,
     tracking_progress: HashSet<Node>,
+
+    consensus: HashMap<Node, Consensus<seq::testing::Sink, crypto::NoopBackend>>,
+    commits: HashMap<Node, BTreeMap<u64, Certificate<Vote>>>,
+    timeouts: HashMap<Node, Certificate<View>>,
+    inboxes: HashMap<Node, Vec<Message>>,
 }
 
 impl Model {
-    fn nodes(total: usize, twins: usize) -> Vec<Node> {
-        (0..total - twins)
-            .map(|i| Node::Honest(i as u8))
-            .chain(
-                (total - twins..total).flat_map(|i| (0..=1).map(move |j| Node::Twin(i as u8, j))),
-            )
-            .collect()
-    }
-
-    pub fn new(total: usize, twins: usize) -> Self {
-        let keys = seq::testing::privates(total);
-        let nodes = Self::nodes(total, twins)
-            .into_iter()
-            .map(|n| {
-                (
-                    n,
-                    match n {
-                        Node::Honest(id) => &keys[id as usize],
-                        Node::Twin(id, _) => &keys[id as usize],
-                    },
-                )
-            })
+    pub(crate) fn new(total: usize, twins: usize) -> Self {
+        let twins = Twins::new(total, twins);
+        let nodes = twins
+            .nodes
+            .iter()
             .map(|(n, key)| {
                 (
-                    n,
+                    *n,
                     Consensus::new(
                         0.into(),
-                        keys.iter()
-                            .map(|key| key.public())
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice(),
+                        twins.publics.clone().into_boxed_slice(),
                         seq::testing::genesis(),
                         seq::testing::genesis(),
                         0.into(),
@@ -79,16 +54,11 @@ impl Model {
         }
         let inboxes = nodes.keys().map(|n| (*n, vec![])).collect();
         let mut model = Self {
-            total: total,
+            twins: twins,
             consensus: nodes,
-            public_key_to_node: by_public,
             commits: HashMap::new(),
-            locks: HashMap::new(),
             timeouts: HashMap::new(),
-            proposals_counter: HashMap::new(),
             inboxes: inboxes,
-            installed_partition: vec![],
-            routes: HashMap::new(),
             consecutive_advance: 0,
             tracking_progress: HashSet::new(),
         };
@@ -100,7 +70,8 @@ impl Model {
         tracing::trace!("step: {:?}", op);
         match op {
             Op::Routes(partition) => {
-                self.paritition(partition);
+                self.twins.install_partition(partition);
+                self.sync();
                 self.consecutive_advance = 0;
                 self.tracking_progress.clear();
             }
@@ -161,10 +132,6 @@ impl Model {
                 });
             };
         }
-        self.sync_timeouts(from, to)
-    }
-
-    fn sync_timeouts(&mut self, from: &Node, to: &Node) {
         let from_timeout = self.timeouts.get(from).map_or(0.into(), |cert| cert.inner);
         let to_timeout = self.timeouts.get(to).map_or(0.into(), |cert| cert.inner);
         if from_timeout > to_timeout {
@@ -196,7 +163,6 @@ impl Model {
                                 lock.inner.view,
                                 id
                             );
-                            self.locks.insert(*id, lock);
                         }
                         if let Some(cert) = change.commit {
                             tracing::debug!(
@@ -224,59 +190,31 @@ impl Model {
                     }
                     Event::Send(msg, target) => {
                         if let Some(target) = target {
-                            if let Some(route) = self.public_key_to_node.get(&target) {
-                                let targets = route
-                                    .iter()
-                                    .filter(|target| {
-                                        self.routes
-                                            .get(id)
-                                            .and_then(|linked| linked.get(target))
-                                            .is_some()
-                                            || *target == id
-                                    })
-                                    .collect::<Vec<_>>();
-                                if targets.len() == 0 {
-                                    tracing::warn!(
-                                        "{}: blocked from {:?} {:?}",
-                                        self.consecutive_advance,
-                                        id,
-                                        msg,
-                                    );
-                                }
-                                for target in targets.into_iter() {
-                                    tracing::trace!(
-                                        "{}: routed {:?} => {:?}: {:?}",
-                                        self.consecutive_advance,
-                                        id,
-                                        target,
-                                        msg,
-                                    );
-                                    self.inboxes.get_mut(target).unwrap().push(msg.clone());
-                                }
+                            for target in self.twins.route_to_public_key(id, &target).into_iter() {
+                                tracing::trace!(
+                                    "{}: routed {:?} => {:?}: {:?}",
+                                    self.consecutive_advance,
+                                    id,
+                                    target,
+                                    msg,
+                                );
+                                self.inboxes.get_mut(target).unwrap().push(msg.clone());
                             }
                         } else {
-                            if let Some(links) = self.routes.get(id) {
-                                for linked in links {
-                                    tracing::trace!(
-                                        "{}: unrouted {:?} => {:?}: {:?}",
-                                        self.consecutive_advance,
-                                        id,
-                                        linked,
-                                        msg,
-                                    );
-                                    self.inboxes.get_mut(linked).unwrap().push(msg.clone());
-                                }
+                            for linked in self.twins.broadcast(id) {
+                                tracing::trace!(
+                                    "{}: unrouted {:?} => {:?}: {:?}",
+                                    self.consecutive_advance,
+                                    id,
+                                    linked,
+                                    msg,
+                                );
+                                self.inboxes.get_mut(linked).unwrap().push(msg.clone());
                             }
-                            self.inboxes.get_mut(id).unwrap().push(msg);
                         }
                     }
                     Event::Propose => {
-                        let nonce = self.proposals_counter.get(id).unwrap_or(&0);
-                        let mut block_id = [0u8; 32];
-                        block_id[0..8].copy_from_slice(&nonce.to_be_bytes());
-                        block_id[9] = id.num();
-                        _ = consensus.propose(block_id.into());
-                        self.proposals_counter.insert(*id, nonce + 1);
+                        _ = consensus.propose(self.twins.unique_proposal(id));
                         queue.push(id);
                     }
                 }
@@ -303,7 +241,6 @@ impl Model {
         }
     }
 
-    #[cfg(test)]
     fn verify_committed(&self, height: u64, nodes: Vec<Node>) -> anyhow::Result<()> {
         let mut commits = nodes
             .into_iter()
@@ -342,9 +279,9 @@ impl Model {
         }
 
         if self.consecutive_advance >= LIVENESS_MAX_ROUNDS as usize {
-            for side in self.installed_partition.iter() {
+            for side in self.twins.installed_partition() {
                 let unique = side.iter().map(|n| n.key()).collect::<HashSet<_>>();
-                if unique.len() == self.total {
+                if unique.len() == self.twins.total() {
                     tracing::debug!(
                         "checking liveness for side {:?} in {} advances {:?}",
                         side,
@@ -364,23 +301,10 @@ impl Model {
         Ok(())
     }
 
-    fn paritition(&mut self, partition: Vec<Vec<Node>>) {
-        tracing::debug!("updating to partition {:?}", partition);
-        self.installed_partition = partition.clone();
-        self.routes = Op::Routes(partition).to_routes().unwrap();
-        tracing::debug!(
-            "routes {:?}. partition {:?}",
-            self.routes,
-            self.installed_partition
-        );
-        self.sync();
-    }
-
     fn sync(&mut self) {
-        for side in self.installed_partition.clone().iter() {
-            for pair in side.iter().permutations(2) {
-                self.sync_from(&pair[0], &pair[1]);
-            }
+        let pairs = &self.twins.pair_routes().collect::<Vec<_>>();
+        for (from, to) in pairs {
+            self.sync_from(&from, &to);
         }
     }
 }
@@ -764,7 +688,7 @@ advance 28
         #[test]
         fn test_random_partitions(ops in &vec(
             prop_oneof![
-                1 => twins::two_sided_partition(Model::nodes(4, 1)),
+                1 => twins::two_sided_partition(twins::Twins::nodes(4, 1)),
                 4 => (1..4usize).prop_map(Op::Advance),
             ],
             100,
