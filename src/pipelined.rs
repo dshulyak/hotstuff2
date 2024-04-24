@@ -155,7 +155,6 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         fields(view = ?cert.view, height = cert.block.height),
     )]
     pub(crate) fn on_synced_certificate(&self, cert: Certificate<Vote>) -> Result<()> {
-        ensure!(cert.view > self.state.lock().chain_view());
         self.verify_certificate(Domain::Vote, &cert, &cert.signature, &cert.signers)?;
 
         let mut state = self.state.lock();
@@ -220,7 +219,7 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
             ensure!(propose.lock.view >= last_cert.view);
 
             let mut update = vec![];
-            if propose.commit.view > View(2) && !state.is_known_cert(&propose.commit) {
+            if !state.is_known_cert(&propose.commit) {
                 update.push(propose.commit.clone());
                 state.update_chain(propose.commit.clone(), None);
             }
@@ -570,11 +569,8 @@ impl State {
         }
     }
 
-    fn chain_view(&self) -> View {
-        self.chain.last_key_value().map_or(View(0), |(_, cert)| cert.view)
-    }
-
     fn update_chain(&mut self, cert: Certificate<Vote>, commit: Option<u64>) {
+        tracing::debug!(view=%cert.view, height=%cert.block.height, block=%cert.block.id, "update chain");
         let cert_height = cert.height;
         self.chain.insert(cert_height, cert);
         if let Some(commit) = commit {

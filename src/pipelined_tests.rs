@@ -501,46 +501,38 @@ impl Model {
         self.verify()
     }
 
-    fn last_commit(&self, node: &twins::Node) -> Option<&Certificate<Vote>> {
-        let commit = self.commit.get(node).unwrap_or(&0);
-        self.chain.get(node).and_then(|chain| chain.get(commit))
+    fn committed_height(&self, node: &twins::Node) -> u64 {
+        *self.commit.get(node).unwrap_or(&0)
     }
 
     fn sync_from(&mut self, from: &twins::Node, to: &twins::Node) {
-        let from_last_commit = self.last_commit(from);
-        let to_last_commit = self.last_commit(to);
+        let src_commit = self.committed_height(from);
+        let dst_commit = self.committed_height(to);
 
         tracing::debug!(
-            "syncing from {:?} to {:?}. certs from={:?} to ={:?}",
+            "syncing from {:?} to {:?}. certs src commit {:?}. dst commit {:?}",
             from,
             to,
-            from_last_commit,
-            to_last_commit,
+            src_commit,
+            dst_commit,
         );
-        for height in to_last_commit
-            .map(|cert| cert.block.height + 1)
-            .unwrap_or(1)
-            ..=from_last_commit.map(|cert| cert.block.height).unwrap_or(1)
-        {
-            let cert = self.chain.get(from).and_then(|certs| certs.get(&height));
-            if cert.is_none() {
-                continue;
+        if src_commit > 0 {
+            let boundary = src_commit.max(dst_commit);
+            for (_, cert) in self.chain.get(from).unwrap().range(boundary..) {
+                tracing::trace!(
+                    "uploading certificate for height {:?} from {:?} to {:?}",
+                    cert,
+                    from,
+                    to
+                );
+                if let Some(consensus) = self.consensus.get(to) {
+                    tracing::debug_span!("sync", node = ?to).in_scope(|| {
+                        if let Err(err) = consensus.on_message(Message::Certificate(cert.clone())) {
+                            tracing::warn!("error syncing from {:?} to {:?}: {:?}", from, to, err);
+                        };
+                    });
+                };
             }
-            tracing::trace!(
-                "uploading certificate for height {:?} from {:?} to {:?}",
-                cert,
-                from,
-                to
-            );
-            if let Some(consensus) = self.consensus.get(to) {
-                tracing::debug_span!("sync", node = ?to).in_scope(|| {
-                    if let Err(err) =
-                        consensus.on_message(Message::Certificate(cert.unwrap().clone()))
-                    {
-                        tracing::warn!("error syncing from {:?} to {:?}: {:?}", from, to, err);
-                    };
-                });
-            };
         }
         let from_timeout = self.timeouts.get(from).map_or(0.into(), |cert| cert.inner);
         let to_timeout = self.timeouts.get(to).map_or(0.into(), |cert| cert.inner);
@@ -673,7 +665,7 @@ impl Model {
                 .get(node)
                 .expect("btree must be initialized")
                 .get(&height)
-                .unwrap();
+                .expect("comitted height must be in the chain");
             (*height, cert.clone())
         });
         let mut by_height: HashMap<u64, Certificate<Vote>> = HashMap::new();
@@ -733,33 +725,27 @@ fn test_debug() {
     init_tracing();
     let scenario = twins::Scenario::parse(
         r#"
-        {0, 1, 3/0, 3/1} | {2}
-        advance 3
-        {0, 1, 2, 3/1} | {3/0}
-        advance 3
-        {0, 2, 3/0, 3/1} | {1}
         advance 1
-        {0, 1, 2, 3/0} | {3/1}
-        advance 3
-        {3/0, 3/1} | {0, 1, 2}
-        advance 5
-        {1, 2, 3/0, 3/1} | {0}
-        advance 5
-        {0, 2, 3/0, 3/1} | {1}
-        advance 2
-        {0, 1, 3/0, 3/1} | {2}
-        advance 7
-        {0, 2, 3/0, 3/1} | {1}
-        advance 3
-        {0, 1, 2, 3/0} | {3/1}
-        advance 2
-        {0, 1, 3/0} | {2, 3/1}
-        advance 15
-        {0, 1, 2, 3/1} | {3/0}
-        advance 40
+{0, 1, 3/0, 3/1} | {2}
+advance 2
+{0, 1, 2, 3/0} | {3/1}
+advance 3
+{1, 2, 3/0, 3/1} | {0}
+advance 3
+{0, 2, 3/1} | {1, 3/0}
+advance 8
+{0, 1, 2, 3/0} | {3/1}
+advance 1
+{0, 1, 2, 3/1} | {3/0}
+advance 1
+{0, 1, 3/0, 3/1} | {2}
         "#,
     )
     .unwrap();
+
+    // {2, 3/1} created wishes for 9
+    // certificate for view 8 is not synced, which leads to halting
+    // {0, 1, 3/0} create wishes for 11
     let mut model = Model::new(4, 1);
     for op in scenario {
         if let Err(err) = model.step(op) {
