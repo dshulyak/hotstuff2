@@ -8,7 +8,7 @@ use proptest::{collection::vec, prelude::*, proptest, sample::subsequence};
 
 use crate::{
     crypto::NoopBackend,
-    pipelined::{self as pipe, Consensus, Event, Events, Message, Propose},
+    pipelined::{self as pipe, OnMessage, OnDelay, Proposer, Consensus, Event, Events, Message, Propose},
     twins,
     types::{
         AggregateSignature, Bitfield, Block, Certificate, PrivateKey, Signature, Signed, Signer,
@@ -245,7 +245,7 @@ fn vote_strategy1(views: Range<u64>) -> impl Strategy<Value = Signed<Vote>> {
 }
 
 #[derive(Debug, Clone)]
-enum OnDelay {
+enum OnDelayChoice {
     Cert(Certificate<Vote>),
     Delay,
 }
@@ -388,16 +388,16 @@ proptest! {
 
     #[test]
     fn test_on_delay(actions in &vec(prop_oneof![
-        2 => Just(OnDelay::Delay),
-        1 => valid_block_cert(1..7, 1..3).prop_map(|cert| OnDelay::Cert(cert))
+        2 => Just(OnDelayChoice::Delay),
+        1 => valid_block_cert(1..7, 1..3).prop_map(|cert| OnDelayChoice::Cert(cert))
     ], 100)) {
         let node = node(7, 0..4);
         for action in actions {
             match action {
-                OnDelay::Delay => {
+                OnDelayChoice::Delay => {
                     let _ = node.on_delay();
                 },
-                OnDelay::Cert(cert) => {
+                OnDelayChoice::Cert(cert) => {
                     let _ = node.on_synced_certificate(cert);
                 }
             }

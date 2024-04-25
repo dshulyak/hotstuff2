@@ -80,6 +80,18 @@ impl ToBytes for Propose {
     }
 }
 
+pub trait OnMessage {
+    fn on_message(&self, message: Message) -> Result<()>;
+}
+
+pub trait OnDelay {
+    fn on_delay(&self);
+}
+
+pub trait Proposer {
+    fn propose(&self, block: ID) -> Result<()>;
+}
+
 #[derive(Debug)]
 pub struct Consensus<EVENTS: Events, CRYPTO: crypto::Backend = crypto::BLSTBackend> {
     participants: Participants,
@@ -138,16 +150,6 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
 
     pub fn events(&self) -> &EVENTS {
         &self.events
-    }
-
-    pub fn on_message(&self, msg: Message) -> Result<()> {
-        match msg {
-            Message::Certificate(cert) => self.on_synced_certificate(cert),
-            Message::Propose(propose) => self.on_propose(propose),
-            Message::Vote(vote) => self.on_vote(vote),
-            Message::Wish(wish) => self.on_wish(wish),
-            Message::Timeout(timeout) => self.on_timeout(timeout),
-        }
     }
 
     #[tracing::instrument(
@@ -379,7 +381,7 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn on_delay(&self) -> Result<()> {
+    fn on_delay(&self) {
         let action = {
             let mut state = self.state.lock();
             state.ticks += 1;
@@ -428,11 +430,10 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
                 }));
             });
         }
-        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn propose(&self, id: ID) -> Result<()> {
+    fn propose(&self, id: ID) -> Result<()> {
         let mut proposal = self.state.lock().take_proposal()?;
         proposal.block.id = id;
         self.send_proposal(proposal);
@@ -523,6 +524,30 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
                 self.send_leader(Message::Certificate(last_cert.clone()), state.view);
             }
         };
+    }
+}
+
+impl<EVENTS: Events, CRYPTO: crypto::Backend> Proposer for Consensus<EVENTS, CRYPTO> {
+    fn propose(&self, block: ID) -> Result<()> {
+        self.propose(block)
+    }
+}
+
+impl<EVENTS: Events, CRYPTO: crypto::Backend> OnDelay for Consensus<EVENTS, CRYPTO> { 
+    fn on_delay(&self) {
+        self.on_delay();
+    }
+}
+
+impl<EVENTS: Events, CRYPTO: crypto::Backend> OnMessage for Consensus<EVENTS, CRYPTO> {
+    fn on_message(&self, msg: Message) -> Result<()> {
+        match msg {
+            Message::Certificate(cert) => self.on_synced_certificate(cert),
+            Message::Propose(propose) => self.on_propose(propose),
+            Message::Vote(vote) => self.on_vote(vote),
+            Message::Wish(wish) => self.on_wish(wish),
+            Message::Timeout(timeout) => self.on_timeout(timeout),
+        }
     }
 }
 
