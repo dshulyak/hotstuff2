@@ -8,7 +8,7 @@ use proptest::{collection::vec, prelude::*, proptest, sample::subsequence};
 
 use crate::{
     crypto::NoopBackend,
-    pipelined::{self as pipe, OnMessage, OnDelay, Proposer, Consensus, Event, Events, Message, Propose},
+    pipelined::{self as pipe, OnMessage, OnDelay, EventsAccess, Proposer, Consensus, Event, Events, Message, Propose},
     twins,
     types::{
         AggregateSignature, Bitfield, Block, Certificate, PrivateKey, Signature, Signed, Signer,

@@ -4,7 +4,8 @@ use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
-use hotstuff2::types::{Message, PublicKey};
+use hotstuff2::pipelined::Message;
+use hotstuff2::types::PublicKey;
 use opentelemetry::trace::TraceContextExt;
 use parking_lot::Mutex;
 use prost::{decode_length_delimiter, Message as ProstMessage};

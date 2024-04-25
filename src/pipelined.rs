@@ -1,6 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
-    marker::PhantomData,
+    collections::{BTreeMap, HashMap}, fmt, marker::PhantomData
 };
 
 use anyhow::{anyhow, bail, ensure, Result};
@@ -33,6 +32,18 @@ pub enum Message {
     Vote(Signed<Vote>),
     Wish(Signed<View>),
     Timeout(Certificate<View>),
+}
+
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Message::Certificate(cert) => write!(f, "cert height={:?} view={:?} id={:?}", cert.height, cert.view, cert.block.id),
+            Message::Propose(propose) => write!(f, "propose height={:?} view={:?} id={:?}", propose.block.height, propose.view, propose.block.id),
+            Message::Vote(vote) => write!(f, "vote height={:?} view={:?} id={:?} signer={:?}", vote.block.height, vote.view, vote.block.id, vote.signer),
+            Message::Wish(wish) => write!(f, "wish view={:?} signer={:?}", wish.inner, wish.signer),
+            Message::Timeout(timeout) => write!(f, "timeout view={:?}", timeout.inner),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -92,6 +103,10 @@ pub trait Proposer {
     fn propose(&self, block: ID) -> Result<()>;
 }
 
+pub trait EventsAccess<EVENTS: Events>{
+    fn events(&self) -> &EVENTS;
+}
+
 #[derive(Debug)]
 pub struct Consensus<EVENTS: Events, CRYPTO: crypto::Backend = crypto::BLSTBackend> {
     participants: Participants,
@@ -146,10 +161,6 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
 
     pub fn public_keys(&self) -> impl IntoIterator<Item = (Signer, PublicKey)> + '_ {
         self.keys.iter().map(|(signer, key)| (*signer, key.public()))
-    }
-
-    pub fn events(&self) -> &EVENTS {
-        &self.events
     }
 
     #[tracing::instrument(
@@ -548,6 +559,12 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> OnMessage for Consensus<EVENTS, CR
             Message::Wish(wish) => self.on_wish(wish),
             Message::Timeout(timeout) => self.on_timeout(timeout),
         }
+    }
+}
+
+impl<EVENTS: Events, CRYPTO: crypto::Backend> EventsAccess<EVENTS> for Consensus<EVENTS, CRYPTO> {
+    fn events(&self) -> &EVENTS {
+        &self.events
     }
 }
 

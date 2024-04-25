@@ -4,9 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use hotstuff2::sequential::{Event, Events, Consensus, OnDelay, OnMessage, Proposer};
+use hotstuff2::pipelined::{
+    Consensus, Event, Events, EventsAccess, Message, OnDelay, OnMessage, Proposer,
+};
 use hotstuff2::types::{
-    AggregateSignature, Bitfield, Block, Certificate, Message, PrivateKey, ProofOfPossession, PublicKey, Sync as SyncMsg, Timeout, View, Vote, ID
+    AggregateSignature, Bitfield, Block, Certificate, PrivateKey, ProofOfPossession, PublicKey,
+    Sync as SyncMsg, View, Vote, ID,
 };
 use rand::{thread_rng, Rng};
 use tokio::select;
@@ -16,7 +19,7 @@ use tracing::Instrument;
 
 use crate::context::Context;
 use crate::history::History;
-use crate::net::{MsgStream, Router, Protocol};
+use crate::net::{MsgStream, Protocol, Router};
 use crate::proto::{self, protocol};
 
 pub(crate) const GOSSIP_PROTOCOL: Protocol = Protocol::new(1);
@@ -25,17 +28,19 @@ pub(crate) const SYNC_PROTOCOL: Protocol = Protocol::new(2);
 pub(crate) type TokioConsensus = Consensus<TokioSink>;
 
 #[derive(Debug)]
-pub(crate) struct TokioSink(mpsc::UnboundedSender<Event>);
-
-impl TokioSink {
-    pub(crate) fn new(sender: mpsc::UnboundedSender<Event>) -> Self {
-        Self(sender)
-    }
+pub(crate) struct TokioSink {
+    sender: mpsc::UnboundedSender<Event>,
+    receiver: mpsc::UnboundedReceiver<Event>,
 }
 
 impl Events for TokioSink {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        Self { sender, receiver }
+    }
+
     fn send(&self, action: Event) {
-        self.0
+        self.sender
             .send(action)
             .expect("consumer should never be dropped before producer");
     }
@@ -155,10 +160,8 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: Ms
             }
         };
     }
-    if let Some(timeout) = history.timeout() {
-        let msg = Message::Timeout(Timeout {
-            certificate: timeout,
-        });
+    if let Some(timeout) = history.timeout().await {
+        let msg = Message::Timeout(timeout);
         match ctx
             .timeout_secs(10)
             .select(stream.send_payload(msg.borrow().into()))
@@ -203,7 +206,10 @@ async fn consume_messages(
 ) -> anyhow::Result<()> {
     loop {
         let span = tracing::debug_span!("recv gossip", remote=%stream.remote());
-        let msg: Message = match ctx.select(stream.recv_payload().instrument(span.clone())).await {
+        let msg: Message = match ctx
+            .select(stream.recv_payload().instrument(span.clone()))
+            .await
+        {
             None => {
                 return Ok(());
             }
@@ -226,25 +232,35 @@ async fn consume_messages(
 }
 
 pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: MsgStream) {
-    let proofs: Vec<ProofOfPossession> = match ctx.timeout_secs(10).select(stream.recv_payload()).await {
+    let proofs: Vec<ProofOfPossession> = match ctx
+        .timeout_secs(10)
+        .select(stream.recv_payload())
+        .await
+    {
         Ok(Ok(protocol::Payload::Hello(hello))) => {
-            let rst = hello.proofs.iter()
-                .map(|pop| pop.try_into()).collect::<Result<Vec<_>>>();
+            let rst = hello
+                .proofs
+                .iter()
+                .map(|pop| pop.try_into())
+                .collect::<Result<Vec<_>>>();
             match rst {
                 Ok(proofs) => {
-                    if let Err(err) = proofs.iter().map(|pop: &ProofOfPossession| pop.verify()).collect::<Result<()>>() {
+                    if let Err(err) = proofs
+                        .iter()
+                        .map(|pop: &ProofOfPossession| pop.verify())
+                        .collect::<Result<()>>()
+                    {
                         tracing::warn!(error = ?err, remote = %stream.remote(), "invalid proof of possession");
                         return;
                     };
                     proofs
-                },
+                }
                 Err(err) => {
                     tracing::warn!(error = ?err, remote = %stream.remote(), "failed to decode proofs");
                     return;
                 }
             }
-
-        },
+        }
         Ok(Ok(_)) => {
             tracing::warn!(remote = %stream.remote(), "unexpected message");
             return;
@@ -259,7 +275,10 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
         }
     };
 
-    let publics = proofs.iter().map(|pop| pop.public_key.clone()).collect::<Vec<_>>();
+    let publics = proofs
+        .iter()
+        .map(|pop| pop.public_key.clone())
+        .collect::<Vec<_>>();
     let mut msgs = {
         match router.register(stream.remote(), publics.clone().into_iter()) {
             Ok(msgs) => msgs,
@@ -319,46 +338,41 @@ pub(crate) async fn process_actions(
     history: &History,
     router: &Router,
     local: HashSet<PublicKey>,
-    consensus: &(impl Proposer + OnMessage),
-    receiver: &mut mpsc::UnboundedReceiver<Event>,
+    consensus: &(impl Proposer + OnMessage + EventsAccess<TokioSink>),
 ) {
     let mut average_latency: f64 = 0.0;
     let mut last = Instant::now();
+    let receiver = &mut consensus.events().receiver;
     while let Some(Some(action)) = ctx.select(receiver.recv()).await {
         match action {
             Event::Send(msg, to) => {
-                if let Some(to) = &to {
-                    tracing::debug!(msg = %msg, to=%to, "sent direct message");
+                if to.is_empty() {
+                    if let Err(err) = consensus.on_message(msg.clone()) {
+                        tracing::warn!(error = ?err, "failed to validate own message")
+                    };
+                    router.send_all(msg);
                 } else {
-                    tracing::debug!(msg = %msg, "sent message");
-                }
-                match to {
-                    None => {
-                        if let Err(err) = consensus.on_message(msg.clone()) {
-                            tracing::warn!(error = ?err, "failed to validate own message")
-                        };
-                        router.send_all(msg);
-                    }
-                    Some(public) => {
-                        if local.contains(&public) {
+                    for dst in to {
+                        if local.contains(&dst) {
                             if let Err(err) = consensus.on_message(msg.clone()) {
                                 tracing::warn!(error = ?err, "failed to validate own message")
                             };
                         } else {
-                            if let Err(err) = router.send_to(&public, msg) {
+                            if let Err(err) = router.send_to(&dst, msg.clone()) {
                                 tracing::warn!(error = ?err, "failed to send message");
                             }
                         }
                     }
                 }
             }
-            Event::StateChange(change) => {
-                if let Some(commit) = &change.commit {
-                    tracing::info_span!("on_block", 
-                        view = %commit.inner.view, 
-                        height = commit.inner.block.height, 
-                        id = %commit.inner.block.id)
-                    .in_scope(|| {
+            Event::StateChange {
+                voted,
+                commit,
+                timeout,
+                chain,
+            } => {
+                if let Some(commit) = commit {
+                    tracing::info_span!("on_block", height = commit).in_scope(|| {
                         let latency = Instant::now() - last;
                         tracing::info!(
                             latency = ?latency,
@@ -374,13 +388,12 @@ pub(crate) async fn process_actions(
                         last = Instant::now();
                     });
                 }
-                if let Err(err) = history.update(&change).await {
+                if let Err(err) = history.update(voted, commit, timeout, chain).await {
                     tracing::error!(error = ?err, "state change");
                 };
             }
-            Event::Propose => {
-                let id = ID::new(thread_rng().gen::<[u8; 32]>());
-                if let Err(err) = consensus.propose(id) {
+            Event::ReadyPropose => {
+                if let Err(err) = consensus.propose(thread_rng().gen::<[u8; 32]>().into()) {
                     tracing::error!(error = ?err, "propose block");
                 }
             }
@@ -615,18 +628,18 @@ mod tests {
 
         let mut reader = Builder::new();
         let mut writer = Builder::new();
-        
+
         let hello = protocol::Payload::Hello(proto::Hello {
             proofs: proofs.iter().map(|pop| pop.into()).collect::<Vec<_>>(),
         });
         writer.write(&empty_headers_message(hello));
 
-        reader.read(
-            &empty_headers_message(Message::Wish(wish(1.into(), 1)).borrow().into())
-        );
-        reader.read(
-            &empty_headers_message(Message::Wish(wish(1.into(), 2)).borrow().into())
-        );
+        reader.read(&empty_headers_message(
+            Message::Wish(wish(1.into(), 1)).borrow().into(),
+        ));
+        reader.read(&empty_headers_message(
+            Message::Wish(wish(1.into(), 2)).borrow().into(),
+        ));
 
         let stream = MsgStream::new(
             GOSSIP_PROTOCOL,
@@ -646,7 +659,9 @@ mod tests {
         let mut reader = Builder::new();
         let mut writer = Builder::new();
 
-        reader.read(&empty_headers_message(protocol::Payload::Hello(proto::Hello::default())));
+        reader.read(&empty_headers_message(protocol::Payload::Hello(
+            proto::Hello::default(),
+        )));
 
         let to_send = (1..=3)
             .into_iter()

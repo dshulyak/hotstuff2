@@ -590,6 +590,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "futures",
+ "futures-util",
  "hex",
  "hotstuff2",
  "humantime",

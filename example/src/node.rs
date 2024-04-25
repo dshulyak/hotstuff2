@@ -6,17 +6,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_scoped::TokioScope;
-use hotstuff2::sequential::Event;
 use hotstuff2::types::{PrivateKey, ProofOfPossession, PublicKey};
 use quinn::TransportConfig;
 use sqlx::SqlitePool;
-use tokio::sync::mpsc::{self, unbounded_channel};
 use tokio::time::sleep;
 
 use crate::context::Context;
 use crate::history::{self, History};
 use crate::net::{Connection, Router};
-use crate::protocol::{self, TokioConsensus, TokioSink};
+use crate::protocol::{self, TokioConsensus};
 
 async fn initiate(
     ctx: &Context,
@@ -161,7 +159,6 @@ pub struct Node {
     router: Router,
     proofs: Box<[ProofOfPossession]>,
     consensus: TokioConsensus,
-    receiver: mpsc::UnboundedReceiver<Event>,
     endpoint: quinn::Endpoint,
     local_cert: rustls::Certificate,
     network_delay: Duration,
@@ -180,25 +177,24 @@ impl Node {
     ) -> anyhow::Result<Self> {
         let genesis = protocol::genesis(genesis);
         history::insert_genesis(&db, &genesis).await?;
-        let history = History::from_db(db).await?;
+        let history = History::new(db);
+        let stats = history.stats().await?;
         tracing::info!(
-            last_view = %history.last_view(),
-            voted = %history.voted(),
-            locked_view = %history.locked().inner.view,
-            locked_block = %history.locked().inner.block,
-            committed_view = %history.last_commit().inner.view,
-            committed_block = %history.last_commit().inner.block,
+            last_view = %stats.last,
+            voted = %stats.voted,
+            locked_view = %stats.last_cert.view,
+            locked_block = %stats.last_cert.block.id,
+            committed_view = %stats.commit.inner.view,
+            committed_block = %stats.commit.inner.block.id,
             "loaded history"
         );
-        let (sender, receiver) = unbounded_channel();
+        let chain = history.load_chain_from(stats.commit.block.height).await?;
         let consensus = TokioConsensus::new(
-            history.last_view(),
-            participants,
-            history.locked(),
-            history.last_commit(),
-            history.voted(),
+            &participants,
             &keys,
-            TokioSink::new(sender),
+            stats.last,
+            stats.voted,
+            &chain,
         );
         let (cert, key) = ensure_cert(&dir, &listen)?;
         let server_crypto = rustls::ServerConfig::builder()
@@ -225,7 +221,6 @@ impl Node {
             history: history,
             router: Router::new(1_000),
             consensus: consensus,
-            receiver: receiver,
             endpoint: endpoint,
             local_cert: cert,
             network_delay: network_delay,
@@ -254,7 +249,6 @@ impl Node {
             &self.router,
             local_public_keys,
             &self.consensus,
-            &mut self.receiver,
         ));
         for peer in &self.peers {
             s.spawn(connect(
@@ -370,15 +364,15 @@ mod tests {
             });
             s.collect().await;
         }
-        let max = nodes
-            .iter_mut()
-            .map(|node| node.history.last_commit().inner.view)
-            .max()
-            .unwrap();
-        assert!(max > 0.into());
-        for node in nodes.iter_mut() {
-            let commit = node.history.last_commit().inner.view;
-            assert!(commit == max || commit == (max.0 - 1).into());
+        let mut max_height = 0;
+        for node in nodes.iter() {
+            let stats= node.history.stats().await.expect("should not fail");
+            max_height = max_height.max(stats.commit.height)
+        }
+        assert!(max_height > 0);
+        for node in nodes.iter() {
+            let stats= node.history.stats().await.expect("should not fail");
+            assert!(stats.commit.height == max_height || stats.commit.height == max_height - 1);
         }
     }
 }
