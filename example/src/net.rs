@@ -117,10 +117,13 @@ impl MsgStream {
     pub(crate) async fn send_payload(&mut self, payload: protocol::Payload) -> Result<()> {
         let protocol_message = proto::Protocol {
             payload: Some(payload),
-            headers: Some(proto::Headers {
-                sent_millis: since_unix_epoch().as_millis() as u64,
-                traceparent: Some(Span::current().context().borrow().into()),
-            }),
+            headers: match Span::current().id() {
+                Some(_) => Some(proto::Headers {
+                    sent_millis: since_unix_epoch().as_millis() as u64,
+                    traceparent: Some(Span::current().context().borrow().into()),
+                }),
+                None => None,
+            },
         };
         self.send_message(&protocol_message).await
     }

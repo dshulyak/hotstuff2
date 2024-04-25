@@ -19,13 +19,20 @@ message Protocol {
     oneof payload {
         Timeout timeout = 2;
         TimeoutCertificate timeout_certificate = 3;
-        Prepare prepare = 4;
-        Vote vote_lock = 5;
-        Propose propose = 6;
-        CommitVote vote_commit = 7;
-        Sync sync = 8;
-        Hello hello = 9;
+        Propose propose = 4;
+        Vote vote = 5;
+        BlockCertificate certificate = 6;
+        Hello hello = 7;
     }
+}
+
+message Propose {
+    uint64 view = 1;
+    Block block = 2;
+    BlockCertificate lock = 3;
+    BlockCertificate double = 4;
+    bytes signature = 5;
+    uint32 signer = 6;
 }
 
 message Block {
@@ -39,12 +46,6 @@ message Vote {
     Block block = 2;
     bytes signature = 3;
     uint32 signer = 4;
-}
-
-message CommitVote {
-    BlockCertificate cert = 1;
-    bytes signature = 2;
-    uint32 signer = 3;
 }
 
 message BlockCertificate {
@@ -64,26 +65,6 @@ message TimeoutCertificate {
     uint64 view = 1;
     bytes aggregated_signature = 2;
     bytes signers = 3;
-}
-
-message Propose {
-    uint64 view = 1;
-    Block block = 2;
-    BlockCertificate locked = 3;
-    BlockCertificate commit = 4;
-    bytes signature = 5;
-    uint32 signer = 6;
-}
-
-message Prepare {
-    BlockCertificate locked = 3;
-    bytes signature = 4;
-    uint32 signer = 5;
-}
-
-message Sync {
-    BlockCertificate locked = 1;
-    BlockCertificate commit = 2; 
 }
 
 message ProofOfPossession {

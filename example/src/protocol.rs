@@ -9,8 +9,9 @@ use hotstuff2::pipelined::{
 };
 use hotstuff2::types::{
     AggregateSignature, Bitfield, Block, Certificate, PrivateKey, ProofOfPossession, PublicKey,
-    Sync as SyncMsg, View, Vote, ID,
+    View, Vote, ID,
 };
+use parking_lot::Mutex;
 use rand::{thread_rng, Rng};
 use tokio::select;
 use tokio::sync::mpsc::{self, Receiver};
@@ -30,19 +31,31 @@ pub(crate) type TokioConsensus = Consensus<TokioSink>;
 #[derive(Debug)]
 pub(crate) struct TokioSink {
     sender: mpsc::UnboundedSender<Event>,
-    receiver: mpsc::UnboundedReceiver<Event>,
+    receiver: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
 }
 
 impl Events for TokioSink {
     fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
-        Self { sender, receiver }
+        Self {
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+        }
     }
 
     fn send(&self, action: Event) {
         self.sender
             .send(action)
             .expect("consumer should never be dropped before producer");
+    }
+}
+
+impl TokioSink {
+    fn take_receiver(&self) -> mpsc::UnboundedReceiver<Event> {
+        self.receiver
+            .lock()
+            .take()
+            .expect("receiver should be present")
     }
 }
 
@@ -63,15 +76,10 @@ pub(crate) async fn sync_initiate(
     consensus: &impl OnMessage,
     mut stream: MsgStream,
 ) -> anyhow::Result<()> {
-    let state = {
-        SyncMsg {
-            locked: None,
-            commit: Some(history.last_commit()),
-        }
-    };
+    let cert = history.commit_cert().await?;
     match ctx
         .timeout_secs(10)
-        .select(stream.send_payload(Message::Sync(state).borrow().into()))
+        .select(stream.send_payload(Message::Certificate(cert).borrow().into()))
         .await
     {
         Ok(Ok(())) => {}
@@ -81,7 +89,15 @@ pub(crate) async fn sync_initiate(
     loop {
         match ctx.timeout_secs(10).select(stream.recv_payload()).await {
             Ok(Ok(payload)) => {
-                if let Err(err) = consensus.on_message(payload.borrow().try_into()?) {
+                let msg = match payload.borrow().try_into() {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        tracing::debug!(error = ?err, remote = ?stream.remote(), "decode sync message");
+                        return Err(err)
+                    }
+                };
+                tracing::debug!(remote = ?stream.remote(), msg = %msg, "received sync message");
+                if let Err(err) = consensus.on_message(msg) {
                     tracing::warn!(error = ?err, remote = ?stream.remote(), "failed to process sync message");
                 }
             }
@@ -102,8 +118,8 @@ pub(crate) async fn sync_initiate(
 }
 
 pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: MsgStream) {
-    let state = match ctx.timeout_secs(10).select(stream.recv_payload()).await {
-        Ok(Ok(protocol::Payload::Sync(state))) => state,
+    let cert = match ctx.timeout_secs(10).select(stream.recv_payload()).await {
+        Ok(Ok(protocol::Payload::Certificate(cert))) => cert,
         Ok(Ok(msg)) => {
             tracing::debug!(message = ?msg, "unexpected message");
             return;
@@ -117,36 +133,26 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: Ms
             return;
         }
     };
-    let mut last = state
-        .commit
-        .as_ref()
-        .map(|v| View(v.view + 1))
-        .unwrap_or(View(1));
-    tracing::debug!(from_view = %last, remote = %stream.remote(), "requested sync");
-    loop {
-        let (sync_msg, next) = {
-            let commit = history.first_after(last).await;
-            let next = commit.as_ref().map(|c| c.inner.view + 1);
-            (
-                Message::Sync(SyncMsg {
-                    commit,
-                    locked: None,
-                }),
-                next,
-            )
-        };
-        match next {
-            Some(next) => {
-                last = next;
-            }
-            None => {
-                tracing::debug!(last = %last, remote = %stream.remote(), "finished syncing certificates");
-                break;
-            }
+    let cert: Certificate<Vote> = match cert.borrow().try_into() {
+        Ok(cert) => cert,
+        Err(err) => {
+            tracing::debug!(error = ?err, "decode certificate");
+            return;
         }
+    };
+    tracing::debug!(after_height = %cert.block.height, remote = %stream.remote(), "requested sync");
+    let chain = match history.load_chain_after(cert.block.height).await {
+        Ok(chain) => chain,
+        Err(err) => {
+            tracing::debug!(error = ?err, "load chain");
+            return;
+        }
+    };
+    for cert in chain {
+        tracing::debug!(remote = %stream.remote(), height = %cert.block.height, "sending certificate");
         match ctx
             .timeout_secs(10)
-            .select(stream.send_payload(sync_msg.borrow().into()))
+            .select(stream.send_payload(Message::Certificate(cert).borrow().into()))
             .await
         {
             Ok(Ok(())) => {}
@@ -160,7 +166,7 @@ pub(crate) async fn sync_accept(ctx: &Context, history: &History, mut stream: Ms
             }
         };
     }
-    if let Some(timeout) = history.timeout().await {
+    if let Ok(Some(timeout)) = history.timeout().await {
         let msg = Message::Timeout(timeout);
         match ctx
             .timeout_secs(10)
@@ -342,7 +348,7 @@ pub(crate) async fn process_actions(
 ) {
     let mut average_latency: f64 = 0.0;
     let mut last = Instant::now();
-    let receiver = &mut consensus.events().receiver;
+    let mut receiver = consensus.events().take_receiver();
     while let Some(Some(action)) = ctx.select(receiver.recv()).await {
         match action {
             Event::Send(msg, to) => {
@@ -421,10 +427,7 @@ mod tests {
 
     use futures::prelude::*;
     use futures::FutureExt;
-    use hotstuff2::{
-        sequential::StateChange,
-        types::{Signature, Signed, Sync as SyncMsg, Wish, SIGNATURE_SIZE},
-    };
+    use hotstuff2::types::{Signature, Signed, SIGNATURE_SIZE};
     use prost::Message as ProtestMessage;
     use tokio::time::{self, timeout};
     use tokio_test::{assert_ok, io::Builder};
@@ -505,9 +508,9 @@ mod tests {
         SocketAddr::from_str(addr).unwrap()
     }
 
-    fn wish(view: View, signer: u16) -> Signed<Wish> {
-        Signed::<Wish> {
-            inner: Wish { view: view },
+    fn wish(view: View, signer: u16) -> Signed<View> {
+        Signed::<View> {
+            inner: view,
             signer: signer,
             signature: Signature::new([0u8; SIGNATURE_SIZE]),
         }
@@ -532,18 +535,12 @@ mod tests {
 
         let ctx = Context::new();
         let history = History::new(inmemory().await.unwrap());
-        let change = StateChange {
-            voted: None,
-            locked: Some(genesis_test()),
-            commit: Some(genesis_test()),
-            timeout: None,
-        };
-        history.update(&change).await.unwrap();
+        history
+            .update(None, None, None, vec![genesis_test()])
+            .await
+            .unwrap();
 
-        let msg = Message::Sync(SyncMsg {
-            locked: None,
-            commit: Some(history.last_commit()),
-        });
+        let msg = Message::Certificate(history.commit_cert().await.expect("commit cert"));
         let mut reader = Builder::new();
         reader.read(&empty_headers_message(msg.borrow().into()));
         let mut writer = Builder::new();
@@ -564,40 +561,29 @@ mod tests {
 
         let ctx = Context::new();
         let history = History::new(inmemory().await.unwrap());
-        let change = StateChange {
-            voted: None,
-            locked: Some(genesis_test()),
-            commit: Some(genesis_test()),
-            timeout: None,
-        };
-        history.update(&change).await.unwrap();
+        history
+            .update(None, None, None, vec![genesis_test()])
+            .await
+            .unwrap();
         let cnt = Counter::new();
 
         let mut reader = Builder::new();
         reader.read(&empty_headers_message(
-            Message::Sync(SyncMsg {
-                locked: None,
-                commit: Some(cert_from_view(1.into())),
-            })
-            .borrow()
-            .into(),
+            Message::Certificate(cert_from_view(1.into()))
+                .borrow()
+                .into(),
         ));
         reader.read(&empty_headers_message(
-            Message::Sync(SyncMsg {
-                locked: None,
-                commit: Some(cert_from_view(2.into())),
-            })
-            .borrow()
-            .into(),
+            Message::Certificate(cert_from_view(2.into()))
+                .borrow()
+                .into(),
         ));
         let mut writer = Builder::new();
+
         writer.write(&empty_headers_message(
-            Message::Sync(SyncMsg {
-                locked: None,
-                commit: Some(history.last_commit()),
-            })
-            .borrow()
-            .into(),
+            Message::Certificate(history.commit_cert().await.expect("commit cert"))
+                .borrow()
+                .into(),
         ));
 
         let stream = MsgStream::new(

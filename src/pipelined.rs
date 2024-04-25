@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap}, fmt, marker::PhantomData
 };
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Result, Context};
 use parking_lot::Mutex;
 
 use crate::{
@@ -37,9 +37,12 @@ pub enum Message {
 impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Message::Certificate(cert) => write!(f, "cert height={:?} view={:?} id={:?}", cert.height, cert.view, cert.block.id),
-            Message::Propose(propose) => write!(f, "propose height={:?} view={:?} id={:?}", propose.block.height, propose.view, propose.block.id),
-            Message::Vote(vote) => write!(f, "vote height={:?} view={:?} id={:?} signer={:?}", vote.block.height, vote.view, vote.block.id, vote.signer),
+            Message::Certificate(cert) => write!(f, "cert height={:?} view={:?} id={}", 
+                cert.height, cert.view, cert.block.id),
+            Message::Propose(propose) => write!(f, "propose height={:?} view={:?} id={}", 
+                propose.block.height, propose.view, propose.block.id),
+            Message::Vote(vote) => write!(f, "vote height={:?} view={:?} id={} signer={:?}", 
+                vote.block.height, vote.view, vote.block.id, vote.signer),
             Message::Wish(wish) => write!(f, "wish view={:?} signer={:?}", wish.inner, wish.signer),
             Message::Timeout(timeout) => write!(f, "timeout view={:?}", timeout.inner),
         }
@@ -68,10 +71,10 @@ pub trait Events {
 
 #[derive(Debug, Clone)]
 pub struct Propose {
-    pub(crate) view: View,
-    pub(crate) block: Block,
-    pub(crate) lock: Certificate<Vote>,
-    pub(crate) commit: Certificate<Vote>,
+    pub view: View,
+    pub block: Block,
+    pub lock: Certificate<Vote>,
+    pub commit: Certificate<Vote>,
 }
 
 impl Propose {
@@ -168,7 +171,7 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         fields(view = ?cert.view, height = cert.block.height),
     )]
     pub(crate) fn on_synced_certificate(&self, cert: Certificate<Vote>) -> Result<()> {
-        self.verify_certificate(Domain::Vote, &cert, &cert.signature, &cert.signers)?;
+        self.verify_certificate(Domain::Vote, &cert.inner, &cert.signature, &cert.signers)?;
 
         let mut state = self.state.lock();
         let last_cert: &Certificate<Vote> = state.chain.last_key_value().map(|(_, cert)| cert).unwrap();
@@ -209,13 +212,13 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
         if propose.block.height > 1 {
             ensure!(propose.block.height == propose.lock.height + 1);
             ensure!(propose.block.prev == propose.lock.id);
-            self.verify_certificate(Domain::Vote, &propose.lock, &propose.lock.signature, &propose.lock.signers)?;
+            self.verify_certificate(Domain::Vote, &propose.lock.inner, &propose.lock.signature, &propose.lock.signers)?;
         }
         if propose.block.height > 2 {
             ensure!(propose.lock.height == propose.commit.height + 1);
             ensure!(propose.lock.block.prev == propose.commit.block.id);
             if !self.state.lock().is_known_cert(&propose.commit) {
-                self.verify_certificate(Domain::Vote, &propose.commit, &propose.commit.signature, &propose.commit.signers)?;
+                self.verify_certificate(Domain::Vote, &propose.commit.inner, &propose.commit.signature, &propose.commit.signers)?;
             }
         }
         
@@ -489,7 +492,7 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
             self.participants.decode(&signers),
             signature,
             &signed.to_bytes(),
-        )
+        ).context("aggregated signature verification")
     }
 
     fn send_all(&self, msg: Message) {

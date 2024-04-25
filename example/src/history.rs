@@ -25,6 +25,18 @@ pub async fn sqlite(url: &str) -> Result<SqlitePool> {
         .execute(&pool)
         .await
         .context("create tables")?;
+    let count: i64 = sqlx::query_scalar("select count(*) from safety")
+        .fetch_one(&pool)
+        .await?;
+    if count == 0 {
+        sqlx::query("insert into safety (voted, commit_height) values (?, ?)")
+            .bind(0)
+            .bind(0)
+            .execute(&pool)
+            .await
+            .context("insert single row into safety table")?;
+    }
+
     Ok(pool)
 }
 
@@ -32,11 +44,11 @@ fn schema() -> &'static str {
     r#"
     create table if not exists safety (
         voted integer not null,
-        commit integer not null,
+        commit_height integer not null,
         timeout_view integer,
         timeout_signature blob,
         timeout_signers blob
-    ) without rowid;
+    );
 
     create table if not exists history (
         height integer primary key not null,
@@ -51,18 +63,13 @@ fn schema() -> &'static str {
 }
 
 pub(crate) async fn insert_genesis(pool: &SqlitePool, genesis: &Certificate<Vote>) -> Result<()> {
-    let count: i64 = sqlx::query_scalar("select count(*) from safety")
+    let count: i64 = sqlx::query_scalar("select count(*) from history")
         .fetch_one(pool)
         .await?;
-    if count == 1 {
+    if count >= 1 {
         return Ok(());
     }
-    sqlx::query("insert into safety (voted, commit) values (?, ?)")
-        .bind(0)
-        .bind(0)
-        .execute(pool)
-        .await
-        .context("insert single row into safety table")?;
+
     encode_cert(genesis)
         .execute(pool)
         .await
@@ -72,7 +79,7 @@ pub(crate) async fn insert_genesis(pool: &SqlitePool, genesis: &Certificate<Vote
 
 fn encode_cert(cert: &Certificate<Vote>) -> sqlx::query::Query<'_, Sqlite, SqliteArguments> {
     sqlx::query(
-        "insert into history 
+        "insert or replace into history 
         (view, height, block_id, block_prev, signature, signers) 
         values (?, ?, ?, ?, ?, ?)",
     )
@@ -119,6 +126,22 @@ impl History {
         Self(db)
     }
 
+    pub(crate) async fn commit_cert(&self) -> Result<Certificate<Vote>> {
+        Ok(decode_row_into_cert(
+            sqlx::query(
+                "
+                select 
+                height, view, block_id, block_prev, signature, signers 
+                from history 
+                where height = (select commit_height from safety)
+                ",
+            )
+            .fetch_one(&self.0)
+            .await
+            .context("fetch commit")?,
+        ))
+    }
+
     pub(crate) async fn stats(&self) -> Result<Stats> {
         let voted: i64 = sqlx::query_scalar("select voted from safety")
             .fetch_one(&self.0)
@@ -129,16 +152,7 @@ impl History {
             .await
             .context("fetch timeout view")?;
 
-        let commit_cert =
-            {
-                decode_row_into_cert(sqlx::query(
-                "select height, view, block_id, block_prev, signature, signers from history 
-                where height = (select commit from safety)",
-            )
-            .fetch_one(&self.0)
-            .await
-            .context("fetch commit")?)
-            };
+        let commit_cert = self.commit_cert().await?;
 
         let last_cert = {
             decode_row_into_cert(sqlx::query(
@@ -157,6 +171,21 @@ impl History {
             commit: commit_cert,
             last_cert: last_cert,
         })
+    }
+
+    pub(crate) async fn load_chain_after(&self, height: u64) -> Result<Vec<Certificate<Vote>>> {
+        let mut rows = sqlx::query(
+            "select height, view, block_id, block_prev, signature, signers from history 
+            where height > ?",
+        )
+        .bind(height as i64)
+        .fetch(&self.0);
+
+        let mut chain = Vec::new();
+        while let Some(row) = rows.try_next().await.context("fetch chain")? {
+            chain.push(decode_row_into_cert(row));
+        }
+        Ok(chain)
     }
 
     pub(crate) async fn load_chain_from(&self, height: u64) -> Result<Vec<Certificate<Vote>>> {
@@ -211,7 +240,7 @@ impl History {
                 .context("update voted")?;
         }
         if let Some(commit) = commit {
-            sqlx::query("update safety set commit = ?")
+            sqlx::query("update safety set commit_height = ?")
                 .bind(commit as i64)
                 .execute(&mut *tx)
                 .await
@@ -232,6 +261,7 @@ impl History {
             .context("update timeout")?;
         }
         for cert in chain {
+            tracing::info!(height=%cert.height, view=%cert.view, id=%cert.id, prev=%cert.prev, "save certificate");
             encode_cert(&cert)
                 .execute(&mut *tx)
                 .await
