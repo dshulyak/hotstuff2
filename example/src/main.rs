@@ -13,12 +13,13 @@ use rand::{rngs::OsRng, RngCore};
 use sdk::Resource;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-mod proto;
 mod context;
 mod history;
 mod net;
 mod node;
+mod proto;
 mod protocol;
+mod scope;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -288,7 +289,7 @@ async fn run(opt: Run) {
     )
     .await
     .unwrap();
-    let mut node = match node::Node::init(
+    let node = match node::Node::init(
         opt.directory.as_path(),
         pool,
         opt.listen,

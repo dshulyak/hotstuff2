@@ -4,8 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
-use async_scoped::TokioScope;
 use hotstuff2::types::{PrivateKey, ProofOfPossession, PublicKey};
 use quinn::TransportConfig;
 use sqlx::SqlitePool;
@@ -15,6 +13,7 @@ use crate::context::Context;
 use crate::history::{self, History};
 use crate::net::{Connection, Router};
 use crate::protocol::{self, TokioConsensus};
+use crate::scope;
 
 async fn initiate(
     ctx: &Context,
@@ -98,45 +97,54 @@ async fn connect(
 
 async fn accept(ctx: &Context, endpoint: &quinn::Endpoint, history: &History, router: &Router) {
     tracing::info!(local = %endpoint.local_addr().unwrap(), "accepting connections");
-    let mut s = unsafe { TokioScope::create(Default::default()) };
-    while let Some(Some(conn)) = ctx.select(endpoint.accept()).await {
-        s.spawn(async {
-            let conn = match ctx.select(conn).await {
-                Some(Ok(conn)) => Connection::new(conn),
-                Some(Err(err)) => {
-                    tracing::warn!(error = ?err, "failed to accept connection");
-                    return;
-                }
-                None => {
-                    tracing::debug!("task to accept connection is cancelled");
-                    return;
-                }
-            };
-            tracing::debug!(remote = %conn.remote(), "accepted connection");
-            let mut s = unsafe { TokioScope::create(Default::default()) };
-            while let Some(Ok(stream)) = ctx.select(conn.accept()).await {
-                match stream.protocol() {
-                    protocol::GOSSIP_PROTOCOL => {
-                        s.spawn(protocol::gossip_accept(ctx, router, stream));
+    let _: anyhow::Result<()> = scope!(|s| async {
+        while let Some(Some(conn)) = ctx.select(endpoint.accept()).await {
+            s.spawn(async {
+                
+                let conn = match ctx.select(conn).await {
+                    Some(Ok(conn)) => Connection::new(conn),
+                    Some(Err(err)) => {
+                        tracing::warn!(error = ?err, "failed to accept connection");
+                        return Ok(());
                     }
-                    protocol::SYNC_PROTOCOL => {
-                        s.spawn(protocol::sync_accept(ctx, history, stream));
+                    None => {
+                        tracing::debug!("task to accept connection is cancelled");
+                        return Ok(());
                     }
-                    default => {
-                        tracing::debug!(protocol = ?default, "unknown protocol");
+                };
+                tracing::debug!(remote = %conn.remote(), "accepted connection");
+                scope!(|s| async {
+                    while let Some(Ok(stream)) = ctx.select(conn.accept()).await {
+                        match stream.protocol() {
+                            protocol::GOSSIP_PROTOCOL => {
+                                s.spawn(async {
+                                    protocol::gossip_accept(ctx, router, stream).await;
+                                    Ok(())
+                                });
+                            }
+                            protocol::SYNC_PROTOCOL => {
+                                s.spawn(async {
+                                    protocol::sync_accept(ctx, history, stream).await;
+                                    Ok(())
+                                });
+                            }
+                            default => {
+                                tracing::debug!(protocol = ?default, "unknown protocol");
+                            }
+                        }
                     }
-                }
-            }
-            s.collect().await;
-        });
-    }
-    s.collect().await;
+                    Ok(())
+                }).await
+            });
+        }
+        Ok(())
+    }).await;
 }
 
 fn ensure_cert(
     dir: &Path,
     listen: &SocketAddr,
-) -> Result<(rustls::Certificate, rustls::PrivateKey)> {
+) -> anyhow::Result<(rustls::Certificate, rustls::PrivateKey)> {
     let cert_path = dir.join("cert.der");
     let key_path = dir.join("key.der");
     if cert_path.exists() && key_path.exists() {
@@ -189,13 +197,7 @@ impl Node {
             "loaded history"
         );
         let chain = history.load_chain_from(stats.commit.block.height).await?;
-        let consensus = TokioConsensus::new(
-            &participants,
-            &keys,
-            stats.last,
-            stats.voted,
-            &chain,
-        );
+        let consensus = TokioConsensus::new(&participants, &keys, stats.last, stats.voted, &chain);
         let (cert, key) = ensure_cert(&dir, &listen)?;
         let server_crypto = rustls::ServerConfig::builder()
             .with_safe_defaults()
@@ -228,42 +230,54 @@ impl Node {
         })
     }
 
-    pub async fn run(&mut self, ctx: Context) {
-        let mut s = unsafe { TokioScope::create(Default::default()) };
+    pub async fn run(&self, ctx: Context) {
+        let _: anyhow::Result<()> = scope!(|s| async {
+            s.spawn(async {
+                protocol::notify_delays(&ctx, self.network_delay, &self.consensus).await;
+                Ok(())
+            });
 
-        s.spawn(protocol::notify_delays(
-            &ctx,
-            self.network_delay,
-            &self.consensus,
-        ));
+            let local_public_keys = self
+                .consensus
+                .public_keys()
+                .into_iter()
+                .map(|(_, pk)| pk)
+                .collect::<HashSet<_>>();
+            s.spawn(async {
+                protocol::process_actions(
+                    &ctx,
+                    &self.history,
+                    &self.router,
+                    local_public_keys,
+                    &self.consensus,
+                )
+                .await;
+                Ok(())
+            });
 
-        let local_public_keys = self
-            .consensus
-            .public_keys()
-            .into_iter()
-            .map(|(_, pk)| pk)
-            .collect::<HashSet<_>>();
-        s.spawn(protocol::process_actions(
-            &ctx,
-            &self.history,
-            &self.router,
-            local_public_keys,
-            &self.consensus,
-        ));
-        for peer in &self.peers {
-            s.spawn(connect(
-                &ctx,
-                *peer,
-                Duration::from_secs(1),
-                &self.endpoint,
-                &self.local_cert,
-                &self.history,
-                &self.proofs,
-                &self.consensus,
-            ));
-        }
-        s.spawn(accept(&ctx, &self.endpoint, &self.history, &self.router));
-        s.collect().await;
+            for peer in &self.peers {
+                s.spawn(async {
+                    connect(
+                        &ctx,
+                        *peer,
+                        Duration::from_secs(1),
+                        &self.endpoint,
+                        &self.local_cert,
+                        &self.history,
+                        &self.proofs,
+                        &self.consensus,
+                    )
+                    .await;
+                    Ok(())
+                });
+            }
+            s.spawn(async {
+                accept(&ctx, &self.endpoint, &self.history, &self.router).await;
+                Ok(())
+            });
+            Ok(())
+        })
+        .await;
     }
 }
 
@@ -293,11 +307,10 @@ impl rustls::client::ServerCertVerifier for SkipServerVerification {
 mod tests {
     use std::{net::SocketAddr, time::Duration};
 
-    use async_scoped::TokioScope;
     use hotstuff2::types::PrivateKey;
     use tokio::time::sleep;
 
-    use crate::{context, history::inmemory, node};
+    use crate::{context, history::inmemory, node, scope};
 
     fn init_tracing() {
         let rst = tracing_subscriber::fmt()
@@ -351,27 +364,31 @@ mod tests {
 
         {
             let ctx = context::Context::new();
-            let mut s = unsafe { TokioScope::create(Default::default()) };
-            for node in nodes.iter_mut() {
+            let _: Result<(), ()> = scope!(|s| async {
+                for node in nodes.iter() {
+                    let ctx = ctx.clone();
+                    s.spawn(async {
+                        node.run(ctx).await;
+                        Ok(())
+                    });
+                }
+                // TODO change test to run until expected number of blocks were comitted
                 s.spawn(async {
-                    node.run(ctx.clone()).await;
+                    sleep(Duration::from_secs(2)).await;
+                    ctx.cancel();
+                    Ok(())
                 });
-            }
-            // TODO change test to run until expected number of blocks were comitted
-            s.spawn(async {
-                sleep(Duration::from_secs(2)).await;
-                ctx.cancel();
-            });
-            s.collect().await;
+                Ok(())
+            }).await;
         }
         let mut max_height = 0;
         for node in nodes.iter() {
-            let stats= node.history.stats().await.expect("should not fail");
+            let stats = node.history.stats().await.expect("should not fail");
             max_height = max_height.max(stats.commit.height)
         }
         assert!(max_height > 0);
         for node in nodes.iter() {
-            let stats= node.history.stats().await.expect("should not fail");
+            let stats = node.history.stats().await.expect("should not fail");
             assert!(stats.commit.height == max_height || stats.commit.height == max_height - 1);
         }
     }
