@@ -396,7 +396,7 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
 
     #[tracing::instrument(skip(self))]
     fn on_delay(&self) {
-        let action = {
+        let cast_wish = {
             let mut state = self.state.lock();
             state.ticks += 1;
             if state.ticks == TIMEOUT {
@@ -433,7 +433,7 @@ impl<EVENTS: Events, CRYPTO: crypto::Backend> Consensus<EVENTS, CRYPTO> {
                 None
             }
         };
-        if let Some(view) = action {
+        if let Some(view) = cast_wish {
             // we do it here so that signing is done without holding the state lock
             let to_sign = &view.to_bytes();
             self.keys.iter().for_each(|(signer, pk)| {

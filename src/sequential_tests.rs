@@ -250,7 +250,7 @@ impl Tester {
 struct Instance {
     consensus: Consensus,
     signer: Signer,
-    actions: Vec<seq::Event>,
+    events: Vec<seq::Event>,
 }
 
 impl Instance {
@@ -298,12 +298,12 @@ impl Instance {
     }
 
     fn send_all(&mut self, message: Message) {
-        self.action(seq::Event::Send(message, None));
+        self.event(seq::Event::Send(message, None));
     }
 
     fn send_one(&mut self, message: Message, to: Signer) {
         let public = self.consensus.public_key_by_index(to);
-        self.action(seq::Event::Send(message, Some(public)));
+        self.event(seq::Event::Send(message, Some(public)));
     }
 
     fn state_change(
@@ -313,7 +313,7 @@ impl Instance {
         voted: Option<View>,
         timeout: Option<Certificate<View>>,
     ) {
-        self.action(seq::Event::StateChange(StateChange {
+        self.event(seq::Event::StateChange(StateChange {
             locked: lock,
             commit,
             voted,
@@ -338,33 +338,33 @@ impl Instance {
     }
 
     fn propose(&mut self) {
-        self.action(seq::Event::Propose);
+        self.event(seq::Event::Propose);
     }
 
     fn consume_actions(&mut self) {
         for action in self.consensus.events().drain() {
-            self.actions.push(action);
+            self.events.push(action);
         }
     }
 
-    fn action(&mut self, action: seq::Event) {
+    fn event(&mut self, action: seq::Event) {
         self.consume_actions();
-        assert_eq!(self.actions.drain(0..1).next(), Some(action));
+        assert_eq!(self.events.drain(0..1).next(), Some(action));
     }
 
     fn actions(&mut self) -> Vec<seq::Event> {
         self.consume_actions();
-        self.actions.drain(..).collect()
+        self.events.drain(..).collect()
     }
 
     fn no_actions(&mut self) {
         self.consume_actions();
-        assert_eq!(self.actions, vec![]);
+        assert_eq!(self.events, vec![]);
     }
 
     fn drain_actions(&mut self) {
         self.consume_actions();
-        let _ = self.actions.drain(0..);
+        let _ = self.events.drain(0..);
     }
 }
 
@@ -396,7 +396,7 @@ impl Instances {
     fn action(&mut self, action: seq::Event) {
         self.0
             .iter_mut()
-            .for_each(|instance| instance.action(action.clone()));
+            .for_each(|instance| instance.event(action.clone()));
     }
 
     fn lock(&mut self, lock: Certificate<Vote>) {
@@ -452,7 +452,7 @@ fn gentest(n: usize, f: impl FnOnce(&Tester, &mut Instances)) {
         .map(|i| Instance {
             consensus: cluster.active(i),
             signer: i as u16,
-            actions: vec![],
+            events: vec![],
         })
         .collect::<Vec<_>>();
     // TODO refactor it without closure, can't recall what i was thinking

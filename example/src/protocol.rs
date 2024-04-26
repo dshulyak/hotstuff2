@@ -43,9 +43,9 @@ impl Events for TokioSink {
         }
     }
 
-    fn send(&self, action: Event) {
+    fn send(&self, event: Event) {
         self.sender
-            .send(action)
+            .send(event)
             .expect("consumer should never be dropped before producer");
     }
 }
@@ -339,7 +339,7 @@ pub(crate) async fn notify_delays(
     }
 }
 
-pub(crate) async fn process_actions(
+pub(crate) async fn process_events(
     ctx: &Context,
     history: &History,
     router: &Router,

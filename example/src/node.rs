@@ -244,7 +244,7 @@ impl Node {
                 .map(|(_, pk)| pk)
                 .collect::<HashSet<_>>();
             s.spawn(async {
-                protocol::process_actions(
+                protocol::process_events(
                     &ctx,
                     &self.history,
                     &self.router,

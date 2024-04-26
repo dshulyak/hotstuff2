@@ -74,7 +74,7 @@ pub trait Proposer {
 }
 
 pub trait Events: Debug {
-    fn send(&self, action: Event);
+    fn send(&self, events: Event);
 }
 
 #[derive(Debug)]
@@ -96,7 +96,7 @@ impl<T: Events, C: crypto::Backend> Consensus<T, C> {
         commit: Certificate<Vote>,
         voted: View,
         keys: &[PrivateKey],
-        actions: T,
+        events: T,
     ) -> Self {
         let keys = keys
             .iter()
@@ -110,7 +110,7 @@ impl<T: Events, C: crypto::Backend> Consensus<T, C> {
         Self {
             participants: participants.into(),
             keys,
-            events: actions,
+            events: events,
             state: Mutex::new(State {
                 view,
                 voted,
@@ -748,8 +748,8 @@ pub(crate) mod testing {
     }
     
     impl Events for Sink {
-        fn send(&self, action: Event) {
-            self.0.borrow_mut().push(action);
+        fn send(&self, event: Event) {
+            self.0.borrow_mut().push(event);
         }
     }
     
