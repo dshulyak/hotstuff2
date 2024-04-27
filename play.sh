@@ -14,7 +14,7 @@ LATENCY=${LATENCY:-40ms}
 RUST_LOG=$RUST_LOG PATH=$PATH:$BINARY_PATH play run \
     -e RUST_LOG=$APP_LOG \
     -w /tmp/example \
-    -p exmp \
+    -p ex \
     --redirect \
     --netem="delay ${LATENCY}" \
     -n $SIZE \
