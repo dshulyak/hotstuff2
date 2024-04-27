@@ -87,6 +87,7 @@ pub(crate) struct MsgStream {
     send: BufWriter<Box<dyn AsyncWrite + Unpin + Send>>,
     recv_buf: bytes::BytesMut,
     recv: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    add_trace: bool,
 }
 
 impl MsgStream {
@@ -103,6 +104,25 @@ impl MsgStream {
             send: BufWriter::new(send),
             recv_buf: bytes::BytesMut::with_capacity(4096),
             recv: BufReader::new(recv),
+            add_trace: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_no_trace(
+        protocol: Protocol,
+        remote: SocketAddr,
+        send: Box<dyn AsyncWrite + Unpin + Send>,
+        recv: Box<dyn AsyncRead + Unpin + Send>,
+    ) -> Self {
+        Self {
+            protocol,
+            remote,
+            send_buf: bytes::BytesMut::with_capacity(4096),
+            send: BufWriter::new(send),
+            recv_buf: bytes::BytesMut::with_capacity(4096),
+            recv: BufReader::new(recv),
+            add_trace: false,
         }
     }
 
@@ -118,11 +138,11 @@ impl MsgStream {
         let protocol_message = proto::Protocol {
             payload: Some(payload),
             headers: match Span::current().id() {
-                Some(_) => Some(proto::Headers {
+                Some(_) if self.add_trace => Some(proto::Headers {
                     sent_millis: since_unix_epoch().as_millis() as u64,
                     traceparent: Some(Span::current().context().borrow().into()),
                 }),
-                None => None,
+                _ => None,
             },
         };
         self.send_message(&protocol_message).await
@@ -229,12 +249,10 @@ impl Router {
 
     pub(crate) fn send_all(&self, msg: Message) {
         let msg = Arc::new(msg);
-        self.table.lock().sockets.retain(|_, sender| {
+        self.table.lock().sockets.iter().for_each(|(_, sender)| {
             if let Err(err) = sender.try_send(msg.clone()) {
                 tracing::debug!(error = ?err, "failed to send message");
-                return false;
             }
-            return true;
         });
     }
 

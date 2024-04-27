@@ -295,9 +295,9 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
     tracing::debug!(remote = %stream.remote(), "accepted gossip stream");
     if let Err(err) = gossip_messages(ctx, receiver, &mut stream).await {
         tracing::debug!(error = ?err, remote = %stream.remote(), "error in gossip stream");
+        router.remove(&stream.remote(), publics.iter());
     }
     tracing::debug!(remote = %stream.remote(), "closing gossip stream");
-    router.remove(&stream.remote(), publics.iter());
 }
 
 async fn gossip_messages(
@@ -543,7 +543,7 @@ mod tests {
         reader.read(&empty_headers_message(msg.borrow().into()));
         let mut writer = Builder::new();
 
-        let stream = MsgStream::new(
+        let stream = MsgStream::new_no_trace(
             SYNC_PROTOCOL,
             sock("127.0.0.1:3333"),
             Box::new(writer.build()),
@@ -584,7 +584,7 @@ mod tests {
                 .into(),
         ));
 
-        let stream = MsgStream::new(
+        let stream = MsgStream::new_no_trace(
             SYNC_PROTOCOL,
             sock("127.0.0.1:3333"),
             Box::new(writer.build()),
@@ -625,7 +625,7 @@ mod tests {
             Message::Wish(wish(1.into(), 2)).borrow().into(),
         ));
 
-        let stream = MsgStream::new(
+        let stream = MsgStream::new_no_trace(
             GOSSIP_PROTOCOL,
             sock("127.0.0.1:3333"),
             Box::new(writer.build()),
@@ -657,7 +657,7 @@ mod tests {
 
         let router = Router::new(100);
         let sock = sock("127.0.0.1:8888");
-        let stream = MsgStream::new(
+        let stream = MsgStream::new_no_trace(
             GOSSIP_PROTOCOL,
             sock.clone(),
             Box::new(writer.build()),
@@ -672,6 +672,78 @@ mod tests {
         }
         for _ in to_send.iter() {
             _ = futures::poll!(stream.next());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_gossip_reconnect() {
+        init_tracing();
+        let ctx = Context::new();
+
+        let router = Router::new(100);
+        let sock = sock("127.0.0.1:8888");
+
+        let mut reader1 = Builder::new();
+        let mut writer1 = Builder::new();
+
+        reader1.read(&empty_headers_message(protocol::Payload::Hello(
+            proto::Hello::default(),
+        )));
+
+        let to_send1 = (1..=1)
+            .into_iter()
+            .map(|i| Message::Wish(wish(1.into(), i)))
+            .collect::<Vec<_>>();
+        for msg in to_send1.iter() {
+            writer1.write(&empty_headers_message(msg.into()));
+        }
+
+        let stream1 = MsgStream::new_no_trace(
+            GOSSIP_PROTOCOL,
+            sock.clone(),
+            Box::new(writer1.build()),
+            Box::new(reader1.build()),
+        );
+
+        let mut reader2 = Builder::new();
+        let mut writer2 = Builder::new();
+
+        reader2.read(&empty_headers_message(protocol::Payload::Hello(
+            proto::Hello::default(),
+        )));
+
+        let to_send2 = (2..=4)
+            .into_iter()
+            .map(|i| Message::Wish(wish(1.into(), i)))
+            .collect::<Vec<_>>();
+        for msg in to_send2.iter() {
+            writer2.write(&empty_headers_message(msg.into()));
+        }
+
+        let stream2 = MsgStream::new_no_trace(
+            GOSSIP_PROTOCOL,
+            sock.clone(),
+            Box::new(writer2.build()),
+            Box::new(reader2.build()),
+        );
+
+        let mut stream = Box::pin(gossip_accept(&ctx, &router, stream1).into_stream());
+        _ = futures::poll!(stream.next());
+        for msg in to_send1.iter() {
+            router.send_all(msg.clone());
+        }
+        for _ in to_send1.iter() {
+            _ = futures::poll!(stream.next());
+        }
+
+        let mut stream2 = Box::pin(gossip_accept(&ctx, &router, stream2).into_stream());
+        _ = futures::poll!(stream2.next());
+        _ = futures::poll!(stream.next());
+        for msg in to_send2.iter() {
+            router.send_all(msg.clone());
+        }
+        for _ in to_send2.iter() {
+            _ = futures::poll!(stream2.next());
         }
     }
 }
