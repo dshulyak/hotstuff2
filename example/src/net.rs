@@ -208,9 +208,6 @@ impl Router {
     ) -> anyhow::Result<mpsc::Receiver<Arc<Message>>> {
         let (sender, receiver) = mpsc::channel(self.per_channel_buffer_size);
         let mut table = self.table.lock();
-        if table.sockets.contains_key(&addr) {
-            anyhow::bail!("peer with address is already registered");
-        }
         for pubk in publics {
             table.public_keys.insert(pubk, sender.clone());
         }

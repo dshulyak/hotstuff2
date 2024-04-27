@@ -93,7 +93,7 @@ pub(crate) async fn sync_initiate(
                     Ok(msg) => msg,
                     Err(err) => {
                         tracing::debug!(error = ?err, remote = ?stream.remote(), "decode sync message");
-                        return Err(err)
+                        return Err(err);
                     }
                 };
                 tracing::debug!(remote = ?stream.remote(), msg = %msg, "received sync message");
@@ -285,17 +285,15 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
         .iter()
         .map(|pop| pop.public_key.clone())
         .collect::<Vec<_>>();
-    let mut msgs = {
-        match router.register(stream.remote(), publics.clone().into_iter()) {
-            Ok(msgs) => msgs,
-            Err(err) => {
-                tracing::warn!(error = ?err, peer = %stream.remote(), "failed to register peer");
-                return;
-            }
+    let receiver = match router.register(stream.remote(), publics.clone().into_iter()) {
+        Ok(msgs) => msgs,
+        Err(err) => {
+            tracing::warn!(error = ?err, peer = %stream.remote(), "failed to register peer");
+            return;
         }
     };
     tracing::debug!(remote = %stream.remote(), "accepted gossip stream");
-    if let Err(err) = gossip_messages(ctx, &mut msgs, &mut stream).await {
+    if let Err(err) = gossip_messages(ctx, receiver, &mut stream).await {
         tracing::debug!(error = ?err, remote = %stream.remote(), "error in gossip stream");
     }
     tracing::debug!(remote = %stream.remote(), "closing gossip stream");
@@ -304,10 +302,10 @@ pub(crate) async fn gossip_accept(ctx: &Context, router: &Router, mut stream: Ms
 
 async fn gossip_messages(
     ctx: &Context,
-    msgs: &mut Receiver<Arc<Message>>,
+    mut receiver: Receiver<Arc<Message>>,
     stream: &mut MsgStream,
 ) -> anyhow::Result<()> {
-    while let Some(Some(msg)) = ctx.select(msgs.recv()).await {
+    while let Some(Some(msg)) = ctx.select(receiver.recv()).await {
         let span = tracing::debug_span!("send gossip", remote = %stream.remote());
         ctx.timeout_secs(10)
             .select(stream.send_payload(msg.as_ref().into()).instrument(span))
